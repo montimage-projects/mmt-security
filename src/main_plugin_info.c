@@ -26,16 +26,19 @@ static void _usage( const char *prog ){
 	fprintf( stderr, "         print the rule ABI layout and hash of this mmt-security\n" );
 }
 
-/* get the build info of a .so: its exported function, else its ELF note. NULL if none */
-static char *_get_build_info( const char *path ){
-	void *lib = dlopen( path, RTLD_NOW );
-	if( lib != NULL ){
-		mmt_sec_get_rule_build_info_fn_t fn = (mmt_sec_get_rule_build_info_fn_t) dlsym( lib, MMT_SEC_BUILD_INFO_SYMBOL );
-		if( fn != NULL )
-			return strdup( fn() );
+/* get the build info of a .so: its ELF note, read without loading the .so;
+ * if it has no note, its exported function. Returns a MMT_SEC_NOTE_ value */
+static int _get_build_info( const char *path, char **info ){
+	int ret = mmt_sec_elf_read_build_note( path, info );
+	if( ret == MMT_SEC_NOTE_NONE ){
+		void *lib = dlopen( path, RTLD_NOW );
+		if( lib != NULL ){
+			mmt_sec_get_rule_build_info_fn_t fn = (mmt_sec_get_rule_build_info_fn_t) dlsym( lib, MMT_SEC_BUILD_INFO_SYMBOL );
+			if( fn != NULL && (*info = strdup( fn() )) != NULL )
+				ret = MMT_SEC_NOTE_FOUND;
+		}
 	}
-	//cannot be loaded, or no symbol: read the note
-	return mmt_sec_elf_read_build_note( path );
+	return ret;
 }
 
 static void _indent( int level ){
@@ -97,13 +100,24 @@ static int _print_build_info( const char *path, bool json ){
 		fprintf( stderr, "Cannot read %s\n", path );
 		return 1;
 	}
-	info = _get_build_info( path );
-	if( info == NULL ){
+	switch( _get_build_info( path, &info )){
+	case MMT_SEC_NOTE_FOUND:
+		break;
+	case MMT_SEC_NOTE_NONE:
 		if( json )
 			printf( "null\n" );
 		else
 			printf( "No build info in %s: it was compiled by a compile_rule that did not record build info.\n", path );
 		return 0;
+	case MMT_SEC_NOTE_NOT_ELF:
+		fprintf( stderr, "%s is not an ELF shared object (of this architecture)\n", path );
+		return 1;
+	case MMT_SEC_NOTE_INVALID:
+		fprintf( stderr, "%s has an invalid note or section table: cannot read its build info\n", path );
+		return 1;
+	default:
+		fprintf( stderr, "Cannot read %s\n", path );
+		return 1;
 	}
 	if( json )
 		printf( "%s\n", info );

@@ -13,7 +13,9 @@
 #include "./lib/gen_code.h"
 #include "./lib/rule_build_info.h"
 
-#define MAX_STRING_LEN 10000
+#define MAX_STRING_LEN COMPILE_GEN_CODE_MAX_LEN
+//include dirs of the generated code; compile_rule's extra gcc option follows them
+#define GCC_INCLUDES "./src/lib -I ./src/dpi -I/opt/mmt/security/include -I/opt/mmt/dpi/include"
 
 int main( int argc, char** argv ){
 	rule_t **rule_list;
@@ -67,13 +69,21 @@ int main( int argc, char** argv ){
 		mmt_info( "Encoded %zu rules from \"%s\" to \"%s\"", rule_count, xml_file, c_file );
 		mmt_info( "To compile, use: /usr/bin/gcc -fPIC -shared %s -o output.so", c_file );
 	}else{
-		char cflags[MAX_STRING_LEN], glibc_min[64];
+		char cflags[ 2 * COMPILE_GEN_CODE_MAX_LEN ], glibc_min[64];
+		int n;
 
 		if( argc == 3 )
-			snprintf( gcc_param, sizeof( gcc_param), "./src/lib -I ./src/dpi -I/opt/mmt/security/include -I/opt/mmt/dpi/include" );
+			n = snprintf( gcc_param, sizeof( gcc_param), "%s", GCC_INCLUDES );
 		else
-			snprintf( gcc_param, sizeof( gcc_param), "./src/lib -I ./src/dpi -I/opt/mmt/security/include -I/opt/mmt/dpi/include %s", argv[3] );
-		compile_gen_code_flags( cflags, sizeof( cflags ), gcc_param );
+			n = snprintf( gcc_param, sizeof( gcc_param), "%s %s", GCC_INCLUDES, argv[3] );
+		//the recorded flags are the gcc arguments, with the two file names as {source} and {output}
+		if( n < 0 || (size_t) n >= sizeof( gcc_param )
+				|| compile_gen_code_args( cflags, sizeof( cflags ), "{output}", "{source}", gcc_param ) < 0 ){
+			mmt_error( "The gcc option of compile_rule is too long: %zu bytes, at most %zu",
+					argc == 4 ? strlen( argv[3] ) : (size_t) 0, sizeof( gcc_param ) - sizeof( GCC_INCLUDES " " ));
+			ret = 1;
+			goto end;
+		}
 		build_options.cflags = cflags;
 
 		//generate rules to .c code, then compile code file
@@ -100,11 +110,14 @@ int main( int argc, char** argv ){
 			mmt_error( "Cannot encode rule \"%s\". Check options.", xml_file );
 	}
 
+	ret = 0;
+
+  end:
 	//free each rule
 	for( i=0; i<rule_count; i++ )
 		free_a_rule( rule_list[i], YES);
 
 	mmt_mem_free( rule_list );
 	mmt_mem_free( embedded_functions );
-	return 0;
+	return ret;
 }
