@@ -1,0 +1,93 @@
+<beginning>
+<!-- Property 57: SYN flood detected from the SYN rate alone.
+     Rule 56 needs the victim's SYN-ACKs. This rule counts TCP SYN packets (SYN set, ACK clear) to each
+     destination IP address and port in a fixed window. It reports once per window and destination when the
+     count reaches the threshold, so it also fires when no SYN-ACK is seen: spoofed or unroutable sources,
+     a saturated victim, or a probe that sees only the attacker-to-victim direction.
+     Defaults: 100 SYN within 1000 ms. They can be changed with the environment variables
+       MMT_SEC_SYN_FLOOD_THRESHOLD  (number of SYN, > 0)
+       MMT_SEC_SYN_FLOOD_WINDOW_MS  (window length in milliseconds, > 0)
+     A busy public server may legitimately receive more than 100 new connections per second per port: raise
+     the threshold there.
+     Destinations are tracked in a fixed table of 4096 slots; when all 8 slots probed for a destination are
+     busy with other destinations of the current window, its count restarts.
+-->
+<embedded_functions><![CDATA[
+#include <sys/time.h>
+
+#define EM_SYN_FLOOD_SLOTS 4096
+#define EM_SYN_FLOOD_PROBES 8
+
+static unsigned long em_syn_flood_threshold = 100;
+static uint64_t      em_syn_flood_window_us = 1000 * 1000;
+
+typedef struct {
+	uint32_t ip;          //destination IPv4 address, network order
+	uint16_t port;        //destination port
+	uint8_t  used;
+	uint64_t start_us;    //start of the current window
+	unsigned long count;  //SYN counted in the current window
+} em_syn_flood_slot_t;
+
+static em_syn_flood_slot_t em_syn_flood_table[ EM_SYN_FLOOD_SLOTS ];
+
+void on_load(){
+	const char *str = getenv( "MMT_SEC_SYN_FLOOD_THRESHOLD" );
+	if( str != NULL && strtoul( str, NULL, 0 ) > 0 )
+		em_syn_flood_threshold = strtoul( str, NULL, 0 );
+	str = getenv( "MMT_SEC_SYN_FLOOD_WINDOW_MS" );
+	if( str != NULL && strtoul( str, NULL, 0 ) > 0 )
+		em_syn_flood_window_us = (uint64_t) strtoul( str, NULL, 0 ) * 1000;
+}
+
+// Counts one SYN to (ip_dst, port) at time utime (struct timeval).
+// Returns 1 when this SYN is the em_syn_flood_threshold-th one of the current window.
+static inline int em_syn_flood_rate_reached( const void *ip_dst, double port, const void *utime ){
+	const struct timeval *tv = (const struct timeval *) utime;
+	em_syn_flood_slot_t *slot = NULL, *cand;
+	uint32_t ip, hash;
+	uint16_t p = (uint16_t) port;
+	uint64_t now;
+	int i;
+
+	if( ip_dst == NULL || tv == NULL )
+		return 0;
+	memcpy( &ip, ip_dst, 4 );
+	now  = (uint64_t) tv->tv_sec * 1000000 + (uint64_t) tv->tv_usec;
+	hash = (ip * 2654435761u) ^ ((uint32_t) p * 40503u);
+
+	//find the slot of this destination, or else the first free or expired slot
+	for( i = 0; i < EM_SYN_FLOOD_PROBES; i++ ){
+		cand = &em_syn_flood_table[ (hash + i) % EM_SYN_FLOOD_SLOTS ];
+		if( cand->used && cand->ip == ip && cand->port == p ){
+			slot = cand;
+			break;
+		}
+		if( slot == NULL && ( !cand->used || now - cand->start_us > em_syn_flood_window_us ))
+			slot = cand;
+	}
+	if( slot == NULL )
+		slot = &em_syn_flood_table[ hash % EM_SYN_FLOOD_SLOTS ];
+
+	//new destination in this slot, or its window is over: start a new window
+	if( !slot->used || slot->ip != ip || slot->port != p || now - slot->start_us > em_syn_flood_window_us ){
+		slot->used     = 1;
+		slot->ip       = ip;
+		slot->port     = p;
+		slot->start_us = now;
+		slot->count    = 0;
+	}
+	slot->count ++;
+	return slot->count == em_syn_flood_threshold;
+}
+]]></embedded_functions>
+<property value="THEN" delay_units="ms" delay_min="0" delay_max="0" property_id="57" type_property="ATTACK"
+    description="SYN flood: high SYN rate to one destination, replies not required (default: 100 SYN within 1 s to one IP address and port)">
+    <event value="COMPUTE" event_id="1"
+           description="TCP SYN that reaches the threshold for its destination IP address and port"
+           boolean_expression="((tcp.flags == 2)&amp;&amp;(#em_syn_flood_rate_reached(ip.dst, tcp.dest_port, meta.utime) == 1))"/>
+    <event value="COMPUTE" event_id="2"
+           description="Print source and destination of IP"
+           boolean_expression="(ip.src != ip.dst)"/>
+</property>
+</beginning>

@@ -45,6 +45,9 @@ static mmt_sec_handler_t *sec_handler  = NULL;
 //handler of MMT-DPI
 static mmt_handler_t *mmt_dpi_handler = NULL;
 
+//enable IP defragmentation and TCP reassembly in MMT-DPI (option -R)
+static bool is_enable_reassembly = false;
+
 void usage(const char * prg_name) {
 	fprintf(stderr, "MMT-Security version %s using DPI version %s\n", mmt_sec_get_version_info(), mmt_version() );
 	fprintf(stderr, "\nUsage: %s [<option>]\n", prg_name);
@@ -57,6 +60,11 @@ void usage(const char * prg_name) {
 	fprintf(stderr, "\t-f <string>    : Output results to file, e.g., \"/home/tata/:5\" => output to folder /home/tata and each file contains reports during 5 seconds \n");
 	fprintf(stderr, "\t-r <string>    : Output results to redis, e.g., \"localhost:6379\"\n");
 	fprintf(stderr, "\t-g             : Ignore the rest of a flow when an alert was detetected on the flow.\n");
+	fprintf(stderr, "\t-R             : Enable IP defragmentation and TCP reassembly in MMT-DPI.\n");
+	fprintf(stderr, "\t                 Rules using tcp.tcp_session_payload_up or tcp.tcp_session_payload_down (e.g., rule 67) need it.\n");
+	fprintf(stderr, "\t                 It costs memory, as MMT-DPI keeps the payload of each TCP flow (at most 4 MB per flow).\n");
+	fprintf(stderr, "\t                 A reassembled stream that does not fit in \"input.max_message_size\" (mmt-security.conf) is skipped:\n");
+	fprintf(stderr, "\t                 such rules see a flow only until its stream reaches that size.\n");
 	fprintf(stderr, "\t-v             : Verbose.\n");
 	fprintf(stderr, "\t-l             : Prints the available rules then exit.\n");
 	fprintf(stderr, "\t-h             : Prints this help.\n");
@@ -75,7 +83,7 @@ size_t parse_options(int argc, char ** argv, char *filename, int *type, uint16_t
 	*verbose = NO;
 	*is_ignore = NO;
 	filename[0] = '\0';
-	while ((opt = getopt(argc, argv, "t:i:f:r:c:m:x:lhvg")) != EOF) {
+	while ((opt = getopt(argc, argv, "t:i:f:r:c:m:x:lhvgR")) != EOF) {
 		switch (opt) {
 		case 't':
 			optcount++;
@@ -123,6 +131,10 @@ size_t parse_options(int argc, char ** argv, char *filename, int *type, uint16_t
 			optcount++;
 			*verbose = YES;
 			break;
+		case 'R':
+			optcount++;
+			is_enable_reassembly = true;
+			break;
 		case 'h':
 		default:
 			usage(argv[0]);
@@ -150,6 +162,14 @@ size_t parse_options(int argc, char ** argv, char *filename, int *type, uint16_t
 	return 0;
 }
 
+//true if a rule uses tcp.tcp_session_payload_up or tcp.tcp_session_payload_down
+static bool has_tcp_session_payload = false;
+
+static inline bool _is_tcp_session_payload( const proto_attribute_t *p ){
+	return p->proto_id == PROTO_TCP
+			&& (p->att_id == TCP_SESSION_PAYLOAD_UP || p->att_id == TCP_SESSION_PAYLOAD_DOWN);
+}
+
 /**
  * Convert a pcap packet to a message being understandable by mmt-security.
  * The function returns NULL if the packet contains no interested information.
@@ -167,7 +187,14 @@ static inline message_t* _get_packet_info( const ipacket_t *pkt ){
 	msg->flow_id   = get_session_id_from_packet( pkt );
 	//get a list of proto/attributes being used by mmt-security
 	for( i=0; i<proto_atts_count; i++ )
-		dpi_message_set_data( pkt, proto_atts[i]->dpi_type, msg, proto_atts[i]->proto_id, proto_atts[i]->att_id );
+		if( ! _is_tcp_session_payload( proto_atts[i] ))
+			dpi_message_set_data( pkt, proto_atts[i]->dpi_type, msg, proto_atts[i]->proto_id, proto_atts[i]->att_id );
+	//the reassembled TCP streams last: they can be big, and must not take
+	// the room of the other attributes in #msg
+	if( has_tcp_session_payload )
+		for( i=0; i<proto_atts_count; i++ )
+			if( _is_tcp_session_payload( proto_atts[i] ))
+				dpi_message_set_data( pkt, proto_atts[i]->dpi_type, msg, proto_atts[i]->proto_id, proto_atts[i]->att_id );
 
 	if( likely( msg->elements_count ))
 		return msg;
@@ -207,6 +234,7 @@ static inline bool _register_proto_att_to_mmt_dpi( uint32_t proto_id, uint32_t a
 static inline size_t _update_and_register_protocols_attributes_to_extract( bool verbose ){
 	int i;
 	size_t ret = 0;
+	bool is_need_reassembly = false;
 	proto_atts_count = mmt_sec_get_unique_protocol_attributes( & proto_atts );
 
 	for( i=0; i<proto_atts_count; i++ ){
@@ -220,7 +248,19 @@ static inline size_t _update_and_register_protocols_attributes_to_extract( bool 
 		}else if( proto_atts[i]->proto_id == PROTO_IP && proto_atts[i]->att_id == IP_OPTS){
 			ret += _register_proto_att_to_mmt_dpi( PROTO_IP, IP_HEADER_LEN, verbose );
 		}
+		//tcp.tcp_session_payload_up/down => need its length and the TCP reassembly
+		else if( proto_atts[i]->proto_id == PROTO_TCP && proto_atts[i]->att_id == TCP_SESSION_PAYLOAD_UP ){
+			ret += _register_proto_att_to_mmt_dpi( PROTO_TCP, TCP_SESSION_PAYLOAD_UP_LEN, verbose );
+			is_need_reassembly = true;
+		}else if( proto_atts[i]->proto_id == PROTO_TCP && proto_atts[i]->att_id == TCP_SESSION_PAYLOAD_DOWN ){
+			ret += _register_proto_att_to_mmt_dpi( PROTO_TCP, TCP_SESSION_PAYLOAD_DOWN_LEN, verbose );
+			is_need_reassembly = true;
+		}
 	}
+	has_tcp_session_payload = is_need_reassembly;
+	//a hint, not a problem: printed only with -v
+	if( is_need_reassembly && !is_enable_reassembly && verbose )
+		mmt_info("The rules using tcp.tcp_session_payload_up or tcp.tcp_session_payload_down (e.g., rule 67) need -R (TCP reassembly) to fire");
 	return ret;
 }
 
@@ -482,6 +522,10 @@ static inline void termination(){
 
 	fprintf(stderr, "%12zu messages received\n", total_received_reports );
 	fprintf(stderr, "%12zu alerts generated\n", alerts_count );
+	if( dpi_message_get_skipped_tcp_session_payload_count() > 0 )
+		mmt_warn("Skipped the reassembled TCP stream of %zu packets, as it did not fit in \"%s\"",
+				dpi_message_get_skipped_tcp_session_payload_count(),
+				mmt_sec_get_config_name( MMT_SEC__CONFIG__INPUT__MAX_MESSAGE_SIZE ));
 
 	pcap_close( pcap );
 
@@ -582,7 +626,16 @@ int main(int argc, char** argv) {
 	}
 
 
-	_update_and_register_protocols_attributes_to_extract( true );
+	if( is_enable_reassembly ){
+		//IP defragmentation, then reassembly of TCP segments into the flow's payload
+		if( !enable_mmt_reassembly( mmt_dpi_handler ) || !update_protocol( PROTO_TCP, TCP_ENABLE_REASSEMBLE ) ){
+			fprintf(stderr, "Cannot enable reassembly in MMT-DPI\n");
+			return EXIT_FAILURE;
+		}
+		mmt_info("Enabled IP defragmentation and TCP reassembly");
+	}
+
+	_update_and_register_protocols_attributes_to_extract( verbose );
 
 
 	//Register a packet handler, it will be called for every processed packet

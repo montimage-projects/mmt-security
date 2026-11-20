@@ -1,0 +1,9 @@
+<!-- expect-exit: 1 -->
+<!-- expect-output: Protocol nosuchproto has not implemented yet -->
+<beginning>
+<property value="THEN" delay_units="s" delay_min="0" delay_max="60" property_id="87" type_property="ATTACK"
+    description="compile_rule negative test (Montimage/mmt-security#52)">
+      <event value="COMPUTE" event_id="1" description="orig" boolean_expression="((ip.version == 4)&amp;&amp;(ip.proto_id == 17))"/>
+      <event value="COMPUTE" event_id="2" description="fake" boolean_expression="(nosuchproto.foo == 1)"/>
+</property>
+</beginning>
