@@ -66,6 +66,10 @@ uint32_t mmt_sec_get_version_index(){
 	return mmt_sec_get_version_number_from_string( VERSION_NUMBER );
 }
 
+const char *mmt_sec_get_required_plugin_version(){
+	return REQUIRE_PLUGIN;
+}
+
 uint32_t mmt_sec_get_required_plugin_version_number(){
 	return mmt_sec_get_version_number_from_string( REQUIRE_PLUGIN );
 }

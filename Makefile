@@ -404,8 +404,14 @@ _check_compile_rule: compile_rule
 	@echo "Testing compile_rule on malformed rules"
 	$(QUIET) bash check/rules_compile.sh ./$(MAIN_GEN_PLUGIN)
 
-check: check-properties-all check-rule-hooks _prepare _check_compile_rule $(patsubst %,_check.%,$(NAMES))
+check: check-properties-all check-rule-hooks _prepare _check_compile_rule $(patsubst %,_check.%,$(NAMES)) check-build-info
 	@echo "All test passed!"
+
+# build info embedded in every rule .so (doc/rule.md)
+check-build-info: compile_rule rule_info standalone
+	@echo
+	@echo "Testing the build info of rule .so files"
+	$(QUIET) test/build_info/check.sh $(VERSION) $(GIT_VERSION)
 
 # every rules/*.xml must have a copy in rules/properties_all/ (see readme.md)
 check-properties-all:

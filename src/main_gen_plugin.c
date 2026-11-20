@@ -11,6 +11,7 @@
 #include "./lib/expression.h"
 #include "./lib/rule.h"
 #include "./lib/gen_code.h"
+#include "./lib/rule_build_info.h"
 
 #define MAX_STRING_LEN 10000
 
@@ -57,18 +58,33 @@ int main( int argc, char** argv ){
 	//read rule from .xml file
 	rule_count = read_rules_from_file( xml_file, &rule_list, &embedded_functions );
 
-	//generate rules to .c code
-	generate_fsm( c_file, rule_list, rule_count, embedded_functions );
+	rule_build_options_t build_options = { .xml_file = xml_file };
 
 	if( argc == 4 && strcmp( argv[3], "-c") == 0 ){
+		//generate rules to .c code
+		//the flags it will be compiled with are not known: build info has "cflags": null
+		generate_fsm_with_build_options( c_file, rule_list, rule_count, embedded_functions, &build_options );
 		mmt_info( "Encoded %zu rules from \"%s\" to \"%s\"", rule_count, xml_file, c_file );
 		mmt_info( "To compile, use: /usr/bin/gcc -fPIC -shared %s -o output.so", c_file );
 	}else{
-		//compile code file
+		char cflags[MAX_STRING_LEN], glibc_min[64];
+
 		if( argc == 3 )
-			ret = compile_gen_code(output_file, c_file,"./src/lib -I ./src/dpi -I/opt/mmt/security/include -I/opt/mmt/dpi/include" );
-		else{
+			snprintf( gcc_param, sizeof( gcc_param), "./src/lib -I ./src/dpi -I/opt/mmt/security/include -I/opt/mmt/dpi/include" );
+		else
 			snprintf( gcc_param, sizeof( gcc_param), "./src/lib -I ./src/dpi -I/opt/mmt/security/include -I/opt/mmt/dpi/include %s", argv[3] );
+		compile_gen_code_flags( cflags, sizeof( cflags ), gcc_param );
+		build_options.cflags = cflags;
+
+		//generate rules to .c code, then compile code file
+		generate_fsm_with_build_options( c_file, rule_list, rule_count, embedded_functions, &build_options );
+		ret = compile_gen_code(output_file, c_file, gcc_param );
+
+		//the GLIBC_ versions the .so needs are known only once it is linked:
+		// record them, then compile again (the build info does not change them)
+		if( ret == 0 && mmt_sec_elf_glibc_min( output_file, glibc_min, sizeof( glibc_min )) == 0 ){
+			build_options.glibc_min = glibc_min;
+			generate_fsm_with_build_options( c_file, rule_list, rule_count, embedded_functions, &build_options );
 			ret = compile_gen_code(output_file, c_file, gcc_param );
 		}
 
