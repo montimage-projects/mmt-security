@@ -7,13 +7,24 @@ frame can follow the HEADERS frame in the same segment or come in a later one.
 Only the DATA frames sent by the client (the side that sent the connection
 preface or a request header block) are checked, and only when the body starts
 with '{' or '['. An alert is raised when the body
-- holds an injection pattern: a format string ("%n", or 2 conversions such as
-  "%s%s"), "%00", "\u0000", "%2e%2e", a command substitution "$(" or a
-  backtick, or a path traversal "../" or "..\\";
+- holds an injection pattern:
+  - a format string: "%n" (not followed by a letter), or 2 conversions next to
+    each other, such as "%s%s", "%x.%x" or "%p %p";
+  - a NUL: "%00" or "\u0000";
+  - a command substitution: "$(cmd)", or "`cmd`" as a whole string value or
+    after a shell operator (";`cmd`", "|`cmd`", "=`cmd`");
+  - a path traversal: "../../", "..\\..\\" (JSON-escaped backslashes),
+    "%2e%2e", "..%2f" or "..%5c";
 - or, when the whole body is in one DATA frame, is not valid JSON (RFC 8259):
   e.g., the random characters written by a fuzzer such as 5Greplay.
-A '#', '%', '$' or '\' alone is ordinary JSON ("#ff0000", "10%", "$5",
-"C:\\Users") and is not reported.
+  Newline-delimited JSON is valid, and so is any nesting depth.
+Ordinary JSON text is not reported: a '#', '%', '$' or '\' alone ("#ff0000",
+"10%", "100%natural", "$5", "C:\\Users"), a URL escape ("%3d", "%2d"), a
+single "../" ("../images/logo.png"), markdown code ("Use `git status`"),
+jQuery ("$(document).ready"), printf documentation ("%s has %d items").
+
+Each mmt-security thread tracks 128 connections (the least recently used one is
+replaced).
 -->
 
 <embedded_functions><![CDATA[
@@ -415,16 +426,14 @@ static inline int h2_open_find( const h2_dir_t *d, uint32_t sid ){
 }
 
 /*
- * Strict JSON syntax check (RFC 8259) of [p, end).
+ * Strict JSON syntax check (RFC 8259), without recursion: any nesting depth
+ * is accepted. Newline-delimited JSON (JSON texts separated by a line break,
+ * e.g., a bulk request) is accepted too.
  */
-#define JSON_MAX_DEPTH 64
-
 static inline void json_ws( const uint8_t **p, const uint8_t *end ){
 	while( *p < end && (**p == ' ' || **p == '\t' || **p == '\n' || **p == '\r') )
 		(*p) ++;
 }
-
-static bool json_value( const uint8_t **p, const uint8_t *end, int depth );
 
 static inline bool json_string( const uint8_t **p, const uint8_t *end ){
 	const uint8_t *c = *p + 1; //after '"'
@@ -483,59 +492,103 @@ static inline bool json_literal( const uint8_t **p, const uint8_t *end, const ch
 	return true;
 }
 
-static bool json_value( const uint8_t **p, const uint8_t *end, int depth ){
-	uint8_t close;
+//a member name and its ':'
+static inline bool json_key( const uint8_t **p, const uint8_t *end ){
 	json_ws( p, end );
-	if( *p >= end || depth > JSON_MAX_DEPTH )
+	if( *p >= end || **p != '"' || !json_string( p, end ))
 		return false;
+	json_ws( p, end );
+	if( *p >= end || **p != ':' )
+		return false;
+	(*p) ++;
+	return true;
+}
+
+//scalar value: string, number, true, false, null
+static inline bool json_scalar( const uint8_t **p, const uint8_t *end ){
 	switch( **p ){
 	case '"': return json_string( p, end );
 	case 't': return json_literal( p, end, "true" );
 	case 'f': return json_literal( p, end, "false" );
 	case 'n': return json_literal( p, end, "null" );
-	case '{':
-	case '[':
-		close = ( **p == '{' ) ? '}' : ']';
-		(*p) ++;
-		json_ws( p, end );
-		if( *p < end && **p == close ){
-			(*p) ++;
-			return true;
-		}
-		while( true ){
-			if( close == '}' ){
-				json_ws( p, end );
-				if( *p >= end || **p != '"' || !json_string( p, end ))
-					return false;
-				json_ws( p, end );
-				if( *p >= end || **p != ':' )
-					return false;
-				(*p) ++;
-			}
-			if( !json_value( p, end, depth + 1 ))
-				return false;
-			json_ws( p, end );
-			if( *p >= end )
-				return false;
-			if( **p == close ){
-				(*p) ++;
-				return true;
-			}
-			if( **p != ',' )
-				return false;
-			(*p) ++;
-		}
-	default:
-		return json_number( p, end );
+	default:  return json_number( p, end );
 	}
 }
 
 static inline bool json_is_valid( const uint8_t *p, uint32_t len ){
 	const uint8_t *end = p + len;
-	if( !json_value( &p, end, 0 ))
-		return false;
-	json_ws( &p, end );
-	return p == end;
+	//kinds of the open containers: bit i is 1 if the container at depth i is an object
+	uint8_t small[ 256 ], *kinds = small;
+	uint32_t depth = 0, top;
+	bool after = false, ok = false, nl;
+
+	//the depth is at most #len: one byte per container
+	if( len / 8 + 1 > sizeof( small )){
+		kinds = malloc( len / 8 + 1 );
+		if( kinds == NULL )
+			return true; //cannot check: no alert
+	}
+	while( true ){
+		if( after && depth == 0 ){
+			//end of a JSON text: end of the body, or a next JSON text after a line break
+			nl = false;
+			while( p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') ){
+				if( *p == '\n' )
+					nl = true;
+				p ++;
+			}
+			if( p == end ){
+				ok = true;
+				break;
+			}
+			if( !nl )
+				break;
+			after = false;
+		}
+		json_ws( &p, end );
+		if( p >= end )
+			break;
+		if( after ){
+			//after a value inside a container: ',' or the end of the container
+			top = depth - 1;
+			bool is_object = (kinds[ top / 8 ] >> (top % 8)) & 1;
+			if( *p == ',' ){
+				p ++;
+				if( is_object && !json_key( &p, end ))
+					break;
+				after = false;
+			}else if( *p == (is_object ? '}' : ']') ){
+				p ++;
+				depth --;
+			}else
+				break;
+			continue;
+		}
+		//a value
+		if( *p == '{' || *p == '[' ){
+			bool is_object = ( *p == '{' );
+			if( is_object )
+				kinds[ depth / 8 ] |=  (uint8_t)(1u << (depth % 8));
+			else
+				kinds[ depth / 8 ] &= (uint8_t)~(1u << (depth % 8));
+			depth ++;
+			p ++;
+			json_ws( &p, end );
+			if( p < end && *p == (is_object ? '}' : ']') ){ //empty container
+				p ++;
+				depth --;
+				after = true;
+			}else if( is_object && !json_key( &p, end ))
+				break;
+			continue;
+		}
+		if( !json_scalar( &p, end ))
+			break;
+		after = true;
+	}
+	if( kinds != small )
+		free( kinds );
+	return ok;
 }
 
 static inline bool mem_has( const uint8_t *p, uint32_t len, const char *s ){
@@ -547,43 +600,82 @@ static inline bool mem_has( const uint8_t *p, uint32_t len, const char *s ){
 	return false;
 }
 
+//whether a closing backtick follows #i before the end of the JSON string; its index in #close
+static inline bool json_backtick_close( const uint8_t *p, uint32_t len, uint32_t i, uint32_t *close ){
+	uint32_t k;
+	for( k = i + 1; k < len && k < i + 256 && p[k] != '"'; k++ )
+		if( p[k] == '`' ){
+			*close = k;
+			return true;
+		}
+	return false;
+}
+
 /**
- * Injection and fuzzing patterns in a JSON body. A '#', '%', '$' or '\'
- * alone is ordinary JSON ("#ff0000", "10%", "$5", "C:\\Users").
+ * Injection and fuzzing patterns in a JSON body. Ordinary text is not
+ * reported: '#', '%', '$' or '\' alone ("#ff0000", "10%", "$5", "C:\\Users"),
+ * URL escapes ("%3d", "%2d"), a single "../", markdown code ("Use `ls`"),
+ * jQuery ("$(document).ready"), printf documentation ("%s has %d items").
  */
 static inline bool json_has_injection( const uint8_t *p, uint32_t len ){
-	uint32_t i, j, specifiers = 0;
+	uint32_t i, j, k, run = 0, conv_end = 0;
+	uint8_t prev;
 	for( i=0; i<len; i++ ){
 		switch( p[i] ){
 		case '%':
-			//format string: "%n", or 2 conversions or more ("%s%s", "%x %p")
+			//URL escape "%XX": NUL "%00" and dots "%2e%2e" are reported, the others are text
+			if( i + 2 < len && isxdigit( p[i+1] ) && isxdigit( p[i+2] )){
+				if( p[i+1] == '0' && p[i+2] == '0' )
+					return true;
+				if( i + 5 < len && strncasecmp( (const char *)p + i, "%2e%2e", 6 ) == 0 )
+					return true;
+				break;
+			}
+			//format string: "%n" (not "100%natural"), or 2 conversions next to each other ("%s%s", "%x.%x", "%p %p")
 			j = i + 1;
 			while( j < len && (isdigit( p[j] ) || p[j] == '.' || p[j] == '-' || p[j] == 'l' || p[j] == 'h' ))
 				j++;
-			if( j < len && p[j] == 'n' )
+			if( j >= len )
+				break;
+			if( p[j] == 'n' && (j + 1 >= len || !isalpha( p[j+1] )) )
 				return true;
-			if( j < len && strchr( "sxXpd", p[j] ) != NULL && p[j] != '\0' )
-				specifiers ++;
-			//URL-encoded NUL or dots: "%00", "%2e%2e"
-			if( i + 2 < len && p[i+1] == '0' && p[i+2] == '0' )
-				return true;
-			if( i + 5 < len && strncasecmp( (const char *)p + i, "%2e%2e", 6 ) == 0 )
-				return true;
+			if( p[j] != '\0' && strchr( "sxXpd", p[j] ) != NULL ){
+				run = ( run > 0 && i <= conv_end + 1 ) ? run + 1 : 1;
+				conv_end = j + 1;
+				if( run >= 2 )
+					return true;
+			}
 			break;
-		case '$': //command substitution
-			if( i + 1 < len && p[i+1] == '(' )
-				return true;
-			break;
-		case '`':
+		case '$': //command substitution "$(cmd)", not jQuery: "$(this).hide()", "$('#id')", "$(\"#id\")"
+			if( i + 1 >= len || p[i+1] != '(' )
+				break;
+			if( i + 2 < len && (p[i+2] == '\'' || p[i+2] == '\\') )
+				break;
+			for( k = i + 2; k < len && k < i + 256 && p[k] != ')' && p[k] != '"'; k++ )
+				;
+			if( k < len && p[k] == ')' && k + 1 < len && p[k+1] == '.' )
+				break; //a method call on the jQuery object
 			return true;
-		case '.': //path traversal: "../" or "..\\" (an escaped backslash in JSON)
-			if( i + 2 < len && p[i+1] == '.' && (p[i+2] == '/' || (p[i+2] == '\\' && i + 3 < len && p[i+3] == '\\')) )
+		case '`': //command substitution "`cmd`": a whole value ("`reboot`") or after a shell operator ("x;`id`")
+			prev = ( i > 0 ) ? p[i-1] : '"';
+			if( !json_backtick_close( p, len, i, &k ))
+				break;
+			if( strchr( ";|&(=", prev ) != NULL && prev != '\0' )
+				return true;
+			if( prev == '"' && k + 1 < len && p[k+1] == '"' )
+				return true;
+			i = k; //the closing backtick does not open another one
+			break;
+		case '.': //path traversal: "../../", "..\\..\\" (escaped backslashes), "..%2f", "..%5c"
+			if( i + 5 < len && memcmp( p + i, "../../", 6 ) == 0 )
+				return true;
+			if( i + 7 < len && memcmp( p + i, "..\\\\..\\\\", 8 ) == 0 )
+				return true;
+			if( i + 4 < len && p[i+1] == '.' && (strncasecmp( (const char *)p + i + 2, "%2f", 3 ) == 0 || strncasecmp( (const char *)p + i + 2, "%5c", 3 ) == 0) )
 				return true;
 			break;
 		}
 	}
-	if( specifiers >= 2 )
-		return true;
 	//NUL character, escaped
 	return mem_has( p, len, "\\u0000" );
 }
