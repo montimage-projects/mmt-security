@@ -1,5 +1,5 @@
 <beginning>
-<!-- Property 33: TROJAN detection based on the hash table of 426 blacklisted http_uri (426 rules)
+<!-- Property 33: TROJAN detection based on a list of blacklisted http_uri patterns
 (Ref: Suricata rules emerging-trojan.rules). 
 -->
 <property value="THEN" delay_units="ms" delay_min="0" delay_max="0" property_id="33" type_property="ATTACK" 
@@ -12,16 +12,18 @@
            boolean_expression="((http.method == 'GET')&amp;&amp;(ip.src != ip.dst))"/> 
 </property>
 <embedded_functions><![CDATA[
-static mmt_hash_t *table = NULL;
-
-static inline int em_check_trojan_uri(const char * uri){
-   return( mmt_hash_search( table, uri, strlen( uri )) != NULL );
-}
-
 /**
- * List of URI trojans
+ * List of trojan URI patterns (Ref: Suricata rules emerging-trojan.rules).
+ *
+ * Most entries are the "content" keywords of a Suricata rule, joined with
+ * their values stripped, e.g., ".php?affid=subid=guid=ver=key=".
+ * An entry is therefore split after each '=' into fragments, and it matches
+ * a URI that contains all its fragments in this order, e.g.,
+ * ".php?affid=1&subid=2&guid=3&ver=4&key=5". An entry without '=' matches
+ * a URI containing it, e.g., "/install/ws.exe?v=2".
+ * Suricata's |xx| hex escapes are decoded.
  */
-const char *list_trojan_uri[] = {
+static const char *list_trojan_uri[] = {
 "/download/Antivirus_.exe",
 "/install/ws.exe",
 "/InternetAntivirus.exe",
@@ -65,7 +67,7 @@ const char *list_trojan_uri[] = {
 "os=&user=&status=&uptime=&cmd=",
 "/test.php?abc=?def=",
 ".php?param=&socks=",
-"/reg|3f|u=|26|v=",
+"/reg?u=&v=",
 ".php?win=&id=&lip=",
 "mode=boot&MyValue=&code=",
 "kgen_up.intfxp=",
@@ -141,7 +143,7 @@ const char *list_trojan_uri[] = {
 "php?partner_id=&u=&log_id=&os=",
 ".php?affid=&data=&v=",
 "/getnewv.php?keyword=google&id=",
-".php|3F|a|3D|QQk",
+".php?a=QQk",
 "/getpmnum.asp?id=",
 ".php?v=&id=&wv=",
 "webgetinfo.aspx?ver=",
@@ -156,7 +158,7 @@ const char *list_trojan_uri[] = {
 "/?uid=&aid=&linkuid=",
 "/download.php?nd=&id=",
 "/Install/Post.asp?Uid=",
-"&logdata=MacTryCnt|3A|",
+"&logdata=MacTryCnt:",
 "/geo/productid.php",
 "/version.php?ver=&app=",
 "/update_check?version=",
@@ -188,12 +190,11 @@ const char *list_trojan_uri[] = {
 "/command.php?IP=ID=",
 ".asp?ID=&Action=GetMyIP",
 "/Count.asp?UserID=",
-"/Default.aspx?INDEX=",
 "&coid=&fff=&IP=&lct=",
 "value.php?md=&pc=",
 "/count.php?m=c&n=",
 "/count.php?m=w&n=",
-".php?datos=c|3A|&user=",
+".php?datos=c:&user=",
 "/stat.php?w=&i=00000000000&a=",
 "cmd=getproxy&login=",
 "cmd=getsocks&login=",
@@ -250,7 +251,7 @@ const char *list_trojan_uri[] = {
 "/antivirus-install.exe",
 ".php?php=receipt",
 "/proxy_info.php",
-"/.ru|60|utr/qiq",
+"/.ru`utr/qiq",
 "/upload/fid=AAAAAAAAAAA",
 "/pir/bfg.php?dll=",
 "/cgi-bin/dllhost/ac",
@@ -261,14 +262,12 @@ const char *list_trojan_uri[] = {
 "/api/ping?stage=&uid=",
 "/viruslist/?uid=",
 "/admin/count.php?isOnline=1",
-"port=|3A|&uname=",
+"port=:&uname=",
 "/Count.asp?mac=&ver=&t=",
-"/admin/plugins/",
 "/upload/img.jpg",
 "/upload/mp3.mp3",
 "/js.php?ran=&t=&u=",
 "/forum/images.php?id",
-"/Default.aspx?ID=",
 "/ping.html?r=/utils/",
 "mainsettings/settings.sol",
 "/features/fetch/time/",
@@ -300,7 +299,7 @@ const char *list_trojan_uri[] = {
 "/rssfeed.php?a=",
 "/psp.php?p=&g=&s=&t=&r=",
 "/tsone/ajuno.php",
-"Target|3a|Message|3a|",
+"Target:Message:",
 "/poll/update.txt",
 "/feed404/mysfeeds.php",
 ".php?mark=&type=&theos=",
@@ -309,11 +308,10 @@ const char *list_trojan_uri[] = {
 "/MessageBox.bin",
 "/ComputerInfo.bin",
 "/WalletSteal.bin",
-"/forumdisplay.php?fid=",
 "/client/config.ini",
 ".cgi?Group=&Ver=&Inst&Ask=&Bn=",
 "androidbugreport.php",
-"/log?|7c|version=|7c|id=|7c|os=",
+"/log?|version=|id=|os=",
 "/1/6b-558694705129b01c0",
 "/gate.php?user=&id=&type=",
 ".exedownload_helper.ns",
@@ -330,7 +328,6 @@ const char *list_trojan_uri[] = {
 "/project/check.asp",
 "/support/main.html",
 "/0/Service Pack ",
-"/wp-content/themes/",
 "/upfornow/connect.php",
 ".php?t=&o=&i=&task_id=",
 ".phpos=&osbit=&antiv=",
@@ -352,16 +349,14 @@ const char *list_trojan_uri[] = {
 "/images/view.php",
 ".asp?i=0&v=o10.1",
 "/title.php?pizza=",
-"/.ni|67 67|ers/bin.sh",
+"/.niggers/bin.sh",
 "/payment_gateway/.gz",
 ".php?i=&data=&hash=",
 "/checkupdate.asmx",
 "update.php?&key=&dummy=",
 "/connect.php?a=1",
-"/index.php?c=&r=",
-"/uploads/images/201",
 "/download.php?listfiles=",
-".php?a=n|60|e|3e|",
+".php?a=n`e>",
 "?uid=&context=&mode=text&data=",
 ".php?page=&enckey=",
 "/action.php?action=&sent_all=",
@@ -376,17 +371,16 @@ const char *list_trojan_uri[] = {
 ".php?name=&serial=",
 ".php?name=&date=",
 "/attach/1759CB3B5124F217143044",
-"/verify.php?version=&GUID=|7b|",
+"/verify.php?version=&GUID={",
 "?encoding=&t=&cc=&process=",
 ".php?U3ViamVjdD1",
-"hl=source=aq=aqi=aql=oq=",
 "ext=&pid=&country=&regd=",
 "/wp-content/themes/citytv.com",
 "/.c.php?request=",
 "/redirect.php?loc=mail",
 "/do.asp?search=",
 "/command.php?id=&os=&com=&ver=",
-"/log.php?id=|5b|",
+"/log.php?id=[",
 "/keylogger.php?id=&com=&key=",
 "/?bit=&version=",
 "/ohupdate.php?program=&q=",
@@ -413,8 +407,6 @@ const char *list_trojan_uri[] = {
 "/adobe_flashplayer_7.exe",
 "/go/flashplayer_support/",
 "/?ID=&Serial=&acao=&Log=",
-"/fwlink/?LinkId=",
-"/wp-content/plugins/",
 "/forum.php?sid=",
 ".php?id=&token1=&token2=&C=",
 "/logo.gif?sessd=&sessc=&sessk=",
@@ -439,34 +431,85 @@ const char *list_trojan_uri[] = {
 "&os=&bits=&av=&host=&plugins=",
 ".php?HWInfo=}&Time=",
 ".php?user=&try=&status=",
-"?-----BEGIN|20|CERTIFICATE-----",
+"?-----BEGIN CERTIFICATE-----",
 ".exe???????????????",
 "/config.php?id=",
 "/catalog/outgoing",
 "/api/asyncTwitter.php"
 };
 
-//This fuction is called when the rules in this file being loaded into MMT-Security
-void on_load(){	
-	int i;
-	//number of uri
-	int length = sizeof( list_trojan_uri ) / sizeof( list_trojan_uri[0] );
-	const char* uri;
-	
-	//create a new hash table
-	table = mmt_hash_create();
-	mmt_debug("Rule 33.trojan: Created a table for checking trojat having %d URI", length );
-	
-	//add items to the hash table
-	for( i=0; i<length; i++ ){
-      uri = list_trojan_uri[i];
-		mmt_hash_add( table, uri, strlen(uri), (void*) uri, false );
-	} 
-}//end on_load()
+#define TROJAN_URI_COUNT (sizeof( list_trojan_uri ) / sizeof( list_trojan_uri[0] ))
+#define BIGRAM_BITS 4096
 
-//This fuction is called when exiting MMT-Security
-void on_unload(){
-   mmt_hash_free( table );
-}//end on_unload()
+//first bigram of each pattern, to skip quickly the patterns that cannot match;
+// only set when the first fragment has 2 characters or more
+static uint16_t trojan_bigram[ TROJAN_URI_COUNT ];
+static bool     trojan_has_bigram[ TROJAN_URI_COUNT ];
+
+static inline uint16_t em_bigram( const char *s ){
+	return ( ((uint8_t)s[0]) * 31u + ((uint8_t)s[1]) ) % BIGRAM_BITS;
+}
+
+//whether #uri contains the fragments of #pattern in order (fragments end after each '=')
+static inline bool em_match_fragments( const char *uri, const char *pattern ){
+	const char *frag = pattern, *eq, *found;
+	char buf[ 256 ];
+	size_t len;
+	while( *frag != '\0' ){
+		eq  = strchr( frag, '=' );
+		len = (eq == NULL) ? strlen( frag ) : (size_t)(eq - frag + 1);
+		if( len >= sizeof( buf ))
+			return false;
+		memcpy( buf, frag, len );
+		buf[ len ] = '\0';
+		found = strstr( uri, buf );
+		if( found == NULL )
+			return false;
+		uri   = found + len;
+		frag += len;
+	}
+	return true;
+}
+
+static inline int em_check_trojan_uri(const char * uri){
+	uint8_t bigrams[ BIGRAM_BITS / 8 ];
+	const char *c;
+	size_t i;
+	uint16_t h;
+
+	if( uri == NULL || uri[0] == '\0' )
+		return false;
+
+	//bigrams present in the URI
+	memset( bigrams, 0, sizeof( bigrams ));
+	for( c = uri; c[1] != '\0'; c++ ){
+		h = em_bigram( c );
+		bigrams[ h / 8 ] |= 1u << (h % 8);
+	}
+
+	for( i=0; i<TROJAN_URI_COUNT; i++ ){
+		if( trojan_has_bigram[i] ){
+			h = trojan_bigram[i];
+			if( (bigrams[ h / 8 ] & (1u << (h % 8))) == 0 )
+				continue;
+		}
+		if( em_match_fragments( uri, list_trojan_uri[i] ))
+			return true;
+	}
+	return false;
+}
+
+//This fuction is called when the rules in this file being loaded into MMT-Security
+void on_load(){
+	size_t i;
+	const char *p;
+	for( i=0; i<TROJAN_URI_COUNT; i++ ){
+		p = list_trojan_uri[i];
+		trojan_has_bigram[i] = ( p[0] != '\0' && p[0] != '=' && p[1] != '\0' );
+		if( trojan_has_bigram[i] )
+			trojan_bigram[i] = em_bigram( p );
+	}
+	mmt_debug("Rule 33.trojan: %zu URI patterns", TROJAN_URI_COUNT );
+}//end on_load()
 ]]></embedded_functions>
 </beginning>

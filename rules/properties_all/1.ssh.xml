@@ -1,22 +1,38 @@
 <beginning>
-<!-- Property 1: Several attempts to connect via ssh (brute force attack). Source address is either infected machine or attacker (no spoofing is possible).-->
-<property value="THEN" delay_units="s" delay_min="0+" delay_max="5" property_id="1" type_property="ATTACK" 
-    description="Several attempts to connect via ssh (brute force attack). Source address is either infected machine or attacker (no spoofing is possible).">
-    <operator value="THEN" delay_units="s" delay_min="0+" delay_max="3">
-      <event value="COMPUTE" event_id="1" 
-             description="SYN request"
+<!-- Property 1: Several attempts to connect via ssh (brute force attack). Source address is either infected machine or attacker (no spoofing is possible).
+     SSH is encrypted and mmt-dpi gives no authentication result, so the rule counts connection attempts:
+     5 SYNs to port 22 from one client to one server, from 5 different source ports (a retransmitted SYN is
+     not a new attempt), within about 10 s, then a SYN-ACK from the server (it is listening). The threshold is above a short
+     burst of normal logins (scp then ssh, a few commands in a row); password guessers open many connections.
+     delay_min is 0, not 0+, so that parallel attempts captured with the same timestamp are counted.
+-->
+<property value="THEN" delay_units="s" delay_min="0" delay_max="10" property_id="1" type_property="ATTACK"
+    description="Several attempts to connect via ssh (brute force attack): 5 SSH connection attempts from one client to one server within 10 s. Source address is either infected machine or attacker (no spoofing is possible).">
+    <operator value="THEN" delay_units="s" delay_min="0" delay_max="10">
+      <event value="COMPUTE" event_id="1"
+             description="SYN request (1st attempt)"
              boolean_expression="((tcp.flags == 2)&amp;&amp;((tcp.dest_port == 22)&amp;&amp;(ip.src != ip.dst)))"/>
-      <event value="COMPUTE" event_id="2" 
-             description="SYN ACK reply"
-             boolean_expression="((tcp.flags == 18)&amp;&amp;((tcp.src_port == 22)&amp;&amp;((ip.dst == ip.src.1)&amp;&amp;(ip.src == ip.dst.1))))"/>
+      <event value="COMPUTE" event_id="2"
+             description="2nd attempt, from another source port"
+             boolean_expression="((tcp.flags == 2)&amp;&amp;((tcp.dest_port == 22)&amp;&amp;(((ip.src == ip.src.1)&amp;&amp;(ip.dst == ip.dst.1))&amp;&amp;(tcp.src_port != tcp.src_port.1))))"/>
     </operator>
-    <operator value="THEN" delay_units="s" delay_min="0+" delay_max="3">
-      <event value="COMPUTE" event_id="3" 
-             description="2nd attempt"
-             boolean_expression="((tcp.flags == 2)&amp;&amp;((tcp.dest_port == 22)&amp;&amp;((ip.src == ip.src.1)&amp;&amp;(ip.dst == ip.dst.1))))"/>
-      <event value="COMPUTE" event_id="4" 
-             description="3rd attempt"
-             boolean_expression="((tcp.flags == 2)&amp;&amp;((tcp.dest_port == 22)&amp;&amp;((ip.src == ip.src.1)&amp;&amp;(ip.dst == ip.dst.1))))"/>
+    <operator value="THEN" delay_units="s" delay_min="0" delay_max="10">
+      <operator value="THEN" delay_units="s" delay_min="0" delay_max="10">
+        <event value="COMPUTE" event_id="3"
+               description="3rd attempt, from another source port"
+               boolean_expression="((tcp.flags == 2)&amp;&amp;((tcp.dest_port == 22)&amp;&amp;((((ip.src == ip.src.1)&amp;&amp;(ip.dst == ip.dst.1))&amp;&amp;(tcp.src_port != tcp.src_port.1))&amp;&amp;(tcp.src_port != tcp.src_port.2))))"/>
+        <event value="COMPUTE" event_id="4"
+               description="4th attempt, from another source port"
+               boolean_expression="((tcp.flags == 2)&amp;&amp;((tcp.dest_port == 22)&amp;&amp;(((((ip.src == ip.src.1)&amp;&amp;(ip.dst == ip.dst.1))&amp;&amp;(tcp.src_port != tcp.src_port.1))&amp;&amp;(tcp.src_port != tcp.src_port.2))&amp;&amp;(tcp.src_port != tcp.src_port.3))))"/>
+      </operator>
+      <operator value="THEN" delay_units="s" delay_min="0" delay_max="10">
+        <event value="COMPUTE" event_id="5"
+               description="5th attempt, from another source port"
+               boolean_expression="((tcp.flags == 2)&amp;&amp;((tcp.dest_port == 22)&amp;&amp;((((((ip.src == ip.src.1)&amp;&amp;(ip.dst == ip.dst.1))&amp;&amp;(tcp.src_port != tcp.src_port.1))&amp;&amp;(tcp.src_port != tcp.src_port.2))&amp;&amp;(tcp.src_port != tcp.src_port.3))&amp;&amp;(tcp.src_port != tcp.src_port.4))))"/>
+        <event value="COMPUTE" event_id="6"
+               description="SYN ACK reply from the SSH server to the client (the server is listening)"
+               boolean_expression="((tcp.flags == 18)&amp;&amp;((tcp.src_port == 22)&amp;&amp;((ip.dst == ip.src.1)&amp;&amp;(ip.src == ip.dst.1))))"/>
+      </operator>
     </operator>
 </property>
 </beginning>

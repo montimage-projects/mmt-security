@@ -1,23 +1,48 @@
 <beginning>
 <!-- Property 56: Probable SYN flooding attack.
+     A server sends a SYN-ACK to 3 different clients (IP or port) from the same port within 200 ms, and none of
+     these 3 clients completes its handshake within 1 s: no packet with ACK set and SYN and RST clear comes back
+     on the same connection. A client that answers the SYN-ACK with a RST (the kernel of a real-source flooder
+     does) or that never answers (a spoofed source) leaves the handshake half-open.
+     A client that opens several connections at once completes each handshake, so it is not reported.
+     Rule 57 detects SYN floods whose SYN-ACKs are not seen.
+     Note: the 1 s timeout is checked when a later packet arrives; a flood that ends the capture less than 1 s
+     after its last SYN-ACK is reported only for its earlier handshakes.
 -->
-	<property value="THEN" delay_units="ms" delay_min="0+" delay_max="100" property_id="56" type_property="ATTACK" 
-    description="Probable SYN flooding attack (Half TCP handshake without TCP RST)">
-    <operator value="THEN" delay_units="ms" delay_min="0+" delay_max="50">
-      <event value="COMPUTE" event_id="1" 
-             description="TCP SYN packet"
-             boolean_expression="((tcp.flags == 2)&amp;&amp;(ip.src != ip.dst))"/>
-      <event value="COMPUTE" event_id="2" 
-             description="TCP [SYN, ACK] packet"
-             boolean_expression="((tcp.flags == 18)&amp;&amp;((ip.src == ip.dst.1)&amp;&amp;(ip.dst == ip.src.1)))"/>
+<embedded_functions><![CDATA[
+// ACK set, SYN and RST clear: the client's packet that completes (or follows) the TCP handshake
+static inline int em_completes_handshake( double flags ){
+	int f = (int) flags;
+	return ((f & 0x10) != 0) && ((f & 0x06) == 0);
+}
+]]></embedded_functions>
+<property value="NOT" delay_units="ms" delay_min="0" delay_max="1000" property_id="56" type_property="ATTACK"
+    description="Probable SYN flooding attack: 3 TCP handshakes to one server port left half-open (no final ACK from the client within 1 s)">
+    <operator value="THEN" delay_units="ms" delay_min="0+" delay_max="100">
+      <event value="COMPUTE" event_id="1"
+             description="TCP [SYN, ACK] packet from the server to client 1"
+             boolean_expression="((tcp.flags == 18)&amp;&amp;(ip.src != ip.dst))"/>
+      <operator value="THEN" delay_units="ms" delay_min="0+" delay_max="100">
+        <event value="COMPUTE" event_id="2"
+               description="TCP [SYN, ACK] packet from the same server port to client 2"
+               boolean_expression="((tcp.flags == 18)&amp;&amp;(((ip.src == ip.src.1)&amp;&amp;(tcp.src_port == tcp.src_port.1))&amp;&amp;((ip.dst != ip.dst.1)||(tcp.dest_port != tcp.dest_port.1))))"/>
+        <event value="COMPUTE" event_id="3"
+               description="TCP [SYN, ACK] packet from the same server port to client 3"
+               boolean_expression="((tcp.flags == 18)&amp;&amp;(((ip.src == ip.src.1)&amp;&amp;(tcp.src_port == tcp.src_port.1))&amp;&amp;(((ip.dst != ip.dst.1)||(tcp.dest_port != tcp.dest_port.1))&amp;&amp;((ip.dst != ip.dst.2)||(tcp.dest_port != tcp.dest_port.2)))))"/>
+      </operator>
     </operator>
-    <operator value="THEN" delay_units="ms" delay_min="0+" delay_max="50">
-      <event value="COMPUTE" event_id="3" 
-             description="TCP [SYN, ACK] packet"
-             boolean_expression="((tcp.flags == 18)&amp;&amp;((ip.src == ip.dst.1)&amp;&amp;(ip.dst == ip.src.1)))"/>
-      <event value="COMPUTE" event_id="4" 
-             description="TCP [SYN, ACK] packet"
-             boolean_expression="((tcp.flags == 18)&amp;&amp;((ip.src == ip.dst.1)&amp;&amp;(ip.dst == ip.src.1)))"/>
+    <operator value="OR">
+      <event value="COMPUTE" event_id="4"
+             description="Client 1 completes its handshake"
+             boolean_expression="((#em_completes_handshake(tcp.flags) == 1)&amp;&amp;((ip.src == ip.dst.1)&amp;&amp;((ip.dst == ip.src.1)&amp;&amp;((tcp.src_port == tcp.dest_port.1)&amp;&amp;(tcp.dest_port == tcp.src_port.1)))))"/>
+      <operator value="OR">
+        <event value="COMPUTE" event_id="5"
+               description="Client 2 completes its handshake"
+               boolean_expression="((#em_completes_handshake(tcp.flags) == 1)&amp;&amp;((ip.src == ip.dst.2)&amp;&amp;((ip.dst == ip.src.2)&amp;&amp;((tcp.src_port == tcp.dest_port.2)&amp;&amp;(tcp.dest_port == tcp.src_port.2)))))"/>
+        <event value="COMPUTE" event_id="6"
+               description="Client 3 completes its handshake"
+               boolean_expression="((#em_completes_handshake(tcp.flags) == 1)&amp;&amp;((ip.src == ip.dst.3)&amp;&amp;((ip.dst == ip.src.3)&amp;&amp;((tcp.src_port == tcp.dest_port.3)&amp;&amp;(tcp.dest_port == tcp.src_port.3)))))"/>
+      </operator>
     </operator>
 </property>
 </beginning>

@@ -3,8 +3,8 @@
 <property value="THEN" delay_units="ms" delay_min="0" delay_max="0" property_id="77" type_property="ATTACK" 
     description="Detect Log4Shell attack that exploits a vulnerability of log4j, CVE-2021-44832, to get a remote code execution">
       <event value="COMPUTE" event_id="1" 
-             description="HTTP request URI containing a malicious request"
-             boolean_expression="(((#em_check_log4shell(http.uri) ) || (#em_check_log4shell( http.user_agent ) )) )"/>
+             description="HTTP request whose URI, headers or body contain a JNDI lookup ${jndi:...}, possibly obfuscated"
+             boolean_expression="(#em_check_log4shell( http.uri, tcp.p_payload ) == 1)"/>
       <event value="COMPUTE" event_id="2" 
              description="Print IP source and destination addresses"
              boolean_expression="(ip.src != ip.dst)"/>
@@ -27,7 +27,7 @@ static inline size_t decode_url(char *dst, const char *src) {
 	while (*src) {
 		if ((*src == '%') &&
 				((a = src[1]) && (b = src[2])) &&
-				(isxdigit(a) && isxdigit(b))) {
+				(isxdigit((unsigned char)a) && isxdigit((unsigned char)b))) {
 			if (a >= 'a')
 				a -= 'a'-'A';
 			if (a >= 'A')
@@ -56,7 +56,7 @@ static inline size_t decode_url(char *dst, const char *src) {
 //change string to lower cases
 static inline void em_to_lower( char *p ){
 	for ( ; *p; ++p)
-		*p = tolower(*p);
+		*p = tolower((unsigned char)*p);
 }
 
 static inline void em_remove_spaces( char* s ){
@@ -64,53 +64,115 @@ static inline void em_remove_spaces( char* s ){
 	do{
 		while (*d == ' ' || *d == '\t')
 			++d;
-	}while( *s++ = *d++ );
+	}while( (*s++ = *d++) );
 }
 
-static int em_check_log4shell( const char *uri ){
-	//https://github.com/nhnghia/log4shell-pcaps
-	const char *signatures[] = {
-		"${${::-j}${::-n}${::-d}${::-i}:${::-l}${::-d}${::-a}${::-p}://",
-		"${${::-j}${::-n}${::-d}${::-i}:${::-r}${::-m}${::-i}://",
-		"${${lower:jndi}:${lower:ldap}://",
-		"${${::-j}ndi:rmi://",
-		"${${lower:${lower:jndi}}:${lower:ldap}://",
-		"${${lower:jndi}:${lower:rmi}://",
-		"${${lower:j}${lower:n}${lower:d}i:${lower:ldap}://",
-		"${${lower:${lower:jndi}}:${lower:rmi}://",
-		"${${lower:j}${upper:n}${lower:d}${upper:i}:${lower:l}d${lower:a}p://",
-		"${${lower:j}${upper:n}${lower:d}${upper:i}:${lower:r}m${lower:i}://",
-		"${j${env:DOESNOTEXIST:-}ndi:ldap://",
-		"${j${env:DOESNOTEXIST:-}ndi:rmi://",
-		"${${:::::::::::::::-j}ndi:ldap://",
-		"${${:::::::::::::::-j}ndi:rmi://",
-		"${${::::::::::::::-j}ndi:ldap://",
-		"${${::::::::::::::-j}ndi:rmi://"
-	};
-	
-	//number of signatures
-	const int length = sizeof( signatures ) / sizeof( signatures[0] );
-	//length of the decoded uri is always lower than the one of uri
-	// +1 for \0 at the end
-	char *decoded_uri = malloc( (strlen( uri ) + 1) * sizeof( char) );
+#define LOG4SHELL_MAX_LOOKUPS 512
+
+/**
+ * Collapse the Log4j lookups of the normalized string #s, innermost first, and
+ * return 1 as soon as a JNDI lookup "${jndi:" appears, otherwise 0.
+ * The lookups used to hide "jndi" are replaced by the text they produce:
+ * - ${::-x}, ${:::::-x}, ${env:NAME:-x}, ${sys:NAME:-x}: the default value x
+ * - ${env:NAME:-}: the empty string
+ * - ${lower:x}, ${upper:x}: x (#s is already lower case)
+ * - ${date:'x'}: x
+ * - other lookups, e.g., ${hostname}: their content
+ */
+static inline int em_collapse_log4j_lookups( char *s ){
+	char *start, *end, *c, *rep;
+	size_t rep_len, tail_len;
 	int i;
-	int ret = 0;
-	
-	if( decode_url( decoded_uri, uri ) != 0 ){
-	
-		em_to_lower( decoded_uri );
-	
-		em_remove_spaces( decoded_uri );
-	
-		for( i=0; i<length; i++ )
-			//whether the uri contains a signature
-			if( strstr( decoded_uri, signatures[i] )){
-				ret = 1;
-				break;
-			}
+
+	for( i=0; i<LOG4SHELL_MAX_LOOKUPS; i++ ){
+		if( strstr( s, "${jndi:" ) != NULL )
+			return 1;
+
+		//innermost lookup: the last "${"
+		start = NULL;
+		for( c = strstr( s, "${" ); c != NULL; c = strstr( c + 1, "${" ))
+			start = c;
+		if( start == NULL )
+			return 0;
+		end = strchr( start + 2, '}' );
+		if( end == NULL ){
+			//not closed (e.g., cut by the end of the packet): ignore this "${"
+			start[1] = '(';
+			continue;
+		}
+
+		*end = '\0';
+		rep = start + 2;
+		if( (c = strstr( rep, ":-" )) != NULL )
+			rep = c + 2;
+		else if( strncmp( rep, "lower:", 6 ) == 0 || strncmp( rep, "upper:", 6 ) == 0 )
+			rep += 6;
+		else if( strncmp( rep, "date:", 5 ) == 0 )
+			rep += 5;
+		rep_len = strlen( rep );
+		//${date:'x'}
+		if( rep_len >= 2 && rep[0] == '\'' && rep[rep_len-1] == '\'' ){
+			rep ++;
+			rep_len -= 2;
+		}
+
+		//replace "${...}" by #rep (that is inside it, thus memmove)
+		tail_len = strlen( end + 1 );
+		memmove( start, rep, rep_len );
+		memmove( start + rep_len, end + 1, tail_len + 1 );
 	}
-	free( decoded_uri );
+	return ( strstr( s, "${jndi:" ) != NULL );
+}
+
+/**
+ * Whether the #len bytes of #data contain a Log4Shell JNDI lookup after
+ * URL decoding, lower-casing, removing white space and collapsing the lookups
+ * used for obfuscation.
+ */
+static inline int em_has_log4shell( const char *data, size_t len ){
+	char *buf, *decoded;
+	size_t i;
+	int ret = 0;
+
+	if( data == NULL || len == 0 )
+		return 0;
+	//quick filter: a lookup needs '$', even URL-encoded ("%24")
+	if( memchr( data, '$', len ) == NULL && memchr( data, '%', len ) == NULL )
+		return 0;
+
+	buf     = malloc( len + 1 );
+	decoded = malloc( len + 1 );
+	if( buf == NULL || decoded == NULL ){
+		free( buf );
+		free( decoded );
+		return 0;
+	}
+	//a NUL byte in a body must not hide what follows it
+	for( i=0; i<len; i++ )
+		buf[i] = (data[i] == '\0') ? ' ' : data[i];
+	buf[len] = '\0';
+
+	if( decode_url( decoded, buf ) != 0 ){
+		em_to_lower( decoded );
+		em_remove_spaces( decoded );
+		ret = em_collapse_log4j_lookups( decoded );
+	}
+	free( buf );
+	free( decoded );
 	return ret;
+}
+
+/**
+ * Check an HTTP request: its URI, and the TCP payload holding the request
+ * line, all the request headers (User-Agent, Referer, Cookie, X-Api-Version,
+ * ...) and the beginning of the body.
+ */
+static int em_check_log4shell( const char *uri, const char *payload ){
+	if( uri != NULL && em_has_log4shell( uri, strlen( uri ) ))
+		return 1;
+	if( payload != NULL && em_has_log4shell( payload, mmt_mem_size( payload ) ))
+		return 1;
+	return 0;
 }
 ]]></embedded_functions>
 </beginning>
