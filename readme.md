@@ -66,8 +66,8 @@ cd mmt-security
     - `UPDATE_RULES`: this module allows to add or remove rules at runtime. This is enabled by default. To disable this, e.g., in the case we do not need this feature: `MODULE_NAME=0`
 
 - compile mmt-security to get .deb file in order to re-distribute its binary: `make deb`  
-   You will get a .deb file, e.g., `mmt-security_1.0.1_8d5d7ea_Linux_x86_64.deb`, containing everything mmt-security needs in order to be able to execute on a fresh machine.  
-   To install this deb file on a new debian-based machine, install the `mmt-dpi` package (1.10.3 or later, from the [MMT-DPI releases](https://github.com/Montimage/mmt-dpi/releases)) first, then use: `sudo dpkg -i file_name.deb`
+   You will get a .deb file, e.g., `mmt-security_1.0.1_8d5d7ea_Linux_x86_64.deb`, containing the mmt-security binaries, libraries and compiled rules.  
+   To install this deb file on a new debian-based machine, install the `mmt-dpi` package (1.10.3 or later, from the [MMT-DPI releases](https://github.com/Montimage/mmt-dpi/releases)) first, then use: `sudo dpkg -i file_name.deb`. An MMT-DPI installed from source (`make install`) registers no `mmt-dpi` package, so `dpkg -i` fails on the dependency: install the MMT-DPI release package instead.
 
 - install mmt-security on the current machine: `make install`
 
