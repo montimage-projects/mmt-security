@@ -425,6 +425,11 @@ check-properties-all:
 # no rule may define on_load/on_unload as static: dlsym() would not find them
 check-rule-hooks:
 	@./check/check-rule-hooks.sh
+
+# rules 56 and 57: environment variables, cost of a fast flood, threads
+check: check-syn-flood-rules
+check-syn-flood-rules: _prepare
+	@./check/check-syn-flood-rules.sh ./$(MAIN_STAND_ALONE)
 	
 _csv.%: _prepare
 	$(QUIET) $(RM) /tmp/mmt-security*.csv
