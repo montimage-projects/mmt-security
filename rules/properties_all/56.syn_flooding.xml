@@ -1,48 +1,255 @@
 <beginning>
 <!-- Property 56: Probable SYN flooding attack.
-     A server sends a SYN-ACK to 3 different clients (IP or port) from the same port within 200 ms, and none of
-     these 3 clients completes its handshake within 1 s: no packet with ACK set and SYN and RST clear comes back
-     on the same connection. A client that answers the SYN-ACK with a RST (the kernel of a real-source flooder
-     does) or that never answers (a spoofed source) leaves the handshake half-open.
+     A server port sends SYN-ACKs to 3 different clients (IP or port) within 200 ms, and none of these 3
+     clients completes its handshake within 1 s: no packet with ACK set and SYN and RST clear comes back on
+     the same connection. A client that answers the SYN-ACK with a RST or a RST|ACK (the kernel of a
+     real-source flooder does) or that never answers (a spoofed source) leaves the handshake half-open.
      A client that opens several connections at once completes each handshake, so it is not reported.
      Rule 57 detects SYN floods whose SYN-ACKs are not seen.
-     Note: the 1 s timeout is checked when a later packet arrives; a flood that ends the capture less than 1 s
-     after its last SYN-ACK is reported only for its earlier handshakes.
+
+     The counting is done in C, at a constant cost per packet, so that a fast flood does not slow the engine
+     down (an FSM instance per SYN-ACK triple grows with the cube of the SYN-ACK rate):
+     - each SYN-ACK is kept in a FIFO of pending handshakes, for at most 1 s;
+     - the client's completing packet marks its handshake done;
+     - a handshake still pending after 1 s is half-open: it is counted for its server IP address and port;
+     - 3 half-open handshakes of one server port whose SYN-ACKs are within 200 ms make an alert. The alert
+       is given on the next packet to or from that server port; the half-open handshakes counted since the
+       previous alert of that port are reported together.
+     Notes:
+     - the 1 s are checked on later TCP packets (of any connection): a flood that ends the capture less than
+       1 s after its last SYN-ACK is reported only for its earlier handshakes;
+     - the FIFO holds 65536 SYN-ACKs: above 65536 SYN-ACKs per second, the oldest one is taken out early and
+       counted if it is still pending;
+     - the tables are shared by all the engine instances of a process (the threads of mmt-probe) and
+       protected by a mutex.
 -->
 <embedded_functions><![CDATA[
-// ACK set, SYN and RST clear: the client's packet that completes (or follows) the TCP handshake
-static inline int em_completes_handshake( double flags ){
-	int f = (int) flags;
-	return ((f & 0x10) != 0) && ((f & 0x06) == 0);
+#include <stdint.h>
+#include <string.h>
+#include <pthread.h>
+#include <sys/time.h>
+
+#define EM_SYN56_TIMEOUT_US  1000000  //a handshake not completed within 1 s is half-open
+#define EM_SYN56_SPAN_US      200000  //3 half-open handshakes of one server port within 200 ms
+#define EM_SYN56_HALF_OPEN         3
+#define EM_SYN56_PENDING       65536  //FIFO of the SYN-ACKs of the last 1 s (power of 2)
+#define EM_SYN56_INDEX        131072  //hash index of the FIFO (power of 2)
+#define EM_SYN56_SERVERS        4096  //server IP address and port (power of 2)
+#define EM_SYN56_PROBES            8
+
+enum { EM_SYN56_FREE = 0, EM_SYN56_WAITING, EM_SYN56_DONE };
+
+typedef struct {
+	uint32_t srv_ip, cli_ip;  //network order
+	uint16_t srv_port, cli_port;
+	uint32_t index;           //slot of em_syn56_index pointing at this entry
+	uint64_t ts;              //time of the SYN-ACK, in us
+	uint8_t  state;
+} em_syn56_hs_t;
+
+typedef struct {
+	uint32_t ip;
+	uint16_t port;
+	uint8_t  used;
+	uint8_t  count;           //half-open handshakes in ts[], at most EM_SYN56_HALF_OPEN - 1
+	uint8_t  alert;           //an alert waits for the next packet of this server port
+	uint64_t ts[ EM_SYN56_HALF_OPEN - 1 ]; //SYN-ACK times of these handshakes
+	uint64_t last;            //SYN-ACK time of the last half-open handshake
+} em_syn56_srv_t;
+
+static em_syn56_hs_t  em_syn56_fifo[ EM_SYN56_PENDING ];
+static uint32_t       em_syn56_head, em_syn56_size;
+static uint32_t       em_syn56_index[ EM_SYN56_INDEX ]; //FIFO position + 1, 0: empty
+static em_syn56_srv_t em_syn56_srv[ EM_SYN56_SERVERS ];
+static uint32_t       em_syn56_alerts;                  //servers whose alert flag is set
+static pthread_mutex_t em_syn56_lock = PTHREAD_MUTEX_INITIALIZER;
+
+//murmur3 finalizer: every input bit reaches every output bit
+static inline uint32_t em_syn56_mix( uint32_t h ){
+	h ^= h >> 16; h *= 0x85ebca6bu;
+	h ^= h >> 13; h *= 0xc2b2ae35u;
+	h ^= h >> 16;
+	return h;
+}
+
+static inline uint32_t em_syn56_hash_hs( uint32_t srv_ip, uint16_t srv_port, uint32_t cli_ip, uint16_t cli_port ){
+	uint32_t h = em_syn56_mix( srv_ip );
+	h = em_syn56_mix( h ^ cli_ip );
+	return em_syn56_mix( h ^ (((uint32_t) srv_port << 16) | cli_port) );
+}
+
+//the FIFO entry that the index slot i points at, if that entry is live and owns the slot
+static inline em_syn56_hs_t *em_syn56_owner( uint32_t i ){
+	em_syn56_hs_t *hs;
+	if( em_syn56_index[ i ] == 0 )
+		return NULL;
+	hs = &em_syn56_fifo[ em_syn56_index[ i ] - 1 ];
+	return ( hs->state != EM_SYN56_FREE && hs->index == i )? hs : NULL;
+}
+
+static em_syn56_hs_t *em_syn56_find( uint32_t srv_ip, uint16_t srv_port, uint32_t cli_ip, uint16_t cli_port ){
+	uint32_t h = em_syn56_hash_hs( srv_ip, srv_port, cli_ip, cli_port ), p;
+	em_syn56_hs_t *hs;
+	for( p = 0; p < EM_SYN56_PROBES; p++ ){
+		hs = em_syn56_owner( (h + p) & (EM_SYN56_INDEX - 1) );
+		if( hs != NULL && hs->srv_ip == srv_ip && hs->cli_ip == cli_ip
+				&& hs->srv_port == srv_port && hs->cli_port == cli_port )
+			return hs;
+	}
+	return NULL;
+}
+
+static em_syn56_srv_t *em_syn56_server( uint32_t ip, uint16_t port, int create ){
+	uint32_t h = em_syn56_mix( em_syn56_mix( ip ) ^ port ), p;
+	em_syn56_srv_t *s, *free_slot = NULL, *old = NULL;
+	for( p = 0; p < EM_SYN56_PROBES; p++ ){
+		s = &em_syn56_srv[ (h + p) & (EM_SYN56_SERVERS - 1) ];
+		if( s->used && s->ip == ip && s->port == port )
+			return s;
+		if( free_slot == NULL && !s->used )
+			free_slot = s;
+		//the server without an alert whose last half-open handshake is the oldest
+		if( s->used && !s->alert && ( old == NULL || s->last < old->last ))
+			old = s;
+	}
+	if( !create )
+		return NULL;
+	if( free_slot == NULL )
+		free_slot = old;
+	if( free_slot == NULL ){
+		//8 servers waiting for their alert: replace the first one
+		free_slot = &em_syn56_srv[ h & (EM_SYN56_SERVERS - 1) ];
+		em_syn56_alerts --;
+	}
+	memset( free_slot, 0, sizeof( *free_slot ));
+	free_slot->used = 1;
+	free_slot->ip   = ip;
+	free_slot->port = port;
+	return free_slot;
+}
+
+static inline int em_syn56_within( uint64_t a, uint64_t b ){
+	return ( a > b ? a - b : b - a ) <= EM_SYN56_SPAN_US;
+}
+
+//a handshake of server ip:port, whose SYN-ACK was sent at ts, is half-open
+static void em_syn56_half_open( uint32_t ip, uint16_t port, uint64_t ts ){
+	em_syn56_srv_t *s = em_syn56_server( ip, port, 1 );
+	int i, n = 0;
+	//keep only the half-open handshakes within 200 ms of this one
+	for( i = 0; i < s->count; i++ )
+		if( em_syn56_within( ts, s->ts[i] ))
+			s->ts[ n++ ] = s->ts[i];
+	s->count = n;
+	s->last  = ts;
+	if( n == EM_SYN56_HALF_OPEN - 1 ){
+		s->count = 0;
+		if( !s->alert ){
+			s->alert = 1;
+			em_syn56_alerts ++;
+		}
+	} else
+		s->ts[ s->count++ ] = ts;
+}
+
+//take the oldest SYN-ACK out of the FIFO
+static void em_syn56_pop(){
+	em_syn56_hs_t *hs = &em_syn56_fifo[ em_syn56_head ];
+	if( hs->state == EM_SYN56_WAITING )
+		em_syn56_half_open( hs->srv_ip, hs->srv_port, hs->ts );
+	hs->state = EM_SYN56_FREE;
+	em_syn56_head = (em_syn56_head + 1) & (EM_SYN56_PENDING - 1);
+	em_syn56_size --;
+}
+
+static void em_syn56_add( uint32_t srv_ip, uint16_t srv_port, uint32_t cli_ip, uint16_t cli_port, uint64_t now ){
+	uint32_t h, p, i, pos;
+	em_syn56_hs_t *hs;
+	//a retransmitted SYN-ACK keeps the time of the first one
+	if( em_syn56_find( srv_ip, srv_port, cli_ip, cli_port ) != NULL )
+		return;
+	if( em_syn56_size == EM_SYN56_PENDING )
+		em_syn56_pop();
+	h = em_syn56_hash_hs( srv_ip, srv_port, cli_ip, cli_port );
+	for( p = 0; p < EM_SYN56_PROBES; p++ ){
+		i = (h + p) & (EM_SYN56_INDEX - 1);
+		if( em_syn56_owner( i ) == NULL )
+			break;
+	}
+	//no free index slot (the index is at most half full, so this is rare): do not track this handshake
+	if( p == EM_SYN56_PROBES )
+		return;
+	pos = (em_syn56_head + em_syn56_size) & (EM_SYN56_PENDING - 1);
+	hs  = &em_syn56_fifo[ pos ];
+	hs->srv_ip   = srv_ip;
+	hs->cli_ip   = cli_ip;
+	hs->srv_port = srv_port;
+	hs->cli_port = cli_port;
+	hs->ts       = now;
+	hs->index    = i;
+	hs->state    = EM_SYN56_WAITING;
+	em_syn56_index[ i ] = pos + 1;
+	em_syn56_size ++;
+}
+
+//ACK set, SYN and RST clear: the client's packet that completes (or follows) the TCP handshake
+static inline int em_completes_handshake( int flags ){
+	return ((flags & 0x10) != 0) && ((flags & 0x06) == 0);
+}
+
+// Called on each TCP packet. Returns 1 when this packet is to or from a server port that has an alert.
+static int em_syn_flood_half_open( const void *ip_src, const void *ip_dst, double sport, double dport,
+		double flags, const void *utime ){
+	const struct timeval *tv = (const struct timeval *) utime;
+	uint32_t src, dst;
+	uint16_t sp = (uint16_t) sport, dp = (uint16_t) dport;
+	int f = (int) flags, ret = 0;
+	uint64_t now;
+	em_syn56_hs_t *hs;
+	em_syn56_srv_t *s;
+
+	if( ip_src == NULL || ip_dst == NULL || tv == NULL )
+		return 0;
+	memcpy( &src, ip_src, 4 );
+	memcpy( &dst, ip_dst, 4 );
+	now = (uint64_t) tv->tv_sec * 1000000 + (uint64_t) tv->tv_usec;
+
+	pthread_mutex_lock( &em_syn56_lock );
+	//the handshakes waiting for more than 1 s (time going backwards stops this until it catches up)
+	while( em_syn56_size > 0 && now > em_syn56_fifo[ em_syn56_head ].ts
+			&& now - em_syn56_fifo[ em_syn56_head ].ts > EM_SYN56_TIMEOUT_US )
+		em_syn56_pop();
+
+	if( f == 0x12 ){
+		if( src != dst )
+			em_syn56_add( src, sp, dst, dp, now );
+	} else if( em_completes_handshake( f )){
+		hs = em_syn56_find( dst, dp, src, sp );
+		if( hs != NULL )
+			hs->state = EM_SYN56_DONE;
+	}
+
+	if( em_syn56_alerts > 0 ){
+		s = em_syn56_server( src, sp, 0 );
+		if( s == NULL || !s->alert )
+			s = em_syn56_server( dst, dp, 0 );
+		if( s != NULL && s->alert ){
+			s->alert = 0;
+			em_syn56_alerts --;
+			ret = 1;
+		}
+	}
+	pthread_mutex_unlock( &em_syn56_lock );
+	return ret;
 }
 ]]></embedded_functions>
-<property value="NOT" delay_units="ms" delay_min="0" delay_max="1000" property_id="56" type_property="ATTACK"
-    description="Probable SYN flooding attack: 3 TCP handshakes to one server port left half-open (no final ACK from the client within 1 s)">
-    <operator value="THEN" delay_units="ms" delay_min="0+" delay_max="100">
-      <event value="COMPUTE" event_id="1"
-             description="TCP [SYN, ACK] packet from the server to client 1"
-             boolean_expression="((tcp.flags == 18)&amp;&amp;(ip.src != ip.dst))"/>
-      <operator value="THEN" delay_units="ms" delay_min="0+" delay_max="100">
-        <event value="COMPUTE" event_id="2"
-               description="TCP [SYN, ACK] packet from the same server port to client 2"
-               boolean_expression="((tcp.flags == 18)&amp;&amp;(((ip.src == ip.src.1)&amp;&amp;(tcp.src_port == tcp.src_port.1))&amp;&amp;((ip.dst != ip.dst.1)||(tcp.dest_port != tcp.dest_port.1))))"/>
-        <event value="COMPUTE" event_id="3"
-               description="TCP [SYN, ACK] packet from the same server port to client 3"
-               boolean_expression="((tcp.flags == 18)&amp;&amp;(((ip.src == ip.src.1)&amp;&amp;(tcp.src_port == tcp.src_port.1))&amp;&amp;(((ip.dst != ip.dst.1)||(tcp.dest_port != tcp.dest_port.1))&amp;&amp;((ip.dst != ip.dst.2)||(tcp.dest_port != tcp.dest_port.2)))))"/>
-      </operator>
-    </operator>
-    <operator value="OR">
-      <event value="COMPUTE" event_id="4"
-             description="Client 1 completes its handshake"
-             boolean_expression="((#em_completes_handshake(tcp.flags) == 1)&amp;&amp;((ip.src == ip.dst.1)&amp;&amp;((ip.dst == ip.src.1)&amp;&amp;((tcp.src_port == tcp.dest_port.1)&amp;&amp;(tcp.dest_port == tcp.src_port.1)))))"/>
-      <operator value="OR">
-        <event value="COMPUTE" event_id="5"
-               description="Client 2 completes its handshake"
-               boolean_expression="((#em_completes_handshake(tcp.flags) == 1)&amp;&amp;((ip.src == ip.dst.2)&amp;&amp;((ip.dst == ip.src.2)&amp;&amp;((tcp.src_port == tcp.dest_port.2)&amp;&amp;(tcp.dest_port == tcp.src_port.2)))))"/>
-        <event value="COMPUTE" event_id="6"
-               description="Client 3 completes its handshake"
-               boolean_expression="((#em_completes_handshake(tcp.flags) == 1)&amp;&amp;((ip.src == ip.dst.3)&amp;&amp;((ip.dst == ip.src.3)&amp;&amp;((tcp.src_port == tcp.dest_port.3)&amp;&amp;(tcp.dest_port == tcp.src_port.3)))))"/>
-      </operator>
-    </operator>
+<property value="THEN" delay_units="ms" delay_min="0" delay_max="0" property_id="56" type_property="ATTACK"
+    description="Probable SYN flooding attack: 3 TCP handshakes to one server port left half-open (no final ACK from the client within 1 s), reported on a packet to or from that server port">
+    <event value="COMPUTE" event_id="1"
+           description="TCP packet to or from a server port that has 3 half-open handshakes whose SYN-ACKs are within 200 ms"
+           boolean_expression="(#em_syn_flood_half_open(ip.src, ip.dst, tcp.src_port, tcp.dest_port, tcp.flags, meta.utime) == 1)"/>
+    <event value="COMPUTE" event_id="2"
+           description="Print source and destination of IP"
+           boolean_expression="(ip.src != ip.dst)"/>
 </property>
 </beginning>
