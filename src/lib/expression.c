@@ -267,13 +267,14 @@ size_t _parse_a_string( char **name, const char *string, size_t str_size ){
 	i = 1;
 	index ++;
 	//find a close bracket
-	while( *(temp+i) != *temp && index < str_size ){
+	//(callers give a maximal size, not the real length: stop at the end of the string too)
+	while( *(temp+i) != *temp && *(temp+i) != '\0' && index < str_size ){
 		i++;
 		index ++;
 	}
 
 	//must be found the closer
-	mmt_assert( index < str_size, "Error 3.a: String is in incorrect format: %s", temp );
+	mmt_assert( index < str_size && *(temp+i) == *temp, "Error 3.a: String is in incorrect format (missing closing quote): %s", temp );
 
 	//duplicate the name
 	if( i-1 == 0)
