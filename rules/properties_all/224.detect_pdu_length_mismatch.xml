@@ -68,6 +68,12 @@ static inline int pdu_track_bad(uint8_t type, uint32_t len, uint32_t seen) {
  * Limits (evasion): the rules see only what lies at the boundaries followed.
  * - A connection is followed only from an A-ASSOCIATE as above; a connection
  *   whose first PDU mmt-dpi rejects is not classified as DICOM at all.
+ * - An A-ASSOCIATE-RQ whose first segment is shorter than 99 bytes (the fixed
+ *   fields and the Application Context Item) is never followed: the direction
+ *   is blind for the whole connection.
+ * - A capture that starts in the middle of a connection, or a direction whose
+ *   slot was dropped, takes the first segment that starts like an A-ASSOCIATE as
+ *   above, even if that segment is data.
  * - The boundary is lost when the segment holding (part of) a PDU header is not
  *   seen: lost, reordered, or not given to the rule (mmt-dpi gives no
  *   tcp.payload_len for a TCP payload of 3 bytes or less in an IPv4 packet padded
@@ -77,9 +83,18 @@ static inline int pdu_track_bad(uint8_t type, uint32_t len, uint32_t seen) {
  * - A PDU length above 2 GiB loses the boundary.
  * - PDU_TRACK_SLOTS connection directions are followed per thread; the least
  *   recently seen of PDU_TRACK_PROBES candidates is dropped when they are taken.
+ *   A connection takes two slots, so a thread follows about 1000 concurrent
+ *   associations without loss (7 of 1000 parallel associations from one client
+ *   dropped, 832 of 2000). A dropped direction is blind for the rest of its
+ *   connection (no false alert).
  * - A connection reusing the addresses and ports of a followed one is taken as a
  *   new stream when its sequence numbers are more than PDU_TRACK_NEAR bytes from
- *   the old one's, as for a new random initial sequence number (99% of reuses).
+ *   the old one's, as for a new random initial sequence number (99% of reuses),
+ *   and its first segment starts with an A-ASSOCIATE as above; any other segment
+ *   that far from the stream is ignored. Such a segment, also one injected out of
+ *   the receiver's window, restarts the direction and clears the PDU types seen
+ *   in both directions, so an injected far lone A-ASSOCIATE-RQ still makes 216
+ *   forget the P-DATA-TF before it.
  *
  * The state is per thread (__thread): mmt-probe evaluates the rules in each of its
  * worker threads, and it gives all the packets of a TCP connection to the same
@@ -208,7 +223,10 @@ static int pdu_track(const void *ip_src, const void *ip_dst, double sport, doubl
         } else if (behind == 0 || (behind < 0 && d->npend == 0 && (int32_t)(d->next - seq) >= 0)) {
             skip = 0; /* in order, or after a gap inside a PDU body */
         } else if (behind > 0 || (uint32_t) -(int64_t) behind > PDU_TRACK_NEAR) {
-            /* far from the stream: a new connection with the same addresses and ports */
+            /* far from the stream: a new connection with the same addresses and ports,
+             * only if it starts with an A-ASSOCIATE; anything else is ignored */
+            if ((dpi_pdu_type != 1 && dpi_pdu_type != 2) || !pdu_track_assoc(p, n, 1))
+                return 0;
             d->synced = 0;
             d->npend = 0;
             d->seen = 0;
