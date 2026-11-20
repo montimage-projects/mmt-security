@@ -22,6 +22,13 @@
  * ".php?affid=1&subid=2&guid=3&ver=4&key=5". An entry without '=' matches
  * a URI containing it, e.g., "/install/ws.exe?v=2".
  * Suricata's |xx| hex escapes are decoded.
+ *
+ * The Suricata rules also check the host, user agent or method, which this
+ * list cannot: entries that match ordinary URIs as a substring are left out,
+ * e.g., "/wp-content/plugins/", "/fwlink/?LinkId=", "/forum.php?sid=",
+ * "/images/view.php", "/config.php?id=", "/load.php?file=",
+ * "click?sid=&cid=", "?user=&type=&id=", "/upload/img.jpg",
+ * "/check_value.php", "/set/first.html", "/connect.php?a=1".
  */
 static const char *list_trojan_uri[] = {
 "/download/Antivirus_.exe",
@@ -118,7 +125,6 @@ static const char *list_trojan_uri[] = {
 "/ask?&u=a=&m=&h=",
 ".php?strID=strPC=",
 "receiver/online",
-"/set/first.html",
 "/task.php?id=&task=",
 "subid=br=os=flg=",
 "guid=ver=stat=ie=os=",
@@ -150,7 +156,6 @@ static const char *list_trojan_uri[] = {
 "/cgi-bin/jl/ad03.pl?pv=2&d=",
 "/cgi-bin/jl/ad03.pl",
 "/prod/MEADInst.exe",
-"/load.php?file=",
 "/bot.php?hwid=pcname=",
 "/isup.php?v=&sox=",
 "?user_id=&version_id=&sys=",
@@ -264,7 +269,6 @@ static const char *list_trojan_uri[] = {
 "/admin/count.php?isOnline=1",
 "port=:&uname=",
 "/Count.asp?mac=&ver=&t=",
-"/upload/img.jpg",
 "/upload/mp3.mp3",
 "/js.php?ran=&t=&u=",
 "/forum/images.php?id",
@@ -316,11 +320,9 @@ static const char *list_trojan_uri[] = {
 "/gate.php?user=&id=&type=",
 ".exedownload_helper.ns",
 "/setup/?name=&ini=&v=",
-"/check_value.php",
 "/el/sregister.php?name=",
 "/el/slogin.php?uid=",
 ".php?secue=&pro=",
-"?user=&type=&id=",
 "/default.asp?tmp=",
 "&user&versao&pcname=",
 "/auth.cgi?mode=&id=",
@@ -346,7 +348,6 @@ static const char *list_trojan_uri[] = {
 "/getversion.php?sn=",
 "/getversion.php?v=",
 "/mac/update.zip",
-"/images/view.php",
 ".asp?i=0&v=o10.1",
 "/title.php?pizza=",
 "/.niggers/bin.sh",
@@ -354,7 +355,6 @@ static const char *list_trojan_uri[] = {
 ".php?i=&data=&hash=",
 "/checkupdate.asmx",
 "update.php?&key=&dummy=",
-"/connect.php?a=1",
 "/download.php?listfiles=",
 ".php?a=n`e>",
 "?uid=&context=&mode=text&data=",
@@ -390,7 +390,6 @@ static const char *list_trojan_uri[] = {
 "/?action=getuid",
 "/?action=&uid=&bit=&version=",
 ".asp?resid=&photoid=",
-"click?sid=&cid=",
 "/download/ftp/grabftp.bin",
 "/check?iid=kernel=",
 "/adm/contador.php",
@@ -407,7 +406,6 @@ static const char *list_trojan_uri[] = {
 "/adobe_flashplayer_7.exe",
 "/go/flashplayer_support/",
 "/?ID=&Serial=&acao=&Log=",
-"/forum.php?sid=",
 ".php?id=&token1=&token2=&C=",
 "/logo.gif?sessd=&sessc=&sessk=",
 ".php?RIGHTS=&WIN=",
@@ -433,7 +431,6 @@ static const char *list_trojan_uri[] = {
 ".php?user=&try=&status=",
 "?-----BEGIN CERTIFICATE-----",
 ".exe???????????????",
-"/config.php?id=",
 "/catalog/outgoing",
 "/api/asyncTwitter.php"
 };
