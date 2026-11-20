@@ -5,18 +5,28 @@
      count reaches the threshold, so it also fires when no SYN-ACK is seen: spoofed or unroutable sources,
      a saturated victim, or a probe that sees only the attacker-to-victim direction.
      Defaults: 100 SYN within 1000 ms. They can be changed with the environment variables
-       MMT_SEC_SYN_FLOOD_THRESHOLD  (number of SYN, > 0)
-       MMT_SEC_SYN_FLOOD_WINDOW_MS  (window length in milliseconds, > 0)
+       MMT_SEC_SYN_FLOOD_THRESHOLD  (number of SYN, from 1 to 1000000000)
+       MMT_SEC_SYN_FLOOD_WINDOW_MS  (window length in milliseconds, from 1 to 3600000)
+     A value must be a decimal integer in that range, without sign, leading zero or other character; any
+     other value is reported with a warning and the default is used. The values in effect are logged when
+     one of the variables is set.
      A busy public server may legitimately receive more than 100 new connections per second per port: raise
-     the threshold there.
-     Destinations are tracked in a fixed table of 4096 slots; when all 8 slots probed for a destination are
-     busy with other destinations of the current window, its count restarts.
+     the threshold there (500 to 1000 is a usual start).
+     Destinations are tracked in a fixed table of 4096 slots, indexed by a hash that mixes every bit of the
+     destination address and port; when all 8 slots probed for a destination are busy with other
+     destinations of the current window, its count restarts.
+     The table is shared by all the engine instances of a process (the threads of mmt-probe) and protected
+     by a mutex, so that each window gives exactly one alert.
 -->
 <embedded_functions><![CDATA[
+#include <errno.h>
+#include <pthread.h>
 #include <sys/time.h>
 
 #define EM_SYN_FLOOD_SLOTS 4096
 #define EM_SYN_FLOOD_PROBES 8
+#define EM_SYN_FLOOD_THRESHOLD_MAX 1000000000UL
+#define EM_SYN_FLOOD_WINDOW_MS_MAX 3600000UL
 
 static unsigned long em_syn_flood_threshold = 100;
 static uint64_t      em_syn_flood_window_us = 1000 * 1000;
@@ -30,14 +40,48 @@ typedef struct {
 } em_syn_flood_slot_t;
 
 static em_syn_flood_slot_t em_syn_flood_table[ EM_SYN_FLOOD_SLOTS ];
+static pthread_mutex_t     em_syn_flood_lock = PTHREAD_MUTEX_INITIALIZER;
+
+// Reads the environment variable name into *value: a decimal integer from 1 to max, without sign,
+// leading zero or trailing character. Returns 1 when it is set, else 0. An invalid value leaves
+// *value unchanged and gives a warning.
+static int em_syn_flood_getenv( const char *name, unsigned long max, unsigned long *value ){
+	const char *str = getenv( name ), *p;
+	unsigned long v;
+	char *end;
+
+	if( str == NULL )
+		return 0;
+	for( p = str; *p >= '0' && *p <= '9'; p++ )
+		;
+	if( p != str && *p == '\0' && str[0] != '0' ){
+		errno = 0;
+		v = strtoul( str, &end, 10 );
+		if( errno == 0 && *end == '\0' && v >= 1 && v <= max ){
+			*value = v;
+			return 1;
+		}
+	}
+	mmt_warn( "Rule 57: ignored %s=\"%s\": expected a decimal integer from 1 to %lu; using the default %lu",
+		name, str, max, *value );
+	return 1;
+}
 
 void on_load(){
-	const char *str = getenv( "MMT_SEC_SYN_FLOOD_THRESHOLD" );
-	if( str != NULL && strtoul( str, NULL, 0 ) > 0 )
-		em_syn_flood_threshold = strtoul( str, NULL, 0 );
-	str = getenv( "MMT_SEC_SYN_FLOOD_WINDOW_MS" );
-	if( str != NULL && strtoul( str, NULL, 0 ) > 0 )
-		em_syn_flood_window_us = (uint64_t) strtoul( str, NULL, 0 ) * 1000;
+	unsigned long window_ms = em_syn_flood_window_us / 1000;
+	int is_set = em_syn_flood_getenv( "MMT_SEC_SYN_FLOOD_THRESHOLD", EM_SYN_FLOOD_THRESHOLD_MAX, &em_syn_flood_threshold );
+	is_set |= em_syn_flood_getenv( "MMT_SEC_SYN_FLOOD_WINDOW_MS", EM_SYN_FLOOD_WINDOW_MS_MAX, &window_ms );
+	em_syn_flood_window_us = (uint64_t) window_ms * 1000;
+	if( is_set )
+		mmt_info( "Rule 57: SYN flood threshold: %lu SYN within %lu ms", em_syn_flood_threshold, window_ms );
+}
+
+//murmur3 finalizer: every input bit reaches every output bit
+static inline uint32_t em_syn_flood_mix( uint32_t h ){
+	h ^= h >> 16; h *= 0x85ebca6bu;
+	h ^= h >> 13; h *= 0xc2b2ae35u;
+	h ^= h >> 16;
+	return h;
 }
 
 // Counts one SYN to (ip_dst, port) at time utime (struct timeval).
@@ -48,14 +92,15 @@ static inline int em_syn_flood_rate_reached( const void *ip_dst, double port, co
 	uint32_t ip, hash;
 	uint16_t p = (uint16_t) port;
 	uint64_t now;
-	int i;
+	int i, ret;
 
 	if( ip_dst == NULL || tv == NULL )
 		return 0;
 	memcpy( &ip, ip_dst, 4 );
 	now  = (uint64_t) tv->tv_sec * 1000000 + (uint64_t) tv->tv_usec;
-	hash = (ip * 2654435761u) ^ ((uint32_t) p * 40503u);
+	hash = em_syn_flood_mix( em_syn_flood_mix( ip ) ^ p );
 
+	pthread_mutex_lock( &em_syn_flood_lock );
 	//find the slot of this destination, or else the first free or expired slot
 	for( i = 0; i < EM_SYN_FLOOD_PROBES; i++ ){
 		cand = &em_syn_flood_table[ (hash + i) % EM_SYN_FLOOD_SLOTS ];
@@ -78,7 +123,9 @@ static inline int em_syn_flood_rate_reached( const void *ip_dst, double port, co
 		slot->count    = 0;
 	}
 	slot->count ++;
-	return slot->count == em_syn_flood_threshold;
+	ret = ( slot->count == em_syn_flood_threshold );
+	pthread_mutex_unlock( &em_syn_flood_lock );
+	return ret;
 }
 ]]></embedded_functions>
 <property value="THEN" delay_units="ms" delay_min="0" delay_max="0" property_id="57" type_property="ATTACK"
