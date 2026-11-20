@@ -4,8 +4,8 @@
 # This check runs them with 2 verification threads (-c) under valgrind and
 # fails on a definite leak.
 #
-# usage: check/h2_thread_leak.sh    (from the repository root, after
-#        `make standalone sample_rules`; needs valgrind)
+# usage: make check-valgrind, or check/h2_thread_leak.sh (after
+#        `make standalone sample_rules`); needs valgrind
 set -u
 cd "$(dirname "$0")/.." || exit 1
 command -v valgrind >/dev/null || { echo "valgrind not found"; exit 2; }

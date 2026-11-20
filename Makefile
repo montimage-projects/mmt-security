@@ -409,6 +409,12 @@ _check_compile_rule: compile_rule
 check: check-properties-all check-rule-hooks _prepare _check_compile_rule $(patsubst %,_check.%,$(NAMES)) check-build-info
 	@echo "All test passed!"
 
+# rules 97 and 98 free the state of every verification thread (needs valgrind)
+check-valgrind: standalone sample_rules
+	@echo
+	@echo "Testing the per-thread state of rules 97 and 98 under valgrind"
+	$(QUIET) bash check/h2_thread_leak.sh
+
 # build info embedded in every rule .so (doc/rule.md)
 check-build-info: compile_rule rule_info standalone sample_rules
 	@echo

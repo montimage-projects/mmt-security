@@ -27,6 +27,7 @@ connections of each of its cases fall in one set of the connection table of
 rules 97 and 98, so the capture tests the ways and the LRU replacement.
 `h2_set()` in `gen_review.py` computes the set of a connection.
 
-`check/h2_thread_leak.sh` (outside `make check`, it needs valgrind) runs rules
-97 and 98 with 2 verification threads (`-c`) and fails if their per-thread
-state leaks at exit.
+`check/h2_thread_leak.sh` runs rules 97 and 98 with 2 verification threads
+(`-c`) under valgrind and fails if their per-thread state leaks at exit. It is
+outside `make check`, as it needs valgrind: `make check-valgrind` runs it, and
+so does the CI after `make check`.
