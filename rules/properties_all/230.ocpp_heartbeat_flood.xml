@@ -35,7 +35,7 @@ static __thread struct ocpp_hb_slot ocpp_hb_table[OCPP_HB_SLOTS];
 static uint32_t ocpp_hb_limit    = 10;
 static time_t   ocpp_hb_window_s = 10;
 
-static void on_load(){
+void on_load(){
 	const char *str = getenv("MMT_SEC_OCPP_HEARTBEAT_LIMIT");
 	if( str != NULL && atoi( str ) > 0 )
 		ocpp_hb_limit = atoi( str );
@@ -44,7 +44,7 @@ static void on_load(){
 		ocpp_hb_window_s = atoi( str );
 }
 
-static void on_unload(){
+void on_unload(){
 }
 
 /* Returns 1 once per window, on the Heartbeat that makes the session exceed the limit. */

@@ -17,7 +17,7 @@
 static double ocpp_max_current_x10 = 320;    /* 32 A */
 static double ocpp_max_power_x10   = 220000; /* 22000 W */
 
-static void on_load(){
+void on_load(){
 	const char *str = getenv("MMT_SEC_OCPP_MAX_CURRENT_A");
 	if( str != NULL && atof( str ) > 0 )
 		ocpp_max_current_x10 = atof( str ) * 10;
@@ -26,7 +26,7 @@ static void on_load(){
 		ocpp_max_power_x10 = atof( str ) * 10;
 }
 
-static void on_unload(){
+void on_unload(){
 }
 
 static inline int em_ocpp_limit_too_high( double limit_x10, const char *unit ){
