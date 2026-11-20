@@ -13,14 +13,22 @@
      A busy public server may legitimately receive more than 100 new connections per second per port: raise
      the threshold there (500 to 1000 is a usual start).
      Destinations are tracked in a fixed table of 4096 slots, indexed by a hash that mixes every bit of the
-     destination address and port; when all 8 slots probed for a destination are busy with other
-     destinations of the current window, its count restarts.
+     destination address and port with a random seed drawn once per process (in on_load), so that the slots
+     of a destination cannot be predicted. When all 8 slots probed for a new destination are busy with other
+     destinations of the current window, the one with the fewest SYN is taken over: a flooded destination
+     keeps its count, since taking its slot would need 8 other destinations with more SYN, each of which is
+     reported itself.
+     For tests only, MMT_SEC_SYN_FLOOD_HASH_SEED (a decimal integer from 0 to 4294967295) sets the seed:
+     0 gives the unseeded hash.
      The table is shared by all the engine instances of a process (the threads of mmt-probe) and protected
      by a mutex, so that each window gives exactly one alert.
 -->
 <embedded_functions><![CDATA[
 #include <errno.h>
 #include <pthread.h>
+#include <time.h>
+#include <unistd.h>
+#include <sys/random.h>
 #include <sys/time.h>
 
 #define EM_SYN_FLOOD_SLOTS 4096
@@ -30,6 +38,7 @@
 
 static unsigned long em_syn_flood_threshold = 100;
 static uint64_t      em_syn_flood_window_us = 1000 * 1000;
+static uint32_t      em_syn_flood_seed;     //hash seed, drawn in on_load()
 
 typedef struct {
 	uint32_t ip;          //destination IPv4 address, network order
@@ -42,29 +51,58 @@ typedef struct {
 static em_syn_flood_slot_t em_syn_flood_table[ EM_SYN_FLOOD_SLOTS ];
 static pthread_mutex_t     em_syn_flood_lock = PTHREAD_MUTEX_INITIALIZER;
 
-// Reads the environment variable name into *value: a decimal integer from 1 to max, without sign,
-// leading zero or trailing character. Returns 1 when it is set, else 0. An invalid value leaves
-// *value unchanged and gives a warning.
-static int em_syn_flood_getenv( const char *name, unsigned long max, unsigned long *value ){
-	const char *str = getenv( name ), *p;
+// Parses str: a decimal integer from min to max, without sign, leading zero or trailing character.
+// Returns 1 and sets *value when it is valid, else 0.
+static int em_syn_flood_parse( const char *str, unsigned long min, unsigned long max, unsigned long *value ){
+	const char *p;
 	unsigned long v;
 	char *end;
 
-	if( str == NULL )
-		return 0;
 	for( p = str; *p >= '0' && *p <= '9'; p++ )
 		;
-	if( p != str && *p == '\0' && str[0] != '0' ){
-		errno = 0;
-		v = strtoul( str, &end, 10 );
-		if( errno == 0 && *end == '\0' && v >= 1 && v <= max ){
-			*value = v;
-			return 1;
-		}
-	}
-	mmt_warn( "Rule 57: ignored %s=\"%s\": expected a decimal integer from 1 to %lu; using the default %lu",
-		name, str, max, *value );
+	if( p == str || *p != '\0' || ( str[0] == '0' && str[1] != '\0' ))
+		return 0;
+	errno = 0;
+	v = strtoul( str, &end, 10 );
+	if( errno != 0 || *end != '\0' || v < min || v > max )
+		return 0;
+	*value = v;
 	return 1;
+}
+
+// Reads the environment variable name into *value: a decimal integer from 1 to max.
+// Returns 1 when it is set, else 0. An invalid value leaves *value unchanged and gives a warning.
+static int em_syn_flood_getenv( const char *name, unsigned long max, unsigned long *value ){
+	const char *str = getenv( name );
+
+	if( str == NULL )
+		return 0;
+	if( !em_syn_flood_parse( str, 1, max, value ))
+		mmt_warn( "Rule 57: ignored %s=\"%s\": expected a decimal integer from 1 to %lu; using the default %lu",
+			name, str, max, *value );
+	return 1;
+}
+
+// Draws the hash seed of this process, or takes MMT_SEC_SYN_FLOOD_HASH_SEED (tests only).
+static void em_syn_flood_set_seed(){
+	const char *str = getenv( "MMT_SEC_SYN_FLOOD_HASH_SEED" );
+	unsigned long v;
+	struct timespec ts;
+
+	if( str != NULL ){
+		if( em_syn_flood_parse( str, 0, UINT32_MAX, &v )){
+			em_syn_flood_seed = (uint32_t) v;
+			mmt_info( "Rule 57: hash seed set by MMT_SEC_SYN_FLOOD_HASH_SEED (for tests only)" );
+			return;
+		}
+		mmt_warn( "Rule 57: ignored MMT_SEC_SYN_FLOOD_HASH_SEED=\"%s\": expected a decimal integer from 0 to %lu; using a random seed",
+			str, (unsigned long) UINT32_MAX );
+	}
+	if( getrandom( &em_syn_flood_seed, sizeof( em_syn_flood_seed ), GRND_NONBLOCK ) == sizeof( em_syn_flood_seed ))
+		return;
+	//no entropy yet (early boot): the clock and the process id
+	clock_gettime( CLOCK_REALTIME, &ts );
+	em_syn_flood_seed = (uint32_t) ts.tv_nsec ^ (uint32_t) ts.tv_sec ^ ((uint32_t) getpid() << 16);
 }
 
 void on_load(){
@@ -74,6 +112,7 @@ void on_load(){
 	em_syn_flood_window_us = (uint64_t) window_ms * 1000;
 	if( is_set )
 		mmt_info( "Rule 57: SYN flood threshold: %lu SYN within %lu ms", em_syn_flood_threshold, window_ms );
+	em_syn_flood_set_seed();
 }
 
 //murmur3 finalizer: every input bit reaches every output bit
@@ -98,7 +137,7 @@ static inline int em_syn_flood_rate_reached( const void *ip_dst, double port, co
 		return 0;
 	memcpy( &ip, ip_dst, 4 );
 	now  = (uint64_t) tv->tv_sec * 1000000 + (uint64_t) tv->tv_usec;
-	hash = em_syn_flood_mix( em_syn_flood_mix( ip ) ^ p );
+	hash = em_syn_flood_mix( em_syn_flood_mix( ip ^ em_syn_flood_seed ) ^ p );
 
 	pthread_mutex_lock( &em_syn_flood_lock );
 	//find the slot of this destination, or else the first free or expired slot
@@ -111,8 +150,15 @@ static inline int em_syn_flood_rate_reached( const void *ip_dst, double port, co
 		if( slot == NULL && ( !cand->used || now - cand->start_us > em_syn_flood_window_us ))
 			slot = cand;
 	}
-	if( slot == NULL )
+	//all 8 slots busy with other destinations of their window: take the one with the fewest SYN
+	if( slot == NULL ){
 		slot = &em_syn_flood_table[ hash % EM_SYN_FLOOD_SLOTS ];
+		for( i = 1; i < EM_SYN_FLOOD_PROBES; i++ ){
+			cand = &em_syn_flood_table[ (hash + i) % EM_SYN_FLOOD_SLOTS ];
+			if( cand->count < slot->count )
+				slot = cand;
+		}
+	}
 
 	//new destination in this slot, or its window is over: start a new window
 	if( !slot->used || slot->ip != ip || slot->port != p || now - slot->start_us > em_syn_flood_window_us ){
