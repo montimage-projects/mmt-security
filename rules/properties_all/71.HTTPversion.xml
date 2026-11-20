@@ -9,12 +9,32 @@ static inline bool em_http_is_valid_version( const char *v, const char *end ){
 	return ( end - v == 8 && (memcmp( v, "HTTP/1.0", 8 ) == 0 || memcmp( v, "HTTP/1.1", 8 ) == 0) );
 }
 
+//whether [c, end) starts with 3 digits followed by a space or the end: a status code
+static inline bool em_http_is_status_code( const char *c, const char *end ){
+	return ( end - c >= 3 && c[0] >= '0' && c[0] <= '9' && c[1] >= '0' && c[1] <= '9' && c[2] >= '0' && c[2] <= '9'
+			&& (end - c == 3 || c[3] == ' ') );
+}
+
+//whether [t, end) holds "://": the absolute form of a request-target
+static inline bool em_http_is_absolute( const char *t, const char *end ){
+	for( ; end - t >= 3; t++ )
+		if( t[0] == ':' && t[1] == '/' && t[2] == '/' )
+			return true;
+	return false;
+}
+
 /**
- * Check the HTTP version of the HTTP/1.x message that starts the TCP payload:
- * - a status line starts with the version: "HTTP/1.1 200 OK"
- * - a request line ends with it: "GET / HTTP/1.1" followed by CRLF
- * Only the first line of the payload is read, so text in a message body
- * is never taken for a start line.
+ * Check the HTTP version of the HTTP/1.x message that starts the TCP payload.
+ * Only the first line of the payload is read, and only when it has the shape
+ * of a start line (RFC 9112, sections 3 and 4), so that text in a message
+ * body, also at the start of a later segment of the body, is never taken for
+ * a start line:
+ * - a status line: HTTP-version SP 3DIGIT [SP reason], e.g., "HTTP/1.1 200 OK";
+ * - a request line: method SP request-target SP HTTP-version, e.g.,
+ *   "GET / HTTP/1.1", where the method is an upper-case token and the target
+ *   is an origin ("/..."), absolute ("http://...") or asterisk ("*") form, or
+ *   the authority form of CONNECT.
+ * A request pipelined later in the same segment is not read.
  *
  * Return:
  * - 1: the start line carries a version other than HTTP/1.0 and HTTP/1.1,
@@ -22,7 +42,7 @@ static inline bool em_http_is_valid_version( const char *v, const char *end ){
  * - 0: otherwise, including the HTTP/2 connection preface "PRI * HTTP/2.0"
  */
 static inline int em_check_version_http( const char *str ){
-	const char *end, *eol, *v, *c;
+	const char *end, *eol, *v, *c, *t;
 
 	if( str == NULL )
 		return 0;
@@ -34,21 +54,35 @@ static inline int em_check_version_http( const char *str ){
 	if( eol > str && eol[-1] == '\r' )
 		eol --;
 
-	//status line: the version is the first token
+	//status line: the version is the first token, followed by a status code
 	if( eol - str >= 5 && memcmp( str, "HTTP/", 5 ) == 0 ){
 		for( v = str; v < eol && *v != ' '; v++ )
 			;
+		if( v >= eol || !em_http_is_status_code( v + 1, eol ))
+			return 0;  //not a status line, e.g., "HTTP/2 is faster" in a body
 		return !em_http_is_valid_version( str, v );
 	}
 
-	//request line: the version is the last token, after the last space
-	for( c = eol; c > str && c[-1] != ' '; c-- )
+	//request line: method SP request-target SP HTTP-version
+	for( c = str; c < eol && ((*c >= 'A' && *c <= 'Z') || *c == '-' || *c == '_'); c++ )
 		;
-	if( c == str || eol - c < 5 || memcmp( c, "HTTP/", 5 ) != 0 )
-		return 0;  //not an HTTP/1.x request line
+	if( c == str || c >= eol || *c != ' ' )
+		return 0;  //no upper-case method
+	t = c + 1;
+	for( c = t; c < eol && *c != ' '; c++ )
+		;
+	if( c == t || c >= eol )
+		return 0;  //no request-target
+	if( !( *t == '/' || (*t == '*' && c - t == 1)
+			|| em_http_is_absolute( t, c )
+			|| (t - str == 8 && memcmp( str, "CONNECT ", 8 ) == 0) ))
+		return 0;  //not a request-target form
+	v = c + 1;
+	if( memchr( v, ' ', eol - v ) != NULL || eol - v < 5 || memcmp( v, "HTTP/", 5 ) != 0 )
+		return 0;  //the version is not the last token
 	if( eol - str == 14 && memcmp( str, "PRI * HTTP/2.0", 14 ) == 0 )
 		return 0;  //HTTP/2 connection preface (RFC 9113, section 3.4)
-	return !em_http_is_valid_version( c, eol );
+	return !em_http_is_valid_version( v, eol );
 }
 ]]></embedded_functions>
 <!-- Property 71: Detect malicious HTTP version-->
