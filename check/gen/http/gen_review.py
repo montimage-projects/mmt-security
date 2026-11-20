@@ -417,6 +417,10 @@ cases = [
     [("c", b"CONNECT lab.example:443 HTTP/1.3\r\nHost: lab.example:443\r\n\r\n")],
     [("c", b"GET http://lab.example/ HTTP/0.8\r\nHost: lab.example\r\n\r\n")],
     [("c", GET), ("s", b"HTTP/1.2 200 OK\r\nContent-Length: 0\r\n\r\n")],
+    # runs of SP between the tokens (review 2, F5): a benign request, then malicious versions
+    [("c", b"GET  /  HTTP/1.1\r\nHost: lab.example\r\n\r\n"), ("s", b"HTTP/1.1  200 OK\r\nContent-Length: 0\r\n\r\n")],
+    [("c", b"GET  / HTTP/1.2\r\nHost: lab.example\r\n\r\n")],
+    [("c", GET), ("s", b"HTTP/1.01  200 OK\r\nContent-Length: 0\r\n\r\n")],
 ]
 for i, ex in enumerate(cases):
     Conn(c, 41100 + i, 80).http1(ex)

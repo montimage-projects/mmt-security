@@ -34,6 +34,8 @@ static inline bool em_http_is_absolute( const char *t, const char *end ){
  *   "GET / HTTP/1.1", where the method is an upper-case token and the target
  *   is an origin ("/..."), absolute ("http://...") or asterisk ("*") form, or
  *   the authority form of CONNECT.
+ * A run of SP is accepted where one SP is expected, as a recipient may do
+ * (RFC 9112, section 3): "GET  / HTTP/1.2" is read as "GET / HTTP/1.2".
  * A request pipelined later in the same segment is not read.
  *
  * Return:
@@ -42,7 +44,7 @@ static inline bool em_http_is_absolute( const char *t, const char *end ){
  * - 0: otherwise, including the HTTP/2 connection preface "PRI * HTTP/2.0"
  */
 static inline int em_check_version_http( const char *str ){
-	const char *end, *eol, *v, *c, *t;
+	const char *end, *eol, *v, *c, *t, *m;
 
 	if( str == NULL )
 		return 0;
@@ -58,7 +60,9 @@ static inline int em_check_version_http( const char *str ){
 	if( eol - str >= 5 && memcmp( str, "HTTP/", 5 ) == 0 ){
 		for( v = str; v < eol && *v != ' '; v++ )
 			;
-		if( v >= eol || !em_http_is_status_code( v + 1, eol ))
+		for( c = v; c < eol && *c == ' '; c++ )
+			;
+		if( c == v || !em_http_is_status_code( c, eol ))
 			return 0;  //not a status line, e.g., "HTTP/2 is faster" in a body
 		return !em_http_is_valid_version( str, v );
 	}
@@ -68,16 +72,19 @@ static inline int em_check_version_http( const char *str ){
 		;
 	if( c == str || c >= eol || *c != ' ' )
 		return 0;  //no upper-case method
-	t = c + 1;
+	m = c;     //end of the method
+	for( t = c; t < eol && *t == ' '; t++ )
+		;
 	for( c = t; c < eol && *c != ' '; c++ )
 		;
 	if( c == t || c >= eol )
 		return 0;  //no request-target
 	if( !( *t == '/' || (*t == '*' && c - t == 1)
 			|| em_http_is_absolute( t, c )
-			|| (t - str == 8 && memcmp( str, "CONNECT ", 8 ) == 0) ))
+			|| (m - str == 7 && memcmp( str, "CONNECT", 7 ) == 0) ))
 		return 0;  //not a request-target form
-	v = c + 1;
+	for( v = c; v < eol && *v == ' '; v++ )
+		;
 	if( memchr( v, ' ', eol - v ) != NULL || eol - v < 5 || memcmp( v, "HTTP/", 5 ) != 0 )
 		return 0;  //the version is not the last token
 	if( eol - str == 14 && memcmp( str, "PRI * HTTP/2.0", 14 ) == 0 )
