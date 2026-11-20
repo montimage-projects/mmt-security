@@ -6,9 +6,10 @@
 # in rules/<rule>.xml and in its mirror rules/properties_all/<rule>.xml.
 #
 #   check/dicom-blocks.sh [-I <mmt-dpi include dir>]
-#       fail when a copy differs from its block, when a mirror differs from its
-#       rule, or when the embedded C of one of these rules or of 223 does not
-#       compile on its own (without the preamble that compile_rule adds)
+#       fail when a file has no copy of a block or more than one, when a copy
+#       differs from its block, when a mirror differs from its rule, or when the
+#       embedded C of one of these rules or of 223 does not compile on its own
+#       (without the preamble that compile_rule adds)
 #   check/dicom-blocks.sh --write
 #       write the blocks into the rules and their mirrors
 set -u
@@ -58,8 +59,12 @@ for pair in "$TRACK:pdu_track.c" "$WALK:dimse_walk.c"; do
 		f=$(rule_file "$id")
 		if [ -z "$f" ]; then echo "  => missing rule $id"; fail=1; continue; fi
 		for g in "$f" "rules/properties_all/$(basename "$f")"; do
-			if ! grep -qxF "$(head -1 "$block")" "$g"; then
-				echo "  => $g: no copy of $block"; fail=1; continue
+			# exactly one copy: extract and splice see only the first
+			n=$(grep -cxF "$(head -1 "$block")" "$g")
+			if [ "$n" -ne 1 ]; then
+				if [ "$n" -eq 0 ]; then echo "  => $g: no copy of $block"
+				else echo "  => $g: $n copies of the first line of $block, not one"; fi
+				fail=1; continue
 			fi
 			if [ $WRITE -eq 1 ]; then
 				splice "$g" "$block"
