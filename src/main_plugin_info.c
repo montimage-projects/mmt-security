@@ -15,6 +15,7 @@
 #include <dlfcn.h>
 #include <ctype.h>
 #include <stdio_ext.h>
+#include <unistd.h>
 
 static void _usage( const char *prog ){
 	fprintf( stderr, "Usage: %s [lib_file.so]\n", prog );
@@ -91,7 +92,12 @@ static void _print_json_indented( const char *s ){
 }
 
 static int _print_build_info( const char *path, bool json ){
-	char *info = _get_build_info( path );
+	char *info;
+	if( access( path, R_OK ) != 0 ){
+		fprintf( stderr, "Cannot read %s\n", path );
+		return 1;
+	}
+	info = _get_build_info( path );
 	if( info == NULL ){
 		if( json )
 			printf( "null\n" );

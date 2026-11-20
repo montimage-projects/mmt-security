@@ -975,8 +975,10 @@ static void _gen_build_info( FILE *fd, rule_t *const* rules, size_t count, const
 		rule_ids[i] = rules[i]->id;
 
 	json = mmt_sec_create_rule_build_info( &opt, rule_ids, count, _build_ids, _build_ids_count );
-	cc   = strstr( json, MMT_SEC_BUILD_INFO_CC_PLACEHOLDER );
+	//the key makes the match unique: a quote inside a JSON value is escaped
+	cc   = strstr( json, "\"compiler\":\"" MMT_SEC_BUILD_INFO_CC_PLACEHOLDER "\"" );
 	mmt_assert( cc != NULL, "Error 11b: build info without compiler placeholder" );
+	cc  += strlen( "\"compiler\":\"" );
 
 	fprintf( fd, "\n\n /* BEGIN mmt-security rule build info (doc/rule.md) */" );
 	fprintf( fd, "\n#if defined(__clang__)\n #define MMT_SEC_RULE_CC \"clang \" __clang_version__" );
