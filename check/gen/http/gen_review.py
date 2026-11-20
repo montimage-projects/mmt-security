@@ -95,8 +95,9 @@ class Conn:
         self._s("PA", data)
         self.s = (self.s + len(data)) & 0xffffffff
 
-    def h2_setup(self, server_settings=()):
-        self.handshake()
+    def h2_setup(self, server_settings=(), handshake=True):
+        if handshake:
+            self.handshake()
         self.cl(PREFACE + settings())
         self.sv(settings(*server_settings) + SETTINGS_ACK)
         self.cl(SETTINGS_ACK)
@@ -106,6 +107,21 @@ class Conn:
         for d, data in exchanges:
             (self.cl if d == "c" else self.sv)(data)
         self.fin()
+
+    def flags(self, flags, seq, server=False, ack=None):
+        """one segment without data, with #flags, at sequence number #seq,
+        from the client (or the server, acknowledging #ack); the next sequence
+        numbers do not change"""
+        if server:
+            s, c, self.s = self.s, self.c, seq & 0xffffffff
+            if ack is not None:
+                self.c = ack & 0xffffffff
+            self._s(flags)
+            self.s, self.c = s, c
+        else:
+            c, self.c = self.c, seq & 0xffffffff
+            self._c(flags)
+            self.c = c
 
     def fin(self):
         self._c("FA")
@@ -150,6 +166,20 @@ def bomb(conn, first=b"", between=None, blocks=50):
         sid += 2
 
 
+def small_bomb(conn, between=None, blocks=50):
+    """the bomb of bomb(), smaller, to keep the captures small: blocks of 24
+    references (73 KB decoded each, from 27 bytes), and no server response"""
+    value = b"A" * 3000
+    conn.cl(frame(1, 4, 1, REQ + b"\x40\x0bx-bomb-name\x7f" + bytes([((3000 - 127) & 0x7f) | 0x80, (3000 - 127) >> 7]) + value))
+    conn.sv(frame(1, 5, 1, RESP))
+    if between:
+        between(conn)
+    sid = 3
+    for _ in range(blocks):
+        conn.cl(frame(1, 5, sid, b"\x82\x86\x84" + b"\xbe" * 24))
+        sid += 2
+
+
 def json_request(conn, body, sid=1):
     conn.cl(frame(1, 4, sid, REQ) + frame(0, 1, sid, body))
     conn.sv(frame(1, 5, sid, RESP))
@@ -171,7 +201,7 @@ a.sv(frame(1, 5, 1, RESP))
 a.fin()
 a = Conn(c, 50001, isn_c=1000, isn_s=7000)
 a.h2_setup()
-bomb(a)
+small_bomb(a)   # the smaller bomb: the capture stays under 100 KB
 a.fin()
 
 
@@ -217,6 +247,38 @@ a = Conn(c, 50004, isn_c=1000, isn_s=7000)
 a.h2_setup()
 bomb(a, blocks=10)
 a.fin()
+
+
+def preface_retransmitted(conn, sid=1):
+    """preface_in_data(), then a retransmission of its last segment (the
+    preface): the server drops the duplicate"""
+    preface_in_data(conn, sid)
+    conn.seg(PREFACE, conn.c - 24)
+
+
+def preface_overlap(conn, sid=1):
+    """a DATA frame whose payload ends with the preface: all but its last
+    byte, then a segment that starts 23 bytes before the next sequence number,
+    the preface: the 23 bytes already sent, and the last byte"""
+    d = frame(0, 1, sid, b"x" * 20 + PREFACE)
+    conn.cl(d[:-1])
+    conn.seg(PREFACE, conn.c - 23)
+    conn.c += 1
+
+
+def preface_behind(n):
+    """a segment #n bytes behind the next sequence number, the preface: the
+    server drops it (a duplicate, or out of the window)"""
+    return lambda conn: conn.seg(PREFACE, conn.c - n)
+
+
+# a segment that the server drops, and that starts with the preface, between
+# the priming block and 50 bombs (review 3, F2): not a new connection
+for i, between in enumerate([preface_retransmitted, preface_overlap, preface_behind(2 << 20), preface_behind(1000)]):
+    a = Conn(c, 50005 + i)
+    a.h2_setup()
+    small_bomb(a, between=between)
+    a.fin()
 c.write("97.http2_state_evasion")
 
 # ------------------------------------------------- 98: state evasions (finding 1)
@@ -267,6 +329,55 @@ a = Conn(c, 50020, isn_c=1000, isn_s=7000)
 a.h2_setup()
 json_request(a, FUZZ)
 a.fin()
+
+
+def split_request(conn, body, between=None, sid=1):
+    """HEADERS, then a DATA frame cut in 2 segments, #between(conn) between them:
+    the injection is in the second one"""
+    conn.cl(frame(1, 4, sid, REQ))
+    d = frame(0, 1, sid, body)
+    conn.cl(d[:12])
+    if between:
+        between(conn)
+    conn.cl(d[12:])
+    conn.sv(frame(1, 5, sid, RESP))
+
+
+def two_frame_request(conn, between=None, sid=1):
+    """HEADERS, then the fuzzed body in 2 DATA frames, #between(conn) between
+    them: the injection is in the second one, which does not start with '{'"""
+    conn.cl(frame(1, 4, sid, REQ))
+    conn.cl(frame(0, 0, sid, b'{"cmd":"'))
+    if between:
+        between(conn)
+    conn.cl(frame(0, 1, sid, b'$(id)"}'))
+    conn.sv(frame(1, 5, sid, RESP))
+
+
+# a segment that the server drops, and that starts with the preface, inside a
+# request body (review 3, F2): not a new connection, the body stays whole
+#   - controls: a DATA frame cut in 2 segments, a body in 2 DATA frames;
+#   - between 2 DATA frames, the end of a DATA frame of stream 3 at the expected
+#     sequence number, then its retransmission;
+#   - between 2 DATA frames, the same DATA frame, then a segment that overlaps the
+#     23 bytes already sent;
+#   - inside a DATA frame, and between 2 DATA frames, a segment 1000 bytes behind
+def stream3(end):
+    return lambda a: (a.cl(frame(1, 4, 3, REQ)), end(a, 3))
+
+
+for i, (request, between) in enumerate([(split_request, None), (two_frame_request, None),
+                                        (two_frame_request, stream3(preface_retransmitted)),
+                                        (two_frame_request, stream3(preface_overlap)),
+                                        (split_request, preface_behind(1000)),
+                                        (two_frame_request, preface_behind(1000))]):
+    a = Conn(c, 50030 + i)
+    a.h2_setup()
+    if request is split_request:
+        split_request(a, FUZZ, between)
+    else:
+        two_frame_request(a, between)
+    a.fin()
 c.write("98.http2_state_evasion")
 
 # ------------------------------------------------- 97, 98: connection table (review 2, F3)
@@ -338,6 +449,70 @@ for plan in ["BCD", "BCDE", "BCADE"]:
     a.sv(frame(1, 5, 1, RESP))
     a.fin()
 c.write("97.98.http2_conn_table")
+
+# ------------------------------------------------- 97, 98: TCP flags (review 3, F2)
+# A segment that starts with the preface restarts the state of a connection
+# only once the connection is over. Each case is played for rule 97 (10 bombs
+# after the priming block: 10 alerts), then for rule 98 (a fuzzed body cut in
+# 2 segments: 1 alert).
+c = Pcap(1700037000.0)
+ports = iter(range(52000, 53000))
+
+
+def attack97(conn, between=None):
+    small_bomb(conn, between=between, blocks=10)
+
+
+def attack98(conn, between=None):
+    split_request(conn, FUZZ, between)
+
+
+def old_conn(port):
+    """a connection whose next client sequence number is 64 KiB ahead of the
+    ISN of the next connection on its 4-tuple: only the preface tells the new
+    connection, the reader takes its segments for retransmissions otherwise"""
+    a = Conn(c, port, isn_c=1000 + (64 << 10))
+    a.h2_setup()
+    a.cl(frame(1, 5, 1, REQ))
+    a.sv(frame(1, 5, 1, RESP))
+    return a
+
+
+# the 4-tuple is reused: the new connection must be read
+reuse = [
+    (lambda a: a.fin(), False),             # the client closed the old one (FIN); the new handshake is not captured
+    (lambda a: a.flags("R", a.c), False),   # the client aborted it (RST at its next sequence number); no new handshake
+    (lambda a: None, True),                 # its end is not captured; the server accepts the new one (SYN-ACK)
+]
+# the connection goes on, a segment that the server drops starts with the
+# preface: it must not restart the state
+running = [
+    # a SYN on the connection (the server answers with an ACK, RFC 5961), and the
+    # preface at its next sequence number, 1000 bytes behind
+    lambda a: (a.flags("S", a.c - 1001), a.seg(PREFACE, a.c - 1000)),
+    # an RST 100 bytes ahead: the server ignores it (RFC 5961); then the preface 1000 bytes behind
+    lambda a: (a.flags("R", a.c + 100), a.seg(PREFACE, a.c - 1000)),
+    # a FIN 2 MiB ahead (out of the window); then the preface 1000 bytes behind
+    lambda a: (a.flags("FA", a.c + (2 << 20)), a.seg(PREFACE, a.c - 1000)),
+    # the server closes its side (FIN), the client can still send; then the preface 1000 bytes behind
+    lambda a: (a.flags("FA", a.s, server=True), a.seg(PREFACE, a.c - 1000)),
+    # a SYN-ACK for another sequence number; then the preface 1000 bytes behind
+    lambda a: (a.flags("SA", a.s - 1, server=True, ack=a.c - 5000), a.seg(PREFACE, a.c - 1000)),
+]
+for attack in (attack97, attack98):
+    for end, handshake in reuse:
+        port = next(ports)
+        end(old_conn(port))
+        a = Conn(c, port, isn_c=1000, isn_s=7000)
+        a.h2_setup(handshake=handshake)
+        attack(a)
+        a.fin()
+    for between in running:
+        a = Conn(c, next(ports))
+        a.h2_setup()
+        attack(a, between)
+        a.fin()
+c.write("97.98.http2_tcp_flags")
 
 # ------------------------------------------------- 97: header table size 0 (finding 3)
 c = Pcap(1700032000.0)
