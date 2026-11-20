@@ -408,7 +408,7 @@ _check_compile_rule: compile_rule
 	@echo "Testing compile_rule on malformed rules"
 	$(QUIET) bash check/rules_compile.sh ./$(MAIN_GEN_PLUGIN)
 
-check: check-properties-all check-rule-hooks check-csv-env _prepare _check_compile_rule $(patsubst %,_check.%,$(NAMES)) check-build-info
+check: check-properties-all check-rule-hooks _prepare _check_compile_rule $(patsubst %,_check.%,$(NAMES)) check-build-info
 	@echo "All test passed!"
 
 # rules 97 and 98 free the state of every verification thread (needs valgrind)
@@ -416,6 +416,11 @@ check-valgrind: standalone sample_rules
 	@echo
 	@echo "Testing the per-thread state of rules 97 and 98 under valgrind"
 	$(QUIET) bash check/h2_thread_leak.sh
+
+# make _csv.X uses check/pcap/X.env, as make _check.X does
+check: check-csv-env
+check-csv-env:
+	@./check/check-csv-env.sh
 
 # build info embedded in every rule .so (doc/rule.md)
 check-build-info: compile_rule rule_info standalone sample_rules
@@ -440,10 +445,6 @@ check-dicom-blocks:
 # no rule may define on_load/on_unload as static: dlsym() would not find them
 check-rule-hooks:
 	@./check/check-rule-hooks.sh
-
-# make _csv.X uses check/pcap/X.env, as make _check.X does
-check-csv-env:
-	@./check/check-csv-env.sh
 	
 _csv.%: _prepare
 	$(QUIET) $(RM) /tmp/mmt-security*.csv
