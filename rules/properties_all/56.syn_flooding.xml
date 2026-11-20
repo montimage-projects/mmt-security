@@ -24,21 +24,36 @@
      Notes:
      - the 1 s are checked on later TCP packets (of any connection), and the alert waits for a packet to the
        server port: a spoofed flood (the clients never answer) shorter than 1 s, after which that port
-       receives nothing, is not reported by this rule (rule 57 reports it from its SYN rate). A real-source
-       flood (the clients reset the handshakes) is counted at once;
+       receives nothing, is not reported by this rule. Rule 57 reports it from its SYN rate only if it reaches
+       rule 57's threshold (100 SYN within 1 s by default): a smaller burst on a port that then receives
+       nothing is reported by neither rule. Any later packet to the port (a legitimate client, the next pulse
+       of a pulsing flood) reports it. A real-source flood (the clients reset the handshakes) is counted at
+       once;
      - the FIFO holds 65536 SYN-ACKs (1 s at 65536 new connections per second). When it is full, a new
        SYN-ACK is not tracked until the oldest ones leave after their 1 s: above about 65 k new connections
        per second, a part of the handshakes is not checked, and a flood is reported from the tracked ones,
        up to about 0.7 s later at 100 k/s. Taking the oldest SYN-ACK out early and counting it if it is still
        pending would instead give false alerts on a server above about 65 k new connections per second whose
-       clients are slow (more than about 0.65 s from the SYN-ACK to their ACK);
+       clients are slow (more than about 0.65 s from the SYN-ACK to their ACK). So an attacker who injects
+       about 65 k spoofed SYN-ACKs per second keeps the FIFO full and pauses this rule for all the servers
+       (such a rate is a loud flood in its own right, which rule 57 sees only if it includes SYNs);
+     - the FIFO and the server table are indexed by a hash that mixes every bit of the addresses and ports
+       with a random seed drawn once per process (in on_load), so that an attacker cannot choose servers that
+       share the slots of a victim and evict it. For tests only, MMT_SEC_SYN_FLOOD_HASH_SEED (a decimal
+       integer from 0 to 4294967295, also read by rule 57) sets the seed: 0 gives the unseeded hash. A server
+       whose alert waits for a packet to its port keeps its slot until that packet comes;
      - the tables are shared by all the engine instances of a process (the threads of mmt-probe) and
        protected by a mutex.
 -->
 <embedded_functions><![CDATA[
+#include <errno.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <time.h>
+#include <unistd.h>
+#include <sys/random.h>
 #include <sys/time.h>
 
 #define EM_SYN56_TIMEOUT_US  1000000  //a handshake not completed within 1 s is half-open
@@ -78,6 +93,46 @@ static uint32_t       em_syn56_index[ EM_SYN56_INDEX ]; //FIFO position + 1, 0: 
 static em_syn56_srv_t em_syn56_srv[ EM_SYN56_SERVERS ];
 static uint32_t       em_syn56_alerts;                  //servers whose alert flag is set
 static pthread_mutex_t em_syn56_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t       em_syn56_seed;                    //hash seed, drawn in on_load()
+
+// Parses str: a decimal integer from 0 to 4294967295, without sign, leading zero or trailing character.
+// Returns 1 and sets *seed when it is valid, else 0.
+static int em_syn56_parse_seed( const char *str, uint32_t *seed ){
+	const char *p;
+	unsigned long v;
+	char *end;
+
+	for( p = str; *p >= '0' && *p <= '9'; p++ )
+		;
+	if( p == str || *p != '\0' || ( str[0] == '0' && str[1] != '\0' ))
+		return 0;
+	errno = 0;
+	v = strtoul( str, &end, 10 );
+	if( errno != 0 || *end != '\0' || v > UINT32_MAX )
+		return 0;
+	*seed = (uint32_t) v;
+	return 1;
+}
+
+// Draws the hash seed of this process, or takes MMT_SEC_SYN_FLOOD_HASH_SEED (tests only).
+void on_load(){
+	const char *str = getenv( "MMT_SEC_SYN_FLOOD_HASH_SEED" );
+	struct timespec ts;
+
+	if( str != NULL ){
+		if( em_syn56_parse_seed( str, &em_syn56_seed )){
+			mmt_warn( "Rule 56: hash seed set by MMT_SEC_SYN_FLOOD_HASH_SEED (for tests only)" );
+			return;
+		}
+		mmt_warn( "Rule 56: ignored MMT_SEC_SYN_FLOOD_HASH_SEED=\"%s\": expected a decimal integer from 0 to %lu; using a random seed",
+			str, (unsigned long) UINT32_MAX );
+	}
+	if( getrandom( &em_syn56_seed, sizeof( em_syn56_seed ), GRND_NONBLOCK ) == sizeof( em_syn56_seed ))
+		return;
+	//no entropy yet (early boot): the clock and the process id
+	clock_gettime( CLOCK_REALTIME, &ts );
+	em_syn56_seed = (uint32_t) ts.tv_nsec ^ (uint32_t) ts.tv_sec ^ ((uint32_t) getpid() << 16);
+}
 
 //murmur3 finalizer: every input bit reaches every output bit
 static inline uint32_t em_syn56_mix( uint32_t h ){
@@ -88,7 +143,7 @@ static inline uint32_t em_syn56_mix( uint32_t h ){
 }
 
 static inline uint32_t em_syn56_hash_hs( uint32_t srv_ip, uint16_t srv_port, uint32_t cli_ip, uint16_t cli_port ){
-	uint32_t h = em_syn56_mix( srv_ip );
+	uint32_t h = em_syn56_mix( srv_ip ^ em_syn56_seed );
 	h = em_syn56_mix( h ^ cli_ip );
 	return em_syn56_mix( h ^ (((uint32_t) srv_port << 16) | cli_port) );
 }
@@ -115,7 +170,7 @@ static em_syn56_hs_t *em_syn56_find( uint32_t srv_ip, uint16_t srv_port, uint32_
 }
 
 static em_syn56_srv_t *em_syn56_server( uint32_t ip, uint16_t port, int create ){
-	uint32_t h = em_syn56_mix( em_syn56_mix( ip ) ^ port ), p;
+	uint32_t h = em_syn56_mix( em_syn56_mix( ip ^ em_syn56_seed ) ^ port ), p;
 	em_syn56_srv_t *s, *free_slot = NULL, *old = NULL;
 	for( p = 0; p < EM_SYN56_PROBES; p++ ){
 		s = &em_syn56_srv[ (h + p) & (EM_SYN56_SERVERS - 1) ];
