@@ -396,8 +396,14 @@ _check.%: _print.% check/expect/%.csv check/pcap/%.pcap
 	$(QUIET) bash -c 'diff --ignore-all-space /tmp/mmt-security-expect.csv /tmp/mmt-security-result.csv || { echo "  => FAILED: alerts of check/pcap/$*.pcap differ from check/expect/$*.csv (diff above)"; exit 1; }'
 	@echo '  => OK'
 	
-check: check-properties-all _prepare $(patsubst %,_check.%,$(NAMES))
+check: check-properties-all _prepare $(patsubst %,_check.%,$(NAMES)) check-build-info
 	@echo "All test passed!"
+
+# build info embedded in every rule .so (doc/rule.md)
+check-build-info: compile_rule rule_info standalone
+	@echo
+	@echo "Testing the build info of rule .so files"
+	$(QUIET) test/build_info/check.sh $(VERSION) $(GIT_VERSION)
 
 # every rules/*.xml must have a copy in rules/properties_all/ (see readme.md)
 check-properties-all:
