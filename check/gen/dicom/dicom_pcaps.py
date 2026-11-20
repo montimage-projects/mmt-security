@@ -682,6 +682,19 @@ def segmenting_attacks(out, clock):
     c.send(False, pdata((1, 3, echo_rq(1))))
     c.send(True, assoc_rq("LABPACS", "LABSCU"))
     c.reset()
+    gap()
+
+    # 200: a segment 100 MiB ahead of the stream that holds the fixed fields of an
+    # A-ASSOCIATE-RQ (mmt-dpi reads it as type 1) but no Application Context Item
+    # is ignored, so the type-9 PDU after it is still seen
+    c = associate(out, clock, A, 47204)
+    echo(c)
+    s0 = c.seq[True]
+    c.seq[True] = (s0 + (100 << 20)) & 0xFFFFFFFF
+    c._pkt(True, "PA", fake_rq_no_ctx(206))
+    c.seq[True] = s0
+    c.send(True, pdu(9, b"\0" * 4))
+    c.reset()
 
 
 def fake_rq_no_ctx(total):
@@ -719,6 +732,10 @@ def tracker_edges(out, clock):
 
     def rst_close(c):
         c.reset()
+
+    def abort_close(c):
+        c.send(True, pdu(7, b"\0" * 4))
+        c.close()
 
     # 1. TIME_WAIT reuse: the client reconnects from the same port 1 s after a
     #    released association, and Linux starts the new connection 65537 bytes
@@ -772,6 +789,11 @@ def tracker_edges(out, clock):
     data = fake_rq_no_ctx(206) + b"\0" * 3000
     send_stream(c, True, data, cut(len(data)))
     c.reset()
+    gap()
+
+    # 8. TIME_WAIT reuse as in 1, after an association that the client ended with
+    #    an A-ABORT: no 216 (an A-ABORT was seen)
+    reuse(out, clock, "10.77.0.61", 45011, 65537, end=abort_close)
 
 
 def parallel_associations(out, clock):
