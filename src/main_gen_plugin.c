@@ -23,7 +23,7 @@ int main( int argc, char** argv ){
 
 	const char* xml_file, *output_file;
 	char *embedded_functions;
-	int ret;
+	int ret, exit_code = 0;
 
 	if( argc != 3 && argc != 4){
 		fprintf( stderr, "Usage: %s output_file property_file option", argv[0] );
@@ -96,8 +96,10 @@ int main( int argc, char** argv ){
 			//delete .c file
 			remove( c_file );
 #endif
-		}else
+		}else{
 			mmt_error( "Cannot encode rule \"%s\". Check options.", xml_file );
+			exit_code = 1;
+		}
 	}
 
 	//free each rule
@@ -106,5 +108,5 @@ int main( int argc, char** argv ){
 
 	mmt_mem_free( rule_list );
 	mmt_mem_free( embedded_functions );
-	return 0;
+	return exit_code;
 }

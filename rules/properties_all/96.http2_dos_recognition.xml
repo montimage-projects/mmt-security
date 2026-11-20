@@ -1,15 +1,16 @@
 <beginning>
 
-<!--This rule counts how many packets arrive in interval of time include in [0,100] milliseconds. If the amount of packets that come in that time goes over a threshold decided by the user, then an alert is raised. Note that in order to set the threshold an environment variable called  MMT_SEC_5G_DOS_HTTP2_MS_LIMIT must be declared and set.
-If that variable is not declared a default value will be given.
-
+<!--This rule counts the packets that carry an HTTP/2 GET or POST request (HEADERS frame) or a WINDOW_UPDATE frame in windows of one millisecond of packet time. If the number of such packets in a window goes over a threshold decided by the user, then an alert is raised, once per window. Note that in order to set the threshold an environment variable called MMT_SEC_5G_DOS_HTTP2_MS_LIMIT must be declared and set.
+If that variable is not declared a default value of 80 is used; 0 disables the rule.
+The count is global (all clients and servers together) and counts packets, not HTTP/2 frames: several requests in one TCP segment count as one.
+Both events are checked on the same packet (delay_max is 0), so that each packet is counted once.
 -->
 <embedded_functions><![CDATA[
 #include <stdlib.h>
 #include <mmt_core.h>
 
 
-#include<math.h>
+#include <stdint.h>
 
 static unsigned long int limit_5g_dos_http2_per_ms = 0;
 
@@ -22,25 +23,30 @@ void on_load(){
 	}
 	else
 		limit_5g_dos_http2_per_ms = strtoul( str, NULL, 0 );
-	mmt_info("Rule 96: set MMT_SEC_5G_DOS_HTTP2_MS_LIMIT=%ld", 
-		limit_5g_dos_http2_per_ms );
+	mmt_info("Rule 96: set MMT_SEC_5G_DOS_HTTP2_MS_LIMIT=%lu%s",
+		limit_5g_dos_http2_per_ms,
+		limit_5g_dos_http2_per_ms == 0 ? ": the rule is disabled" : "" );
 }
 
 /*
-To detect DoS, we group messages by windows of millissecond,
-that is, all messages having the same millisecond number will be in the same window.
-We then check the number of message in a window to ensure that it is less than the given limit. 
+To detect DoS, we group the messages by windows of one millisecond of the
+packet time (meta.utime): all the messages whose time has the same
+tv_sec * 1000 + tv_usec / 1000 are in the same window.
+The counter is global: it counts the messages of all the peers together.
+It counts packets: several messages in one packet count as one.
+The function returns true once per window, for the first message that makes
+the count greater than the limit. A limit of 0 disables the rule.
 */
 static inline bool em_5g_check_msg_throughput( const void *data ){
-	static int last_ms = 0; //current ms window
+	static uint64_t last_ms = UINT64_MAX; //current ms window
 	static unsigned long int counter = 0; //number of msg in the current ms window
 	
-	struct timeval *time = (struct timeval *) data;
-	// no limit
-	if( limit_5g_dos_http2_per_ms == 0 )
-		return true;
+	const struct timeval *time = (const struct timeval *) data;
+	// no limit: the rule is disabled
+	if( limit_5g_dos_http2_per_ms == 0 || time == NULL )
+		return false;
 
-	int millisecond = round( time->tv_usec / 1000.0 ); //microsecond to millisecond
+	uint64_t millisecond = (uint64_t) time->tv_sec * 1000 + (uint64_t) time->tv_usec / 1000;
 	
 	//new window => reset the counter
 	if( last_ms != millisecond ){
@@ -49,13 +55,12 @@ static inline bool em_5g_check_msg_throughput( const void *data ){
 	}
 	
 	counter ++;
-	//if(counter >= limit_5g_dos_http2_per_ms)
-		//printf("Rule 96 Dos recognized\n");
-	return (counter >= limit_5g_dos_http2_per_ms);
+	//report only once per window: when the count goes over the limit
+	return (counter == limit_5g_dos_http2_per_ms + 1);
 }
 ]]></embedded_functions>
-<property value="THEN" delay_units="ms" delay_min="0" delay_max="100" property_id="96" type_property="ATTACK" 
-    description="5G Http2 DoS attack Recognition">
+<property value="THEN" delay_units="ms" delay_min="0" delay_max="0" property_id="96" type_property="ATTACK" 
+    description="5G Http2 DoS attack Recognition: the number of packets carrying an HTTP/2 GET/POST request or WINDOW_UPDATE frame, from all peers, in a 1 ms window is greater than MMT_SEC_5G_DOS_HTTP2_MS_LIMIT (default 80; one alert per window)">
     <event value="COMPUTE" event_id="1" 
         description="HTTP2 check on the methods/ types that can realize a flooding"
         boolean_expression="(((( http2.header_method == 131) || (http2.header_method==130))  || (http2.type==8)) &amp;&amp; (ip.src != ip.dst) )"/>

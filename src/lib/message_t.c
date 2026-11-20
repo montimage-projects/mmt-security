@@ -140,7 +140,7 @@ int set_element_data_message_t( message_t *msg, uint32_t proto_id, uint32_t att_
 	int index;
 
 	//check if enough room to stock data
-	if( unlikely (msg->_data_index + data_length + SIZE_OF_MMT_MEMORY_T + 1 >= msg->_data_length )){
+	if( unlikely( ! has_room_in_message_t( msg, data_length ))){
 		mmt_warn( "Report %"PRIu64" for %d.%d is too big (req. %zu, avail. %d bytes), must increase \"%s\"",
 				msg->counter,
 				proto_id, att_id, data_length + SIZE_OF_MMT_MEMORY_T, msg->_data_length - msg->_data_index,
@@ -151,12 +151,9 @@ int set_element_data_message_t( message_t *msg, uint32_t proto_id, uint32_t att_
 	else if( unlikely( data_length == 0 || data == NULL )){
 		return MSG_CONTINUE;
 	}
-	//special filter for:
-	//- proto_id = TCP
-	//- att_id = FLAGS, FIN, SYN, RST, PSH, ACK, URG, ECE, CWR
-	//=> if its data is zero => obmit => consider as NULL
-	else if( proto_id == 354 && data_type == MMT_SEC_MSG_DATA_TYPE_NUMERIC && (*(double*) data)  == 0 && (6 <= att_id && att_id <= 14 ))
-		return MSG_CONTINUE;
+	//Note: a zero value is a value. TCP flag attributes (tcp.flags, tcp.fin, ...,
+	// tcp.cwr) equal to 0 used to be dropped here, so a rule testing
+	// tcp.flags == 0 never matched (Montimage/mmt-security#28).
 
 
 	index = mmt_sec_hash_proto_attribute( proto_id, att_id );
