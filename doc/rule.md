@@ -2,6 +2,18 @@
 
 There are sample rules in [../rules/](../rules/)
 
+## 1.1 Delay and counter values
+
+The attributes `delay_min`, `delay_max`, `counter_min` and `counter_max` of a `<property>` or an `<operator>` take a non-negative integer, optionally followed by one sign:
+
+- `N`: the bound is inclusive, e.g., `delay_max="10"`;
+- `N+`: the bound is strict from below, e.g., `delay_min="0+"` means strictly after the first event;
+- `N-`: the bound is strict from above, e.g., `delay_max="10-"` means strictly less than 10 units.
+
+`delay_units` gives the unit of `delay_min` and `delay_max`: `Y`, `M`, `D`, `h`, `m`, `s` (default), `ms` or `mms` (microseconds).
+
+`compile_rule` rejects any other value, e.g., `"0++"`, `"1s"`, `"0.5"` or a negative number, with an error that names the attribute, and exits with a non-zero code.
+
 
 # 2. Embedded functions
 

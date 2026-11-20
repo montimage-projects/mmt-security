@@ -393,7 +393,13 @@ _check.%: _print.% check/expect/%.csv check/pcap/%.pcap
 	$(QUIET) bash -c "diff --ignore-all-space /tmp/mmt-security-expect.csv /tmp/mmt-security-result.csv || (echo \"====================execution log:\" && cat /tmp/$*.log)"
 	@echo '  => OK'
 	
-check: _prepare $(patsubst %,_check.%,$(NAMES))
+#negative tests of compile_rule: malformed rules must give an error, not a crash
+_check_compile_rule: compile_rule
+	@echo
+	@echo "Testing compile_rule on malformed rules"
+	$(QUIET) bash check/rules_compile.sh ./$(MAIN_GEN_PLUGIN)
+
+check: _prepare _check_compile_rule $(patsubst %,_check.%,$(NAMES))
 	@echo "All test passed!"
 	
 _csv.%: _prepare
