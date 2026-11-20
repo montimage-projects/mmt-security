@@ -25,7 +25,7 @@ int main( int argc, char** argv ){
 
 	const char* xml_file, *output_file;
 	char *embedded_functions;
-	int ret;
+	int ret, exit_code = 0;
 
 	if( argc != 3 && argc != 4){
 		fprintf( stderr, "Usage: %s output_file property_file option", argv[0] );
@@ -81,7 +81,7 @@ int main( int argc, char** argv ){
 				|| compile_gen_code_args( cflags, sizeof( cflags ), "{output}", "{source}", gcc_param ) < 0 ){
 			mmt_error( "The gcc option of compile_rule is too long: %zu bytes, at most %zu",
 					argc == 4 ? strlen( argv[3] ) : (size_t) 0, sizeof( gcc_param ) - sizeof( GCC_INCLUDES " " ));
-			ret = 1;
+			exit_code = 1;
 			goto end;
 		}
 		build_options.cflags = cflags;
@@ -106,11 +106,11 @@ int main( int argc, char** argv ){
 			//delete .c file
 			remove( c_file );
 #endif
-		}else
+		}else{
 			mmt_error( "Cannot encode rule \"%s\". Check options.", xml_file );
+			exit_code = 1;
+		}
 	}
-
-	ret = 0;
 
   end:
 	//free each rule
@@ -119,5 +119,5 @@ int main( int argc, char** argv ){
 
 	mmt_mem_free( rule_list );
 	mmt_mem_free( embedded_functions );
-	return ret;
+	return exit_code;
 }

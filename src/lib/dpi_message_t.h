@@ -116,6 +116,20 @@ static inline size_t dpi_get_ip_option_len(const ipacket_t * ipacket ){
 	return 0;
 }
 
+//number of reassembled TCP streams (tcp.tcp_session_payload_up/down) that were
+// not copied into a message because they did not fit in it (see dpi_message_set_void_data)
+static size_t _dpi_message_skipped_tcp_session_payload_count = 0;
+
+/**
+ * Public API
+ * Return the number of reassembled TCP streams (tcp.tcp_session_payload_up/down)
+ * that were skipped because they were bigger than the room left in the message.
+ * Each skipped stream is the one of a packet: a big flow counts once per packet.
+ */
+static inline size_t dpi_message_get_skipped_tcp_session_payload_count(){
+	return _dpi_message_skipped_tcp_session_payload_count;
+}
+
 /**
  * Public API
  * Convert data in format of MMT-Probe to data in format of MMT-Sec
@@ -127,6 +141,31 @@ static inline int dpi_message_set_void_data( const ipacket_t *pkt, const void *d
 
 	if( unlikely( data == NULL ))
 		return 0;
+
+	//reassembled TCP stream of a flow (needs mmt-dpi TCP reassembly):
+	// its length is given by the corresponding *_len attribute, that must be registered too
+	if( proto_id == PROTO_TCP && (att_id == TCP_SESSION_PAYLOAD_UP || att_id == TCP_SESSION_PAYLOAD_DOWN) ){
+		const uint32_t *len = (const uint32_t *) get_attribute_extracted_data( pkt, PROTO_TCP,
+				(att_id == TCP_SESSION_PAYLOAD_UP)? TCP_SESSION_PAYLOAD_UP_LEN : TCP_SESSION_PAYLOAD_DOWN_LEN );
+		if( len == NULL || *len == 0 )
+			return 0;
+		//The stream grows with its flow, so once it no longer fits in the message, it no longer
+		// fits on any later packet of that flow: skip it quietly, rather than letting
+		// set_element_data_message_t warn on every packet. Warn only once per run;
+		// the caller can report the total with dpi_message_get_skipped_tcp_session_payload_count().
+		//The caller should copy this attribute after the other ones, so that a big stream that
+		// still fits does not take the room of the attributes copied after it.
+		if( unlikely( ! has_room_in_message_t( msg, *len ) )){
+			if( _dpi_message_skipped_tcp_session_payload_count ++ == 0 )
+				mmt_warn("Reassembled TCP stream %d.%d of packet %"PRIu64" is too big (%"PRIu32" bytes, avail. %d bytes): it is skipped. "
+						"Rules using it cannot see the rest of such flows. Increase \"%s\" to keep it. "
+						"This is warned only once.",
+						proto_id, att_id, pkt->packet_id, *len, (int)(msg->_data_length - msg->_data_index),
+						mmt_sec_get_config_name( MMT_SEC__CONFIG__INPUT__MAX_MESSAGE_SIZE ));
+			return 0;
+		}
+		return set_element_data_message_t( msg, proto_id, att_id, data, MMT_SEC_MSG_DATA_TYPE_BINARY, *len );
+	}
 
 	switch( att_id ){
 	case PROTO_PAYLOAD:

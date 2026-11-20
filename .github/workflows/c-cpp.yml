@@ -1,7 +1,10 @@
 name: C/C++ CI
 env:
-  # version of MMT-DPI which supports current codebase
-  DPI_VERSION: 6b1c9f5380a4db616c90bec3cfeda72bce5920a0
+  # version of MMT-DPI which supports current codebase: the commit of the
+  # v1.10.3 release tag (a commit id, as a tag can be moved).
+  # Do not use v1.10.0 to v1.10.2: they lose the TCP payload of reassembled
+  # IPv4 fragments (Montimage/mmt-dpi#84), so check 19.SQLI fails.
+  DPI_VERSION: 6a0afb468cdb6e5d31012de54e7f751f2f337696 # v1.10.3
 on:
   push:
     branches: [ main ]
