@@ -19,6 +19,14 @@ Craft the DICOM check captures for rules 200-228 (Montimage/mmt-security
   dicom_pcaps.py segmenting-attacks <out.pcap>
       attacks after such data in the same connection, which the tracker must
       still see; a retransmitted attack; 12 parallel associations from one client
+  dicom_pcaps.py tracker-edges <out.pcap>
+      benign edge cases of the tracker: reuse of a 4-tuple (TIME_WAIT, random
+      initial sequence numbers, either side of PDU_TRACK_NEAR), data that starts
+      with the fixed fields of an A-ASSOCIATE-RQ but no Application Context Item,
+      a capture loss of nearly PDU_TRACK_NEAR bytes; no rule of the batch may alert
+  dicom_pcaps.py parallel-associations <out.pcap>
+      rule 200: 128 associations from one client open at once (256 directions
+      in the tracker's table at the same time)
   dicom_pcaps.py rates <out.pcap>
       the sliding windows and per-pair keys of rules 220, 223 and 228
   dicom_pcaps.py parallel-sources <out.pcap>
@@ -650,6 +658,133 @@ def segmenting_attacks(out, clock):
         c.send(True, pdu(9, b"\0" * 4))
     for c in conns:
         c.reset()
+    gap()
+
+    # one segment far from the stream (100 MiB ahead, or 16 MiB + 1 behind: out of
+    # the receiver's window, so it drops it) that does not start an A-ASSOCIATE is
+    # ignored: 200 on the type-9 PDU after it (two alerts), and 216 on the
+    # A-ASSOCIATE-RQ after it, the P-DATA-TF before it not forgotten
+    for port, delta, last in ((47200, 100 << 20, pdu(9, b"\0" * 4)),
+                              (47201, 100 << 20, assoc_rq("LABPACS", "LABSCU")),
+                              (47202, -(16 << 20) - 1, pdu(9, b"\0" * 4))):
+        c = associate(out, clock, A, port)
+        echo(c)
+        s0 = c.seq[True]
+        c.seq[True] = (s0 + delta) & 0xFFFFFFFF
+        c._pkt(True, "PA", b"\xab" * 100)
+        c.seq[True] = s0
+        c.send(True, last)
+        c.reset()
+        gap()
+
+    # 216: the P-DATA-TF sent only by the SCP, then an A-ASSOCIATE-RQ from the client
+    c = associate(out, clock, A, 47203)
+    c.send(False, pdata((1, 3, echo_rq(1))))
+    c.send(True, assoc_rq("LABPACS", "LABSCU"))
+    c.reset()
+
+
+def fake_rq_no_ctx(total):
+    """data that is exactly one A-ASSOCIATE-RQ of total bytes with the fixed fields
+    mmt-dpi checks, whose first variable item is a Presentation Context Item, not
+    the Application Context Item"""
+    f = (struct.pack(">BBIHH", 1, 0, total - 6, 1, 0) + ae("LABPACS") + ae("LABSCU")
+         + b"\0" * 32 + item(0x20, bytes([1, 0, 0, 0]) + item(0x30, VERIFICATION)
+                             + item(0x40, IMPLICIT_LE)))
+    return f + b"\0" * (total - len(f))
+
+
+def reuse(out, clock, cip, cport, isn_delta, end=release):
+    """an association with a C-ECHO, ended by end; 1 s later a new association on
+    the same 4-tuple, whose initial sequence numbers are isn_delta after the old
+    ones' next (the SCP's 12345678 after)"""
+    c = associate(out, clock, cip, cport)
+    echo(c)
+    end(c)
+    nxt = dict(c.seq)
+    clock.tick(1.0)
+    c2 = Conn(out, clock, cip, cport)
+    c2.seq = {True: (nxt[True] + isn_delta) & 0xFFFFFFFF,
+              False: (nxt[False] + 12345678) & 0xFFFFFFFF}
+    c2.open()
+    c2.send(True, assoc_rq("LABPACS", "LABSCU"))
+    c2.send(False, assoc_ac("LABPACS", "LABSCU"))
+    echo(c2)
+    release(c2)
+
+
+def tracker_edges(out, clock):
+    gap = lambda: clock.tick(0.3)  # noqa: E731
+    NEAR = 16 << 20  # PDU_TRACK_NEAR
+
+    def rst_close(c):
+        c.reset()
+
+    # 1. TIME_WAIT reuse: the client reconnects from the same port 1 s after a
+    #    released association, and Linux starts the new connection 65537 bytes
+    #    after the old one (tcp_twsk_unique): no 216 (an A-RELEASE-RP was seen)
+    reuse(out, clock, "10.77.0.54", 45004, 65537)
+    gap()
+    # 2. the same with a random initial sequence number, 2 GiB away
+    reuse(out, clock, "10.77.0.55", 45005, 0x80000000)
+    gap()
+    # 3. a reuse with a random initial sequence number after an association ended
+    #    by a TCP reset (no A-RELEASE-RP, no A-ABORT): the far A-ASSOCIATE-RQ starts
+    #    a new stream and clears the PDU types seen, so no 216
+    reuse(out, clock, "10.77.0.56", 45006, 0x80000000, end=rst_close)
+    gap()
+    # 4. the same 64 KiB beyond PDU_TRACK_NEAR: a new stream, no 216
+    reuse(out, clock, "10.77.0.57", 45007, NEAR + (64 << 10), end=rst_close)
+    gap()
+
+    # 5. a capture loss of 64 KiB less than PDU_TRACK_NEAR that holds a PDU
+    #    header, then a segment that starts like a whole A-ASSOCIATE-RQ (with the
+    #    Application Context Item, longer than the PDU): the boundary stays lost,
+    #    the zeros after it are not read as PDUs of type 0 and length 0
+    c = associate(out, clock, "10.77.0.58", 45008, ctxs=STORE_CTX)
+    c.send(True, pdata((1, 0, b"\0" * 2000)))
+    c.seq[True] += NEAR - (64 << 10)
+    rq = fake_rq_full(200)
+    c._pkt(True, "PA", rq + b"\0" * (MSS - len(rq)))
+    c._pkt(True, "PA", b"\0" * MSS)
+    c._pkt(False, "A")
+    c.reset()
+    gap()
+
+    # 6. a segment holding a PDU header lost, then, inside a PDU body, a segment
+    #    that is exactly an A-ASSOCIATE-RQ with the fixed fields but no Application
+    #    Context Item, then zeros: the boundary stays lost
+    c = associate(out, clock, "10.77.0.59", 45009, ctxs=STORE_CTX)
+    p0 = pdata((1, 0, b"\0" * 2000))
+    data = bytearray(p0 + pdata((1, 2, b"\0" * 3000)))
+    h1, a = len(p0), len(p0) + 500
+    data[a:a + 206] = fake_rq_no_ctx(206)
+    bounds = cut(len(data), [h1 - 10, h1 + 100, a, a + 206])
+    lost = next(i for i, (x, y) in enumerate(bounds) if x < h1 < y)
+    send_stream(c, True, bytes(data), bounds, drop={lost})
+    c.reset()
+    gap()
+
+    # 7. a capture that starts in the middle of a connection, at data that starts
+    #    with the fixed fields of an A-ASSOCIATE-RQ but no Application Context Item:
+    #    the direction is not taken up
+    c = Conn(out, clock, "10.77.0.60", 45010)
+    data = fake_rq_no_ctx(206) + b"\0" * 3000
+    send_stream(c, True, data, cut(len(data)))
+    c.reset()
+
+
+def parallel_associations(out, clock):
+    """128 associations from one client to one SCP port, open at once: one
+    A-ASSOCIATE-RQ and its A-ASSOCIATE-AC every 0.3 s (below the rate of rule
+    220), then a PDU of type 9 on each (128 alerts of 200). Only the segments that
+    the rules read are sent."""
+    conns = [Conn(out, clock, "10.66.0.72", 46000 + i) for i in range(128)]
+    for c in conns:
+        c._pkt(True, "PA", assoc_rq("LABPACS", "LABSCU"), dt=0.3)
+        c._pkt(False, "PA", assoc_ac("LABPACS", "LABSCU"), dt=0.0001)
+    for c in conns:
+        c._pkt(True, "PA", pdu(9, b"\0" * 4), dt=0.0001)
 
 
 def rates(out, clock):
@@ -732,8 +867,10 @@ def main():
     elif cmd == "flood":
         flood(out, Clock(1795000000.0))
         wrpcap(sys.argv[2], out)
-    elif cmd in ("segmenting-benign", "segmenting-attacks", "rates", "parallel-sources"):
+    elif cmd in ("segmenting-benign", "segmenting-attacks", "tracker-edges",
+                 "parallel-associations", "rates", "parallel-sources"):
         {"segmenting-benign": segmenting_benign, "segmenting-attacks": segmenting_attacks,
+         "tracker-edges": tracker_edges, "parallel-associations": parallel_associations,
          "rates": rates, "parallel-sources": parallel_sources}[cmd](out, Clock(1795300000.0))
         wrpcap(sys.argv[2], out)
     elif cmd == "merge":

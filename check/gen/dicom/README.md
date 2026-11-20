@@ -31,6 +31,8 @@ expected files leave out.
 
        python3 dicom_pcaps.py segmenting-benign ../../pcap/dicom_segmenting_benign.pcap
        python3 dicom_pcaps.py segmenting-attacks ../../pcap/dicom_segmenting_attacks.pcap
+       python3 dicom_pcaps.py tracker-edges ../../pcap/dicom_tracker_edges.pcap
+       python3 dicom_pcaps.py parallel-associations ../../pcap/dicom_parallel_associations.pcap
        python3 dicom_pcaps.py rates ../../pcap/dicom_rate_windows.pcap
        python3 dicom_pcaps.py parallel-sources ../../pcap/dicom_parallel_sources.pcap
 
@@ -43,16 +45,30 @@ expected files leave out.
      expected file is empty: no rule of the batch may alert.
    - `dicom_segmenting_attacks`: attacks after such data in the same connection
      (200, 208, 226, 216 6 s after the data), a header of the attack PDU split
-     1 + 5, a retransmitted attack (one alert), and 12 parallel associations from
+     1 + 5, a retransmitted attack (one alert), 12 parallel associations from
      one client to one SCP port, each ending with a PDU of type 9 (12 alerts of
-     200).
+     200), a segment far from the stream (100 MiB ahead, 16 MiB + 1 behind) that
+     must not blind the direction or make 216 forget the data (200, 216, 200),
+     and a P-DATA-TF sent only by the SCP before the client's A-ASSOCIATE-RQ
+     (216).
+   - `dicom_tracker_edges`: reuses of a 4-tuple: a TIME_WAIT reuse (new initial
+     sequence number = old + 65537) after a release, random initial sequence
+     numbers after a release and after a TCP reset, one 64 KiB beyond
+     `PDU_TRACK_NEAR` after a reset; a capture loss of 64 KiB less than
+     `PDU_TRACK_NEAR` at a PDU header, then data that starts like a whole
+     A-ASSOCIATE-RQ; data that starts with the fixed fields of an
+     A-ASSOCIATE-RQ but no Application Context Item, after a lost header and as
+     the first segment of a capture that starts mid-connection. Its expected
+     file is empty: no rule of the batch may alert.
+   - `dicom_parallel_associations`: 128 associations from one client to one SCP
+     port open at once, each ending with a PDU of type 9 (128 alerts of 200).
    - `dicom_rate_windows`: 223 with 12 wildcard queries over 30 s (no alert) and
      10 in 1 s (one); 220 with two sources of 15 A-ASSOCIATE-RQ each in 4 s (no
      alert) and one of 22 in 2 s (two); 228 with 12 sources of one /16 (12).
    - `dicom_parallel_sources`: 220 and 223 with 10 sources of one /16 at once,
      each over the threshold (10 alerts of each).
 
-   These four run with `check/pcap/<name>.opt`, which excludes every rule but
+   These six run with `check/pcap/<name>.opt`, which excludes every rule but
    200, 201, 202, 208, 209, 213, 216, 219, 220, 221, 223, 224, 226, 227 and 228,
    so their expected files list every alert of these rules.
 
