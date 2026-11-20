@@ -7,7 +7,7 @@
 # Inputs (mounted by run.sh):
 #   /in/mmt-dpi     a clone of https://github.com/Montimage/mmt-dpi (read-only)
 #   /in/tool        this directory (read-only)
-#   /in/mmt-sec     a snapshot of this repository's tracked files (read-only)
+#   /in/mmt-sec     `git archive HEAD` of this repository (read-only)
 #   /out            output directory for this version
 #   DPI_REF         the mmt-dpi commit or tag to build
 #   OUT_UID/OUT_GID owner to give /out at the end
@@ -26,6 +26,7 @@
 #                                 libmmt_core with all plugins loaded
 #   compile-errors-*.txt          rules that compile_rule could not encode
 #   mmt_dpi.h                     the regenerated header
+#   committed-mmt_dpi.h           the committed header (from /in/mmt-sec)
 set -euo pipefail
 
 : "${DPI_REF:?}"
@@ -107,6 +108,7 @@ extract /build/sec-committed /out/baked-committed-header.tsv /out/compile-errors
 build_sec /build/sec-regen 1 regenerated
 extract /build/sec-regen /out/baked-regenerated.tsv /out/compile-errors-regenerated.txt
 cp /build/sec-regen/src/dpi/mmt_dpi.h /out/mmt_dpi.h
+cp /in/mmt-sec/src/dpi/mmt_dpi.h /out/committed-mmt_dpi.h
 
 cut -f3,4 /out/baked-committed-header.tsv /out/baked-regenerated.tsv | sort -u \
 	| tr '\t' ' ' | /build/resolve_ids > /out/core.tsv

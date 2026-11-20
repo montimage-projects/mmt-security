@@ -4,7 +4,8 @@
 Usage: compare.py OUT_DIR...   (one directory per mmt-dpi version, in order)
 
 Each OUT_DIR holds what in-container.sh wrote: dpi.txt, baked-committed-header.tsv,
-baked-regenerated.tsv, core.tsv and compile-errors-*.txt. The report is Markdown:
+baked-regenerated.tsv, core.tsv, compile-errors-*.txt, mmt_dpi.h and
+committed-mmt_dpi.h (the committed header, taken from `git archive HEAD`). The report is Markdown:
 the versions, every id per version, the differences, the affected rules, and a
 build-on-X / load-on-Y matrix. Exit status: 0 when the report was produced.
 """
@@ -63,9 +64,7 @@ def read_registry(path):
     reg = {}
     proto = None
     pid = None
-    if not os.path.exists(path):
-        return reg
-    with open(path) as f:
+    with open(path) as f:  # a missing header is an error, not an empty registry
         for line in f:
             m = PROTO_RE.search(line)
             if m:
@@ -79,8 +78,11 @@ def read_registry(path):
 def registry_section(p, regs):
     """whole DPI registry: how many ids differ between consecutive versions"""
     p("## Whole DPI registry (every protocol and attribute, not only the rules')\n")
-    p("| from -> to | protocols | attributes | removed | added | id changed | type changed |")
-    p("|---|---|---|---|---|---|---|")
+    p("Counts of `to`. Protocols and attributes are counted separately; an attribute "
+      "of a removed or added protocol counts as a removed or added attribute.\n")
+    p("| from -> to | protocols | attributes | protocols added | protocols removed "
+      "| attributes added | attributes removed | id changed | type changed |")
+    p("|---|---|---|---|---|---|---|---|---|")
     labels = list(regs)
     for a, b in zip(labels, labels[1:]):
         ra, rb = regs[a], regs[b]
@@ -90,16 +92,21 @@ def registry_section(p, regs):
         moved = [k for k in both if ra[k][:2] != rb[k][:2]]
         typed = [k for k in both if ra[k][2] != rb[k][2]]
         nprot = sum(1 for k in rb if k[1] == "")
-        p("| %s -> %s | %d | %d | %d | %d | %d | %d |" % (
-            a, b, nprot, len(rb) - nprot, len(removed), len(added), len(moved), len(typed)))
+
+        def split(lst):
+            n = sum(1 for k in lst if k[1] == "")
+            return n, len(lst) - n
+        (pa, aa), (pr, ar) = split(added), split(removed)
+        p("| %s -> %s | %d | %d | %d | %d | %d | %d | %d | %d |" % (
+            a, b, nprot, len(rb) - nprot, pa, pr, aa, ar, len(moved), len(typed)))
         for name, lst in (("id changed", moved), ("type changed", typed)):
             if lst:
-                p("|  | %s: %s%s ||||||" % (name, ", ".join(
+                p("|  | %s: %s%s ||||||||" % (name, ", ".join(
                     "%s.%s %s->%s" % (k[0], k[1] or "*", "/".join(ra[k][:2]) if name == "id changed" else ra[k][2],
                                       "/".join(rb[k][:2]) if name == "id changed" else rb[k][2])
                     for k in lst[:12]), " ..." if len(lst) > 12 else ""))
         if removed:
-            p("|  | removed: %s%s ||||||" % (", ".join("%s.%s" % (k[0], k[1] or "*") for k in removed[:12]),
+            p("|  | removed: %s%s ||||||||" % (", ".join("%s.%s" % (k[0], k[1] or "*") for k in removed[:12]),
                                               " ..." if len(removed) > 12 else ""))
     p("")
 
@@ -224,8 +231,8 @@ def main(dirs):
     # ---- build on X, load on Y ---------------------------------------------
     p("## Build on X, load on Y: rules whose baked ids are wrong\n")
     p("Rows: the header the `.so` was compiled with. Columns: the libmmt_core it is "
-      "loaded into. Cell: rules (of %d) with at least one wrong or missing id; "
-      "0 means every rule is safe." % len(rules))
+      "loaded into. Cell: rules (of %d) with at least one missing pair, or a pair whose "
+      "proto_id, att_id or dpi_type differs; 0 means every rule is safe." % len(rules))
     p("")
     targets = list(versions)
     p("| built with \\ loaded into | " + " | ".join(targets) + " |")
@@ -239,7 +246,7 @@ def main(dirs):
                 if s not in ids[pair]:
                     continue  # the rule does not compile with s
                 core = versions[t]["core"].get(pair)
-                if core is None or ids[pair][s][:2] != core[:2]:
+                if core is None or ids[pair][s] != core:
                     bad |= {r for r in rs if pair in rules[r]}
             # rules that did not compile against s are not counted
             affected[(s, t)] = bad
@@ -267,8 +274,8 @@ def main(dirs):
     p("")
 
     regs = OrderedDict()
-    regs[COMMITTED] = read_registry(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                                 "..", "..", "src", "dpi", "mmt_dpi.h"))
+    # the committed header as run.sh archived it from HEAD, never the working tree
+    regs[COMMITTED] = read_registry(os.path.join(dirs[0], "committed-mmt_dpi.h"))
     for label in versions:
         regs[label] = read_registry(os.path.join(dirs[list(versions).index(label)], "mmt_dpi.h"))
     registry_section(p, regs)
