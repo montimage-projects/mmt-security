@@ -396,7 +396,7 @@ _check.%: _print.% check/expect/%.csv check/pcap/%.pcap
 	$(QUIET) bash -c 'diff --ignore-all-space /tmp/mmt-security-expect.csv /tmp/mmt-security-result.csv || { echo "  => FAILED: alerts of check/pcap/$*.pcap differ from check/expect/$*.csv (diff above)"; exit 1; }'
 	@echo '  => OK'
 	
-check: check-properties-all _prepare $(patsubst %,_check.%,$(NAMES))
+check: check-properties-all check-rule-hooks _prepare $(patsubst %,_check.%,$(NAMES))
 	@echo "All test passed!"
 
 # every rules/*.xml must have a copy in rules/properties_all/ (see readme.md)
@@ -407,6 +407,10 @@ check-properties-all:
 	done; \
 	[ $$missing -eq 0 ] || exit 1
 	@echo "All rules/*.xml have a copy in rules/properties_all/"
+
+# no rule may define on_load/on_unload as static: dlsym() would not find them
+check-rule-hooks:
+	@./check/check-rule-hooks.sh
 	
 _csv.%: _prepare
 	$(QUIET) $(RM) /tmp/mmt-security*.csv
