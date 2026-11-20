@@ -7,8 +7,27 @@
      Length of 256 as a Command Field (0000,0100), and pixel data as either. The rule
      walks the command set itself, element by element, from the TCP payload. It
      judges a P-DATA-TF whose first PDV is a whole command (message control header
-     03H: command, last fragment) inside the packet; other packets are skipped. -->
+     03H: command, last fragment) inside the packet; other packets are skipped.
+     Not seen: a P-DATA-TF whose 12-byte PDU and PDV header is in a TCP segment of
+     its own, as DCMTK sends them by default, and a command set split across
+     segments (see the walker's comment). Requires mmt-dpi 1.9.0 or later. -->
 <embedded_functions><![CDATA[
+#include <stdint.h>
+
+/* ---- DIMSE command set walker ---- */
+/*
+ * Copied verbatim into rules 201, 202 and 213 from check/gen/dicom/blocks/dimse_walk.c
+ * by check/dicom-blocks.sh --write; make check fails when a copy differs. Edit that
+ * file, not a copy. Requires mmt-dpi 1.9.0 or later: it reads tcp.payload_len bytes
+ * of tcp.p_payload, which mmt-dpi bounds by the captured bytes since 1.9.0.
+ *
+ * Limits (evasion): only a P-DATA-TF whose PDU header starts the TCP segment and
+ * whose first PDV is a whole command set inside the segment is judged. A stack that
+ * writes the 12-byte PDU and PDV header in a segment of its own, as DCMTK does by
+ * default, is not seen (mmt-dpi needs 10 bytes to extract dicom.pdu_type), nor is a
+ * command set split across segments.
+ */
+#include <stddef.h>
 #include <stdint.h>
 
 typedef struct {
@@ -59,6 +78,7 @@ static int em_dimse_walk(const void *payload, double payload_len, em_dimse_t *c)
     }
     return off == end;
 }
+/* ---- end of DIMSE command set walker ---- */
 
 static int em_invalid_command_field(const void *payload, double payload_len) {
     static const int known[] = {
