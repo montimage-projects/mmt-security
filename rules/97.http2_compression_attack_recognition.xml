@@ -40,11 +40,18 @@ replaced); its state takes about 25 MB at most.
  * - after a gap (lost segment), or when the capture starts in the middle of
  *   a connection, the reader resynchronises on a segment that starts with a
  *   plausible frame header;
- * - a segment that starts with the connection preface, other than a
- *   retransmission of the preface already read, starts a new connection on
- *   the same 4-tuple: the state of both directions restarts;
- * - a sequence number more than H2_MAX_BACKWARD bytes behind the expected one
- *   starts a new byte stream, e.g., a 4-tuple reused with a lower ISN.
+ * - a segment that starts with the connection preface starts a new
+ *   connection on the same 4-tuple (it has a new ISN): the state of both
+ *   directions restarts. A retransmission of the preface already read, and
+ *   a segment at the expected sequence number, are not a new connection:
+ *   the latter is data of the current connection (e.g., the end of a DATA
+ *   frame), which a sender could otherwise use to wipe the HPACK table.
+ * - a segment behind the expected sequence number is a retransmission, also
+ *   when it is far behind: a receiver drops a segment out of its window, so
+ *   such a segment must not reset the state either. After a segment far
+ *   ahead (out of window), the reader takes the next segments for
+ *   retransmissions until the stream reaches it: telling such a segment from
+ *   a lost one needs TCP window tracking, which is not done.
  *
  * Both directions of a connection share one entry of a table of H2_SETS sets
  * of H2_WAYS entries, so they never evict each other. The set is a hash of
@@ -68,7 +75,6 @@ replaced); its state takes about 25 MB at most.
 #define H2_WAYS          4                //connections per set: H2_SETS * H2_WAYS connections per thread
 #define H2_MAX_FRAME     16384            //default SETTINGS_MAX_FRAME_SIZE (RFC 9113, 6.5.2)
 #define H2_BUF_MAX       (H2_MAX_FRAME + 9)
-#define H2_MAX_BACKWARD  (1u << 20)       //a sequence number this far behind starts a new byte stream
 
 static const char H2_PREFACE[] = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
@@ -275,7 +281,9 @@ static inline int h2_segment( h2_dir_t *d, h2_dir_t *rev, uint32_t seq, const ui
 	int ret = 0;
 	uint32_t flen, n, total;
 
-	if( len >= 24 && memcmp( p, H2_PREFACE, 24 ) == 0 && !(d->preface_seen && d->preface_seq == seq) ){
+	if( len >= 24 && memcmp( p, H2_PREFACE, 24 ) == 0
+			&& !(d->preface_seen && d->preface_seq == seq)   //retransmission of the preface
+			&& !(d->synced && seq == d->next_seq) ){          //data of the current connection
 		//a new connection on this 4-tuple: both directions restart
 		h2_reset( d );
 		if( rev != NULL && rev != d )
@@ -289,9 +297,7 @@ static inline int h2_segment( h2_dir_t *d, h2_dir_t *rev, uint32_t seq, const ui
 		seq += 24;
 	}else if( d->synced ){
 		int32_t diff = (int32_t)(seq - d->next_seq);
-		if( diff < 0 && (uint32_t)(-(int64_t)diff) > H2_MAX_BACKWARD )
-			h2_desync( d ); //far behind: a new byte stream, not a retransmission
-		else if( diff < 0 ){ //retransmission, possibly overlapping new data
+		if( diff < 0 ){ //retransmission, possibly overlapping new data
 			if( (size_t)(-(int64_t)diff) >= len )
 				return 0;
 			p   += -diff;

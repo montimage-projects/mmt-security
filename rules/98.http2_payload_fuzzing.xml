@@ -55,9 +55,11 @@ replaced).
  * - after a gap (lost segment), or when the capture starts in the middle of
  *   a connection, the reader resynchronises on a segment that starts with a
  *   plausible frame header;
- * - a segment that starts with the connection preface, other than a
- *   retransmission of the preface already read, starts a new connection on
- *   the same 4-tuple: the state of both directions restarts;
+ * - a segment that starts with the connection preface starts a new
+ *   connection on the same 4-tuple (it has a new ISN): the state of both
+ *   directions restarts. A retransmission of the preface already read, and
+ *   a segment at the expected sequence number (data of the current
+ *   connection, e.g., the end of a DATA frame), are not a new connection;
  * - a sequence number more than H2_MAX_BACKWARD bytes behind the expected one
  *   starts a new byte stream, e.g., a 4-tuple reused with a lower ISN.
  *
@@ -275,7 +277,9 @@ static inline int h2_segment( h2_dir_t *d, h2_dir_t *rev, uint32_t seq, const ui
 	int ret = 0;
 	uint32_t flen, n, total;
 
-	if( len >= 24 && memcmp( p, H2_PREFACE, 24 ) == 0 && !(d->preface_seen && d->preface_seq == seq) ){
+	if( len >= 24 && memcmp( p, H2_PREFACE, 24 ) == 0
+			&& !(d->preface_seen && d->preface_seq == seq)   //retransmission of the preface
+			&& !(d->synced && seq == d->next_seq) ){          //data of the current connection
 		//a new connection on this 4-tuple: both directions restart
 		h2_reset( d );
 		if( rev != NULL && rev != d )

@@ -85,6 +85,12 @@ class Conn:
             self._c("PA", ch)
             self.c = (self.c + len(ch)) & 0xffffffff
 
+    def seg(self, data, seq):
+        """one client segment at sequence number #seq; the next sequence number does not change"""
+        c, self.c = self.c, seq & 0xffffffff
+        self._c("PA", data)
+        self.c = c
+
     def sv(self, data):
         self._s("PA", data)
         self.s = (self.s + len(data)) & 0xffffffff
@@ -109,15 +115,18 @@ class Conn:
         self._c("A")
 
 
-def bomb(conn, first=b""):
+def bomb(conn, first=b"", between=None, blocks=50):
     """HPACK bomb: a 3000-byte header inserted in the dynamic table (index 62),
-    then 50 blocks of 204 bytes that reference it 200 times each."""
+    then 50 blocks of 204 bytes that reference it 200 times each.
+    between(conn), if set, is called after the priming block."""
     value = b"A" * 3000
     prime = first + b"\x40\x0bx-bomb-name\x7f" + bytes([((3000 - 127) & 0x7f) | 0x80, (3000 - 127) >> 7]) + value
     conn.cl(frame(1, 4, 1, REQ + prime))
     conn.sv(frame(1, 5, 1, RESP))
+    if between:
+        between(conn)
     sid = 3
-    for _ in range(50):
+    for _ in range(blocks):
         conn.cl(frame(1, 5, sid, REQ + b"\xbe" * 200))
         conn.sv(frame(1, 5, sid, RESP))
         sid += 2
@@ -146,6 +155,50 @@ a = Conn(c, 50001, isn_c=1000, isn_s=7000)
 a.h2_setup()
 bomb(a)
 a.fin()
+
+
+def preface_in_data(conn, sid=1):
+    """a DATA frame whose last 24 bytes, in a segment of their own, are the
+    connection preface: data of the stream at the expected sequence number,
+    which the server reads as DATA payload, not a new connection"""
+    d = frame(0, 1, sid, b"x" * 20 + PREFACE)
+    conn.cl(d[:-24])
+    conn.cl(d[-24:])
+
+
+def far_behind(conn):
+    """a segment 2 MiB behind the next sequence number: out of the window, the
+    server drops it"""
+    conn.seg(frame(6, 0, 0, b"\0" * 8), conn.c - (2 << 20))
+
+
+def far_ahead(conn):
+    """a segment 2 MiB ahead of the next sequence number: out of the window"""
+    conn.seg(frame(6, 0, 0, b"\0" * 8), conn.c + (2 << 20))
+
+
+# in the cases below, 10 bombs (10 alerts) instead of 50, to keep the capture small
+# the preface at the expected sequence number, between the priming block and the bombs (review 2, F2 a)
+a = Conn(c, 50002)
+a.h2_setup()
+bomb(a, between=preface_in_data, blocks=10)
+a.fin()
+# a segment 2 MiB behind, between the priming block and the bombs (review 2, F2 b)
+a = Conn(c, 50003)
+a.h2_setup()
+bomb(a, between=far_behind, blocks=10)
+a.fin()
+# 4-tuple reused, the new connection's ISN 64 KiB behind the old one's next
+# sequence number: only the preface tells the new connection
+a = Conn(c, 50004, isn_c=1000 + (64 << 10))
+a.h2_setup()
+a.cl(frame(1, 5, 1, REQ))
+a.sv(frame(1, 5, 1, RESP))
+a.fin()
+a = Conn(c, 50004, isn_c=1000, isn_s=7000)
+a.h2_setup()
+bomb(a, blocks=10)
+a.fin()
 c.write("97.http2_state_evasion")
 
 # ------------------------------------------------- 98: state evasions (finding 1)
@@ -173,7 +226,31 @@ a = Conn(c, 50000, isn_c=1000, isn_s=7000)
 a.h2_setup()
 json_request(a, FUZZ)
 a.fin()
+# a segment between the HEADERS and the DATA (review 2, F2):
+# - a DATA frame of stream 3 that ends with the preface at the expected sequence number;
+# - a segment 2 MiB behind (out of the window);
+# - a segment 2 MiB ahead (out of the window): the next segments are far behind
+#   it, so the reader restarts on them
+for i, between in enumerate([lambda a: (a.cl(frame(1, 4, 3, REQ)), preface_in_data(a, 3)), far_behind, far_ahead]):
+    a = Conn(c, 50010 + i)
+    a.h2_setup()
+    a.cl(frame(1, 4, 1, REQ))
+    between(a)
+    a.cl(frame(0, 1, 1, FUZZ))
+    a.sv(frame(1, 5, 1, RESP))
+    a.fin()
+# 4-tuple reused, the new connection's ISN 64 KiB behind the old one's next sequence number
+a = Conn(c, 50020, isn_c=1000 + (64 << 10))
+a.h2_setup()
+a.cl(frame(1, 5, 1, REQ))
+a.sv(frame(1, 5, 1, RESP))
+a.fin()
+a = Conn(c, 50020, isn_c=1000, isn_s=7000)
+a.h2_setup()
+json_request(a, FUZZ)
+a.fin()
 c.write("98.http2_state_evasion")
+
 
 # ------------------------------------------------- 97: header table size 0 (finding 3)
 c = Pcap(1700032000.0)
