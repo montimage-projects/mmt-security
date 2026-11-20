@@ -1,23 +1,43 @@
 <beginning>
-<!-- Property 48: Probable FTP bounce scan.
+<!-- Property 48: Probable FTP bounce attack or scan (CERT CA-1997-27, RFC 2577 section 3).
+     A client sends a PORT (or EPRT) command whose address is not its own: the FTP server is asked to open
+     a data connection to a third host. nmap -b sends one such command per scanned port.
+     A normal active-mode client gives its own address, ip.src, so it is not reported.
+     Note: a client behind a NAT that does not rewrite PORT gives its private address and is reported.
 -->
-	<property value="THEN" delay_units="s" delay_min="0+" delay_max="5" property_id="48" type_property="ATTACK" 
-    description="Probable FTP bounce scan (4 different requests in a row for different ports).">
-    <operator value="THEN" delay_units="s" delay_min="0+" delay_max="3">
-      <event value="COMPUTE" event_id="1" 
-             description="FTP request PORT(1)"
-             boolean_expression="(#strstr(ftp.packet_request, 'PORT') != 0)"/>
-      <event value="COMPUTE" event_id="2" 
-             description="FTP request PORT(2)"
-             boolean_expression="((#strstr(ftp.packet_request, 'PORT') != 0)&amp;&amp;((ftp.packet_request_parameter != ftp.packet_request_parameter.1)&amp;&amp;((ip.src == ip.src.1)&amp;&amp;(ip.dst == ip.dst.1))))"/>
-    </operator>
-    <operator value="THEN" delay_units="s" delay_min="0+" delay_max="3">
-      <event value="COMPUTE" event_id="3" 
-             description="FTP request PORT(3)"
-             boolean_expression="((#strstr(ftp.packet_request, 'PORT') != 0)&amp;&amp;((ftp.packet_request_parameter != ftp.packet_request_parameter.1)&amp;&amp;((ftp.packet_request_parameter != ftp.packet_request_parameter.2)&amp;&amp;((ip.src == ip.src.1)&amp;&amp;(ip.dst == ip.dst.1)))))"/>
-      <event value="COMPUTE" event_id="4"
-             description="FTP request PORT(4)"
-             boolean_expression="((#strstr(ftp.packet_request, 'PORT') != 0)&amp;&amp;((ftp.packet_request_parameter != ftp.packet_request_parameter.1)&amp;&amp;((ftp.packet_request_parameter != ftp.packet_request_parameter.2)&amp;&amp;((ftp.packet_request_parameter != ftp.packet_request_parameter.3)&amp;&amp;((ip.src == ip.src.1)&amp;&amp;(ip.dst == ip.dst.1)))))"/>
-    </operator>
+<embedded_functions><![CDATA[
+#include <arpa/inet.h>
+
+// Returns 1 when the address of a PORT "h1,h2,h3,h4,p1,p2" or EPRT "|1|a.b.c.d|port|" argument
+// is a valid IPv4 address different from #ip_src (4 bytes, network order); 0 otherwise.
+static inline int em_ftp_port_addr_differs( const char *cmd, const char *param, const void *ip_src ){
+	unsigned int h[4];
+	char addr[16];
+	struct in_addr given;
+	if( cmd == NULL || param == NULL || ip_src == NULL )
+		return 0;
+	if( strncasecmp( cmd, "PORT", 4 ) == 0 ){
+		if( sscanf( param, " %u,%u,%u,%u,", &h[0], &h[1], &h[2], &h[3] ) != 4 )
+			return 0;
+		if( h[0] > 255 || h[1] > 255 || h[2] > 255 || h[3] > 255 )
+			return 0;
+		given.s_addr = htonl( (h[0] << 24) | (h[1] << 16) | (h[2] << 8) | h[3] );
+	}else if( strncasecmp( cmd, "EPRT", 4 ) == 0 ){
+		// EPRT |1|a.b.c.d|port| (RFC 2428); only IPv4 (protocol 1) is compared
+		if( sscanf( param, " |1|%15[0-9.]|", addr ) != 1 || inet_pton( AF_INET, addr, &given ) != 1 )
+			return 0;
+	}else
+		return 0;
+	return memcmp( &given.s_addr, ip_src, 4 ) != 0;
+}
+]]></embedded_functions>
+<property value="THEN" delay_units="s" delay_min="0" delay_max="0" property_id="48" type_property="ATTACK"
+    description="Probable FTP bounce attack or scan: PORT/EPRT command with an address other than the client's own">
+    <event value="COMPUTE" event_id="1"
+           description="FTP PORT or EPRT request naming another host"
+           boolean_expression="(#em_ftp_port_addr_differs(ftp.packet_request, ftp.packet_request_parameter, ip.src) == 1)"/>
+    <event value="COMPUTE" event_id="2"
+           description="Print source and destination of IP"
+           boolean_expression="(ip.src != ip.dst)"/>
 </property>
 </beginning>
