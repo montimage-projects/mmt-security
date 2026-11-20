@@ -363,6 +363,8 @@ else
 endif
 
 TEST_INDEX=1
+# options of mmt_sec_standalone for check/pcap/X.pcap, read from check/pcap/X.opt if it exists (e.g. -R)
+CHECK_OPT = $(shell cat check/pcap/$*.opt 2>/dev/null)
 _prepare: compile_rule standalone sample_rules
 	@echo "==============================="
 check/expect/%.csv :
@@ -378,7 +380,7 @@ _print.%:
 #one test
 _check.%: _print.% check/expect/%.csv check/pcap/%.pcap
 	$(QUIET) $(RM) /tmp/mmt-security*.csv
-	$(QUIET) bash -c "$(VALGRIND) ./$(MAIN_STAND_ALONE) -t check/pcap/$*.pcap -f /tmp/"
+	$(QUIET) bash -c "$(VALGRIND) ./$(MAIN_STAND_ALONE) $(CHECK_OPT) -t check/pcap/$*.pcap -f /tmp/"
 #starting by rule id (rm timestamp, filename, probe-id)
 	$(QUIET) bash -c "cut -d, -f5- /tmp/mmt-security*.csv  > /tmp/mmt-security-res.csv"
 	$(QUIET) bash -c "cut -d, -f5- check/expect/$*.csv     > /tmp/mmt-security-expect.csv"
@@ -396,7 +398,13 @@ _check.%: _print.% check/expect/%.csv check/pcap/%.pcap
 	$(QUIET) bash -c 'diff --ignore-all-space /tmp/mmt-security-expect.csv /tmp/mmt-security-result.csv || { echo "  => FAILED: alerts of check/pcap/$*.pcap differ from check/expect/$*.csv (diff above)"; exit 1; }'
 	@echo '  => OK'
 	
-check: check-properties-all check-rule-hooks _prepare $(patsubst %,_check.%,$(NAMES))
+#negative tests of compile_rule: malformed rules must give an error, not a crash
+_check_compile_rule: compile_rule
+	@echo
+	@echo "Testing compile_rule on malformed rules"
+	$(QUIET) bash check/rules_compile.sh ./$(MAIN_GEN_PLUGIN)
+
+check: check-properties-all check-rule-hooks _prepare _check_compile_rule $(patsubst %,_check.%,$(NAMES))
 	@echo "All test passed!"
 
 # every rules/*.xml must have a copy in rules/properties_all/ (see readme.md)
@@ -414,7 +422,7 @@ check-rule-hooks:
 	
 _csv.%: _prepare
 	$(QUIET) $(RM) /tmp/mmt-security*.csv
-	$(QUIET) ./$(MAIN_STAND_ALONE) -v -t check/pcap/$*.pcap -f /tmp/ || exit 1
+	$(QUIET) ./$(MAIN_STAND_ALONE) -v $(CHECK_OPT) -t check/pcap/$*.pcap -f /tmp/ || exit 1
 	$(QUIET) find /tmp/mmt-security*.csv -exec mv {} check/expect/$*.csv \;
 	
 csv: $(patsubst %,_csv.%,$(NAMES))
