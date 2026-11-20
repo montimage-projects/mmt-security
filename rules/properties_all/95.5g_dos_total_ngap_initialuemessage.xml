@@ -2,7 +2,12 @@
 
 <!--
 This rule detects whether 5G traffic in control plane overpasses the following limit:
-- total number of NGAP InitialUEMessage per millisecond >= MMT_SEC_5G_DOS_NGAP_INITIALUEMESSAGE_MS_LIMIT  
+- total number of NGAP InitialUEMessage per millisecond > MMT_SEC_5G_DOS_NGAP_INITIALUEMESSAGE_MS_LIMIT
+
+The window is one millisecond of packet time (tv_sec and tv_usec). The count is
+global (all gNBs together) and counts packets: InitialUEMessages bundled in one
+SCTP packet count as one. One alert is raised per window, on the first packet
+over the limit. When the variable is unset or 0, the rule is disabled.
 
 Note: in the boolean_expression below, we use: 
 - ngap.procedure_code == 15: indicate InitialUEMessage
@@ -13,7 +18,7 @@ Note: in the boolean_expression below, we use:
 
 
 <property value="THEN" delay_units="ms" delay_min="0" delay_max="0" property_id="95" type_property="ATTACK" 
-    description="5G DoS attack in the control plane: total number of InitialUEMessage is greater than the limit fixed by the MMT_SEC_5G_DOS_NGAP_INITIALUEMESSAGE_MS_LIMIT environment variable">
+    description="5G DoS attack in the control plane: the total number of packets carrying an NGAP InitialUEMessage, from all gNBs, in a 1 ms window is greater than the limit fixed by the MMT_SEC_5G_DOS_NGAP_INITIALUEMESSAGE_MS_LIMIT environment variable (one alert per window; the rule is disabled when the variable is unset or 0)">
     <event value="COMPUTE" event_id="1" 
         description="NGAP InitialUEMessage"
            boolean_expression="(( ngap.procedure_code == 15) &amp;&amp; ((sctp.dest_port == 38412) &amp;&amp;( ip.src != ip.dst )) )"/>
@@ -27,36 +32,41 @@ Note: in the boolean_expression below, we use:
 #include <stdlib.h>
 #include <mmt_core.h>
 #include <tcpip/mmt_tcpip.h>
-#include<math.h>
+#include <stdint.h>
 
 static unsigned long int limit_5g_dos_ngap_initialuemessage_per_ms = 0;
 
 void on_load(){
 	const char *str = getenv("MMT_SEC_5G_DOS_NGAP_INITIALUEMESSAGE_MS_LIMIT");
 	if( str == NULL ){
-		mmt_info("Rule 95: no value of MMT_SEC_5G_DOS_NGAP_INITIALUEMESSAGE_MS_LIMIT" );
+		mmt_info("Rule 95: no value of MMT_SEC_5G_DOS_NGAP_INITIALUEMESSAGE_MS_LIMIT: the rule is disabled" );
 		return;
 	}
 	limit_5g_dos_ngap_initialuemessage_per_ms = strtoul( str, NULL, 0 );
-	mmt_info("Rule 95: set MMT_SEC_5G_DOS_NGAP_INITIALUEMESSAGE_MS_LIMIT=%ld", 
-		limit_5g_dos_ngap_initialuemessage_per_ms );
+	mmt_info("Rule 95: set MMT_SEC_5G_DOS_NGAP_INITIALUEMESSAGE_MS_LIMIT=%lu%s",
+		limit_5g_dos_ngap_initialuemessage_per_ms,
+		limit_5g_dos_ngap_initialuemessage_per_ms == 0 ? ": the rule is disabled" : "" );
 }
 
 /*
-To detect DoS, we group the InitialUEMessage by windows of millissecond,
-that is, all messages having the same millisecond number will be in the same window.
-We then check the number of message in a window to ensure that it is less than the given limit. 
+To detect DoS, we group the messages by windows of one millisecond of the
+packet time (meta.utime): all the messages whose time has the same
+tv_sec * 1000 + tv_usec / 1000 are in the same window.
+The counter is global: it counts the messages of all the peers together.
+It counts packets: several messages in one packet count as one.
+The function returns true once per window, for the first message that makes
+the count greater than the limit. A limit of 0 disables the rule.
 */
 static inline bool em_5g_check_msg_throughput( const void *data ){
-	static int last_ms = 0; //current ms window
+	static uint64_t last_ms = UINT64_MAX; //current ms window
 	static unsigned long int counter = 0; //number of msg in the current ms window
 	
-	struct timeval *time = (struct timeval *) data;
-	// no limit
-	if( limit_5g_dos_ngap_initialuemessage_per_ms == 0 )
-		return true;
+	const struct timeval *time = (const struct timeval *) data;
+	// no limit: the rule is disabled
+	if( limit_5g_dos_ngap_initialuemessage_per_ms == 0 || time == NULL )
+		return false;
 
-	int millisecond = round( time->tv_usec / 1000.0 ); //microsecond to millisecond
+	uint64_t millisecond = (uint64_t) time->tv_sec * 1000 + (uint64_t) time->tv_usec / 1000;
 	
 	//new window => reset the counter
 	if( last_ms != millisecond ){
@@ -65,7 +75,8 @@ static inline bool em_5g_check_msg_throughput( const void *data ){
 	}
 	
 	counter ++;
-	return (counter >= limit_5g_dos_ngap_initialuemessage_per_ms);
+	//report only once per window: when the count goes over the limit
+	return (counter == limit_5g_dos_ngap_initialuemessage_per_ms + 1);
 }
 ]]></embedded_functions>
 
