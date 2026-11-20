@@ -3,3 +3,4 @@
 - [How to write an embedded function](./rule.md)
 - [Verdict decision of rule types](./verdict.md)
 - [Hash function to access quickly of a message element](./hash.md)
+- [Rule .so stability across mmt-dpi versions (A0)](./rule-abi-stability.md)
