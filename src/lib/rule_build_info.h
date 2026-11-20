@@ -83,31 +83,46 @@ void mmt_sec_rule_ids_hash( rule_build_info_id_t *ids, size_t count, char out[72
  */
 int mmt_sec_elf_glibc_min( const char *so_path, char *out, size_t out_size );
 
+/** Results of #mmt_sec_elf_read_build_note */
+enum{
+	MMT_SEC_NOTE_FOUND = 0,   /**< the note was found */
+	MMT_SEC_NOTE_NONE,        /**< a native ELF shared object without the note */
+	MMT_SEC_NOTE_UNREADABLE,  /**< the file cannot be read, or is empty */
+	MMT_SEC_NOTE_NOT_ELF,     /**< not a native ELF shared object */
+	MMT_SEC_NOTE_INVALID      /**< an ELF shared object whose sections or notes are malformed */
+};
+
 /**
  * Read the JSON of the .note.mmt.build note of a shared object, without
- * loading it. Returns a malloc-ed string (free it), or NULL if there is no note.
+ * loading it. The file is untrusted: every offset and size is checked.
+ * On MMT_SEC_NOTE_FOUND, #json is a malloc-ed string (free it); else NULL.
  */
-char *mmt_sec_elf_read_build_note( const char *so_path );
+int mmt_sec_elf_read_build_note( const char *so_path, char **json );
 
 /**
  * Options of compile_rule that end up in the build info
  */
 typedef struct rule_build_options_struct{
 	const char *xml_file;   /**< rule file, its sha256 is recorded */
-	const char *cflags;     /**< flags used to compile the .so, NULL when only C code is generated */
+	const char *cflags;     /**< gcc arguments used to compile the .so, in their order, with the files
+	                             as {source} and {output}; NULL when only C code is generated */
 	const char *glibc_min;  /**< highest GLIBC_ version the .so needs, NULL if unknown */
-	const char *dpi_header_version; /**< mmt_version() of src/dpi/mmt_dpi.h, where the ids come from */
+	const char *dpi_header_version; /**< mmt_version() of the DPI header compiled into compile_rule,
+	                                     whose table gives the ids */
 }rule_build_options_t;
 
 /**
  * Create the build-info JSON of a .so containing #rule_count rules.
- * The compiler is not known when the C code is generated (it is the compiler
- * that compiles that code), so the JSON contains the placeholder
- * MMT_SEC_BUILD_INFO_CC_PLACEHOLDER (inside a JSON string) that gen_code.c
- * replaces with a preprocessor macro.
+ * The compiler and its target are not known when the C code is generated
+ * (they are those of the compiler that compiles that code), so the JSON
+ * contains the placeholders MMT_SEC_BUILD_INFO_CC_PLACEHOLDER and
+ * MMT_SEC_BUILD_INFO_TARGET_PLACEHOLDER (each a whole JSON string value)
+ * that gen_code.c replaces with preprocessor macros.
  * Returns a malloc-ed string (free it).
  */
 #define MMT_SEC_BUILD_INFO_CC_PLACEHOLDER "@MMT_SEC_RULE_CC@"
+/* the same for the target: the predefined macros of that compiler give it */
+#define MMT_SEC_BUILD_INFO_TARGET_PLACEHOLDER "@MMT_SEC_RULE_TARGET@"
 char *mmt_sec_create_rule_build_info( const rule_build_options_t *opt,
 		const uint32_t *rule_ids, size_t rule_count,
 		rule_build_info_id_t *ids, size_t ids_count );

@@ -408,7 +408,7 @@ check: check-properties-all check-rule-hooks _prepare _check_compile_rule $(pats
 	@echo "All test passed!"
 
 # build info embedded in every rule .so (doc/rule.md)
-check-build-info: compile_rule rule_info standalone
+check-build-info: compile_rule rule_info standalone sample_rules
 	@echo
 	@echo "Testing the build info of rule .so files"
 	$(QUIET) test/build_info/check.sh $(VERSION) $(GIT_VERSION)

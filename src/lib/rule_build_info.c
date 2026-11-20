@@ -173,7 +173,27 @@ static void _buf_printf( _buf_t *b, const char *fmt, ... ){
 	free( big );
 }
 
-/* JSON string, or null */
+/* length of the valid UTF-8 sequence (RFC 3629) at #p, or 0 if it is not valid */
+static size_t _utf8_len( const unsigned char *p ){
+	size_t n, i;
+	uint32_t c;
+	if( p[0] < 0x80 ) return 1;
+	else if( p[0] >= 0xC2 && p[0] <= 0xDF ){ n = 2; c = p[0] & 0x1F; }
+	else if( p[0] >= 0xE0 && p[0] <= 0xEF ){ n = 3; c = p[0] & 0x0F; }
+	else if( p[0] >= 0xF0 && p[0] <= 0xF4 ){ n = 4; c = p[0] & 0x07; }
+	else return 0;
+	for( i = 1; i < n; i++ ){
+		if( (p[i] & 0xC0) != 0x80 ) //also stops at the final NUL
+			return 0;
+		c = (c << 6) | (p[i] & 0x3F);
+	}
+	if( (n == 3 && c < 0x800) || (n == 4 && c < 0x10000) //overlong
+			|| (c >= 0xD800 && c <= 0xDFFF) || c > 0x10FFFF )
+		return 0;
+	return n;
+}
+
+/* JSON string, or null. Invalid UTF-8 bytes become U+FFFD. */
 static void _buf_json_str( _buf_t *b, const char *s ){
 	const unsigned char *p;
 	char esc[8];
@@ -193,8 +213,15 @@ static void _buf_json_str( _buf_t *b, const char *s ){
 			if( *p < 0x20 ){
 				snprintf( esc, sizeof( esc ), "\\u%04x", *p );
 				_buf_add( b, esc );
-			}else
-				_buf_add_n( b, (const char *)p, 1 );
+			}else{
+				size_t n = _utf8_len( p );
+				if( n == 0 )
+					_buf_add( b, "\xEF\xBF\xBD" ); //U+FFFD REPLACEMENT CHARACTER
+				else{
+					_buf_add_n( b, (const char *)p, n );
+					p += n - 1;
+				}
+			}
 		}
 	}
 	_buf_add( b, "\"" );
@@ -292,35 +319,47 @@ static uint8_t *_read_file( const char *path, size_t *size ){
 	long n;
 	if( f == NULL )
 		return NULL;
-	if( fseek( f, 0, SEEK_END ) != 0 || (n = ftell( f )) <= 0 || fseek( f, 0, SEEK_SET ) != 0 ){
+	if( fseek( f, 0, SEEK_END ) != 0 || (n = ftell( f )) < 0 || fseek( f, 0, SEEK_SET ) != 0 ){
 		fclose( f );
 		return NULL;
 	}
-	data = malloc( n );
+	//one more byte: the data is NUL-terminated
+	data = malloc( (size_t) n + 1 );
 	if( data != NULL && fread( data, 1, n, f ) != (size_t) n ){
 		free( data );
 		data = NULL;
 	}
+	if( data != NULL )
+		data[n] = '\0';
 	fclose( f );
 	*size = n;
 	return data;
 }
 
-/* section headers of a native ELF file, or NULL */
-static const ElfW(Shdr) *_elf_sections( const uint8_t *data, size_t size, size_t *count ){
+/* is #off a valid offset of a #T in a buffer of #size bytes that malloc aligned */
+#define _ALIGNED( off, T ) ( (off) % _Alignof( T ) == 0 )
+
+/* section headers of a native ELF shared object.
+ * Returns MMT_SEC_NOTE_NONE and sets #sections, or MMT_SEC_NOTE_NOT_ELF / _INVALID */
+static int _elf_sections( const uint8_t *data, size_t size, const ElfW(Shdr) **sections, size_t *count ){
 	const ElfW(Ehdr) *eh = (const ElfW(Ehdr) *) data;
 #if __SIZEOF_POINTER__ == 8
 	const int elf_class = ELFCLASS64;
 #else
 	const int elf_class = ELFCLASS32;
 #endif
+	*sections = NULL;
+	*count = 0;
 	if( size < sizeof( *eh ) || memcmp( eh->e_ident, ELFMAG, SELFMAG ) != 0
-			|| eh->e_ident[EI_CLASS] != elf_class || eh->e_shentsize != sizeof( ElfW(Shdr) )
-			|| eh->e_shoff == 0 || eh->e_shoff > size
+			|| eh->e_ident[EI_CLASS] != elf_class || eh->e_type != ET_DYN )
+		return MMT_SEC_NOTE_NOT_ELF;
+	if( eh->e_shentsize != sizeof( ElfW(Shdr) ) || eh->e_shoff == 0 || eh->e_shoff > size
+			|| !_ALIGNED( eh->e_shoff, ElfW(Shdr) )
 			|| (size - eh->e_shoff) / sizeof( ElfW(Shdr) ) < eh->e_shnum )
-		return NULL;
+		return MMT_SEC_NOTE_INVALID;
 	*count = eh->e_shnum;
-	return (const ElfW(Shdr) *)( data + eh->e_shoff );
+	*sections = (const ElfW(Shdr) *)( data + eh->e_shoff );
+	return MMT_SEC_NOTE_NONE;
 }
 
 /* compare "GLIBC_2.17" and "GLIBC_2.4" numerically; -2 when b is not a GLIBC_ number */
@@ -349,7 +388,7 @@ int mmt_sec_elf_glibc_min( const char *so_path, char *out, size_t out_size ){
 	const ElfW(Shdr) *sh;
 	if( data == NULL )
 		return -1;
-	sh = _elf_sections( data, size, &count );
+	_elf_sections( data, size, &sh, &count );
 	for( i = 0; sh != NULL && i < count; i++ ){
 		const ElfW(Shdr) *str;
 		size_t off, n;
@@ -364,14 +403,14 @@ int mmt_sec_elf_glibc_min( const char *so_path, char *out, size_t out_size ){
 			const ElfW(Verneed) *vn;
 			size_t aux;
 			unsigned j;
-			if( off + sizeof( *vn ) > sh[i].sh_offset + sh[i].sh_size )
+			if( off + sizeof( *vn ) > sh[i].sh_offset + sh[i].sh_size || !_ALIGNED( off, ElfW(Verneed) ))
 				break;
 			vn  = (const ElfW(Verneed) *)( data + off );
 			aux = off + vn->vn_aux;
 			for( j = 0; j < vn->vn_cnt; j++ ){
 				const ElfW(Vernaux) *va;
 				const char *name;
-				if( aux + sizeof( *va ) > size )
+				if( aux + sizeof( *va ) > size || !_ALIGNED( aux, ElfW(Vernaux) ))
 					break;
 				va = (const ElfW(Vernaux) *)( data + aux );
 				if( va->vna_name < str->sh_size ){
@@ -396,39 +435,51 @@ int mmt_sec_elf_glibc_min( const char *so_path, char *out, size_t out_size ){
 	return 0;
 }
 
-char *mmt_sec_elf_read_build_note( const char *so_path ){
+int mmt_sec_elf_read_build_note( const char *so_path, char **json ){
 	size_t size = 0, count = 0, i;
-	uint8_t *data = _read_file( so_path, &size );
+	uint8_t *data;
 	const ElfW(Shdr) *sh;
-	char *ret = NULL;
+	int ret;
+
+	*json = NULL;
+	data = _read_file( so_path, &size );
 	if( data == NULL )
-		return NULL;
-	sh = _elf_sections( data, size, &count );
-	for( i = 0; sh != NULL && i < count && ret == NULL; i++ ){
+		return MMT_SEC_NOTE_UNREADABLE;
+	ret = _elf_sections( data, size, &sh, &count );
+	for( i = 0; ret == MMT_SEC_NOTE_NONE && i < count; i++ ){
 		size_t off, end;
-		if( sh[i].sh_type != SHT_NOTE || sh[i].sh_offset > size || sh[i].sh_size > size - sh[i].sh_offset )
+		if( sh[i].sh_type != SHT_NOTE )
 			continue;
+		if( sh[i].sh_offset > size || sh[i].sh_size > size - sh[i].sh_offset
+				|| !_ALIGNED( sh[i].sh_offset, ElfW(Nhdr) )){
+			ret = MMT_SEC_NOTE_INVALID;
+			break;
+		}
 		off = sh[i].sh_offset;
 		end = off + sh[i].sh_size;
 		while( off + sizeof( ElfW(Nhdr) ) <= end ){
 			const ElfW(Nhdr) *nh = (const ElfW(Nhdr) *)( data + off );
+			//size_t: the padding of a 32-bit size close to 4 GiB does not wrap to 0
 			size_t name_off = off + sizeof( *nh );
+			size_t name_sz  = nh->n_namesz, desc_sz = nh->n_descsz;
 			size_t desc_off, next;
-			/* raw sizes must fit the section before the aligned (+3 & ~3)
-			 * math below: computing it in uint32_t wraps for sizes >=
-			 * 0xFFFFFFFD, which would let a crafted note pass the bounds
-			 * check and make strndup read far past the file buffer. */
-			if( (size_t) nh->n_namesz > end - name_off )
+			if( name_sz > end - name_off ){
+				ret = MMT_SEC_NOTE_INVALID;
 				break;
-			desc_off = name_off + (((size_t) nh->n_namesz + 3) & ~(size_t) 3);
-			if( desc_off > end || (size_t) nh->n_descsz > end - desc_off )
+			}
+			desc_off = name_off + ((name_sz + 3) & ~(size_t) 3);
+			if( desc_off > end || desc_sz > end - desc_off ){
+				ret = MMT_SEC_NOTE_INVALID;
 				break;
-			next = desc_off + (((size_t) nh->n_descsz + 3) & ~(size_t) 3);
-			if( next > end || next <= off )
-				break;
-			if( nh->n_type == MMT_SEC_BUILD_NOTE_TYPE && nh->n_namesz == sizeof( MMT_SEC_BUILD_NOTE_OWNER )
+			}
+			next = desc_off + ((desc_sz + 3) & ~(size_t) 3);
+			if( nh->n_type == MMT_SEC_BUILD_NOTE_TYPE && name_sz == sizeof( MMT_SEC_BUILD_NOTE_OWNER )
 					&& memcmp( data + name_off, MMT_SEC_BUILD_NOTE_OWNER, sizeof( MMT_SEC_BUILD_NOTE_OWNER )) == 0 ){
-				ret = strndup( (const char *)( data + desc_off ), nh->n_descsz );
+				//the JSON and its NUL fill the descriptor
+				if( desc_sz == 0 || memchr( data + desc_off, '\0', desc_sz ) != data + desc_off + desc_sz - 1 )
+					ret = MMT_SEC_NOTE_INVALID;
+				else if( (*json = strdup( (const char *)( data + desc_off ))) != NULL )
+					ret = MMT_SEC_NOTE_FOUND;
 				break;
 			}
 			off = next;
@@ -473,53 +524,30 @@ static char *_os_name( void ){
 	return NULL;
 }
 
-static char *_target_triple( void ){
-	char line[256];
-	FILE *p = popen( "/usr/bin/gcc -dumpmachine 2>/dev/null", "r" );
-	char *ret = NULL;
-	if( p == NULL )
-		return NULL;
-	if( fgets( line, sizeof( line ), p ) != NULL ){
-		line[ strcspn( line, "\r\n" ) ] = '\0';
-		if( line[0] )
-			ret = strdup( line );
-	}
-	pclose( p );
-	return ret;
-}
-
-static char *_builder( void ){
+/* who built the .so: $MMT_SEC_BUILDER (CI sets it to the run URL), else
+ * unknown. The host name is not recorded: the .so may be distributed. */
+static const char *_builder( void ){
 	const char *v = getenv( "MMT_SEC_BUILDER" );
-	char host[256], *ret;
-	if( v != NULL && v[0] )
-		return strdup( v );
-	if( getenv( "GITHUB_ACTIONS" ) != NULL && getenv( "GITHUB_RUN_ID" ) != NULL ){
-		const char *server = getenv( "GITHUB_SERVER_URL" ), *repo = getenv( "GITHUB_REPOSITORY" );
-		const char *attempt = getenv( "GITHUB_RUN_ATTEMPT" );
-		size_t n = 64 + strlen( server ? server : "" ) + strlen( repo ? repo : "" )
-			+ strlen( getenv( "GITHUB_RUN_ID" )) + strlen( attempt ? attempt : "" );
-		ret = malloc( n );
-		if( ret == NULL ) return NULL;
-		snprintf( ret, n, "%s/%s/actions/runs/%s%s%s", server ? server : "https://github.com",
-				repo ? repo : "?", getenv( "GITHUB_RUN_ID" ), attempt ? "/attempts/" : "", attempt ? attempt : "" );
-		return ret;
-	}
-	if( gethostname( host, sizeof( host )) != 0 )
-		return NULL;
-	host[ sizeof( host ) - 1 ] = '\0';
-	ret = malloc( strlen( host ) + 6 );
-	if( ret != NULL )
-		sprintf( ret, "host:%s", host );
-	return ret;
+	return ( v != NULL && v[0] ) ? v : NULL;
 }
 
-/* build date: SOURCE_DATE_EPOCH when set, for reproducible builds */
-static void _build_date( char *out, size_t size ){
+/* build date: SOURCE_DATE_EPOCH when set, for reproducible builds.
+ * Returns #out, or NULL when the date cannot be represented */
+static const char *_build_date( char *out, size_t size ){
 	const char *e = getenv( "SOURCE_DATE_EPOCH" );
-	time_t t = ( e != NULL && e[0] ) ? (time_t) strtoll( e, NULL, 10 ) : time( NULL );
+	char *end = NULL;
+	time_t t;
 	struct tm tm;
-	gmtime_r( &t, &tm );
-	strftime( out, size, "%Y-%m-%dT%H:%M:%SZ", &tm );
+	if( e != NULL && e[0] ){
+		long long v = strtoll( e, &end, 10 );
+		if( *end != '\0' || (time_t) v != v )
+			return NULL;
+		t = (time_t) v;
+	}else
+		t = time( NULL );
+	if( gmtime_r( &t, &tm ) == NULL || strftime( out, size, "%Y-%m-%dT%H:%M:%SZ", &tm ) == 0 )
+		return NULL;
+	return out;
 }
 
 char *mmt_sec_create_rule_build_info( const rule_build_options_t *opt,
@@ -590,10 +618,8 @@ char *mmt_sec_create_rule_build_info( const rule_build_options_t *opt,
 	_buf_add( &b, plugins ? plugins : "null" );
 	_buf_add( &b, "}" );
 
-	_buf_add( &b, ",\"build\":{\"compiler\":\"" MMT_SEC_BUILD_INFO_CC_PLACEHOLDER "\",\"target\":" );
-	s = _target_triple();
-	_buf_json_str( &b, s );
-	free( s );
+	_buf_add( &b, ",\"build\":{\"compiler\":\"" MMT_SEC_BUILD_INFO_CC_PLACEHOLDER
+			"\",\"target\":\"" MMT_SEC_BUILD_INFO_TARGET_PLACEHOLDER "\"" );
 	_buf_add( &b, ",\"cflags\":" );
 	_buf_json_str( &b, opt ? opt->cflags : NULL );
 	_buf_add( &b, ",\"glibc_min\":" );
@@ -603,12 +629,9 @@ char *mmt_sec_create_rule_build_info( const rule_build_options_t *opt,
 	_buf_json_str( &b, s );
 	free( s );
 	_buf_add( &b, ",\"builder\":" );
-	s = _builder();
-	_buf_json_str( &b, s );
-	free( s );
-	_build_date( date, sizeof( date ));
+	_buf_json_str( &b, _builder() );
 	_buf_add( &b, ",\"date\":" );
-	_buf_json_str( &b, date );
+	_buf_json_str( &b, _build_date( date, sizeof( date )));
 	_buf_add( &b, "}}" );
 
 	free( installed );
