@@ -16,10 +16,12 @@
 #   dpi.txt                       DPI_REF, commit, mmt_version()
 #   baked-regenerated.tsv         ids written into each rule's generated C by a
 #                                 compile_rule whose src/dpi/mmt_dpi.h was
-#                                 regenerated from this DPI (what `make clean-all
-#                                 && make` produces, as in upstream CI)
+#                                 regenerated from this DPI (what `make` produces
+#                                 when /opt/mmt/dpi is newer than the header, and
+#                                 `make clean-all && make` in upstream CI)
 #   baked-committed-header.tsv    the same with the committed src/dpi/mmt_dpi.h
-#                                 (what a plain `make` produces)
+#                                 (what `make compile_rule` produces, and `make`
+#                                 when the header is newer than /opt/mmt/dpi)
 #   core.tsv                      the same pairs resolved at run time by this
 #                                 libmmt_core with all plugins loaded
 #   compile-errors-*.txt          rules that compile_rule could not encode

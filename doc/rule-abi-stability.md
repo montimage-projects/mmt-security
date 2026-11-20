@@ -53,13 +53,24 @@ tools/dpi-id-stability/abi-layout.sh   # rule ABI struct layouts at every v1.2.*
 4. At run time the engine registers those numbers with the running `libmmt_core`
    (`src/main_sec_standalone.c:189-224`). Nothing resolves the names again.
 
-The Makefile regenerates the header only when it is missing
-(`$(MMT_DPI_HEADER)` target). Hence:
+Whether the committed header is used depends on the make target and on file
+times. The rule is `$(MMT_DPI_HEADER): $(MMT_DPI_DIR)` (Makefile, `gen_dpi`
+target): the header is regenerated when it is missing, or older than the
+`/opt/mmt/dpi` directory. Hence:
 
-- a plain `make` (the mmt-stack image, most local builds) bakes the ids of the
-  **committed header**, whatever mmt-dpi is installed;
-- `make clean-all && make` (upstream CI) regenerates the header from the
-  installed mmt-dpi and bakes its ids.
+- `make` (target `all`) regenerates it whenever mmt-dpi was installed after the
+  checkout. This is the usual case: a fresh clone in a container, upstream CI's
+  `make clean-all && make`, and the mmt-stack image's `make -j1`. The rules then
+  bake the installed DPI's ids. The regeneration also rewrites the tracked file,
+  so `git status` shows it as modified;
+- `make compile_rule sample_rules` (no `all`), or a header newer than
+  `/opt/mmt/dpi`, never regenerates it. The rules then bake the **committed
+  header's** ids, whatever mmt-dpi is installed.
+
+Checked in ubuntu:24.04 with the v1.10.3 `.deb`s and `make -n`. On a
+`git archive` of `main`, `make all` regenerates the header. After
+`touch src/dpi/mmt_dpi.h` it does not, and `make compile_rule sample_rules` never
+does. Nothing records which of the two cases happened.
 
 The committed header starts with `using MMT-DPI v1.7.10 (fd93012d)`, but its table
 is identical to that of 6b1c9f53 (all 8096 entries; it has DICOM, which fd93012d
@@ -67,11 +78,13 @@ lacks). It was probably generated from a fd93012d tree with the DICOM branch
 merged in.
 
 Because `gen_code.c` includes that header, `mmt_version()` in
-`src/lib/gen_code.c:582` is the header's too. Every rule built with plain `make`
-reports `dpi version 1.7.10 (fd93012d)` in `rule_info`, even when it was built
-against DPI 1.10.3. Checked with `compile_rule rules/11.ip_size.xml` in an
-ubuntu:24.04 container with the v1.10.3 `.deb`s. Today's `.dpi` field therefore
-tells you where the ids came from, not what was installed.
+`src/lib/gen_code.c:582` is the header's too. A rule built with the committed
+header reports `dpi version 1.7.10 (fd93012d)` in `rule_info`, even when DPI
+1.10.3 is installed. This was checked with `make compile_rule rule_info`, then
+`compile_rule rules/11.ip_size.xml`, in ubuntu:24.04 with the v1.10.3 `.deb`s.
+After `make all` regenerated the header, the same rule reports
+`1.10.3 (6a0afb46)`. Today's `.dpi` field therefore tells you where the ids
+came from, not what was installed.
 
 ## Method
 
@@ -195,7 +208,8 @@ also shares `message_t` and `message_element_t` (`src/lib/message_t.h`, read by
 - Also store the tuples themselves, so the loader can re-resolve each one by
   name and name the pair that differs.
 - Record where the ids came from (the header's `mmt_version()`) and the
-  installed `libmmt_core` version separately. A plain `make` makes them differ.
+  installed `libmmt_core` version separately. They differ whenever the
+  committed header is used.
 - Store a rule ABI hash over the `sizeof`/`offsetof` layout of the shared structs
   above, next to `REQUIRE_PLUGIN`. It would have caught v1.2.13.
 
@@ -223,8 +237,9 @@ Old `.so` files can be checked too.
 - A missing id is silent today. Logging when `register_extraction_attribute`
   fails would make the DICOM case visible without the full check.
 - The committed `src/dpi/mmt_dpi.h` says fd93012d but holds the 6b1c9f53 table.
-  Regenerating it (or building it at `make` time) would make the reported DPI
-  version true.
+  Whether a build uses it or regenerates it depends on file times (see above).
+  Always generating it at build time, outside the source tree, would make the
+  baked ids and the reported DPI version predictable.
 
 ## Appendix: full output of `tools/dpi-id-stability/run.sh`
 
