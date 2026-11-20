@@ -404,7 +404,7 @@ _check_compile_rule: compile_rule
 	@echo "Testing compile_rule on malformed rules"
 	$(QUIET) bash check/rules_compile.sh ./$(MAIN_GEN_PLUGIN)
 
-check: check-properties-all _prepare _check_compile_rule $(patsubst %,_check.%,$(NAMES))
+check: check-properties-all check-rule-hooks _prepare _check_compile_rule $(patsubst %,_check.%,$(NAMES))
 	@echo "All test passed!"
 
 # every rules/*.xml must have a copy in rules/properties_all/ (see readme.md)
@@ -415,6 +415,10 @@ check-properties-all:
 	done; \
 	[ $$missing -eq 0 ] || exit 1
 	@echo "All rules/*.xml have a copy in rules/properties_all/"
+
+# no rule may define on_load/on_unload as static: dlsym() would not find them
+check-rule-hooks:
+	@./check/check-rule-hooks.sh
 	
 _csv.%: _prepare
 	$(QUIET) $(RM) /tmp/mmt-security*.csv

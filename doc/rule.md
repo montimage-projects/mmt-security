@@ -288,3 +288,55 @@ An example of `COMPUTE`rule:
 	 - The embedded functions are called each time their boolean expressions are verified. Consequently, rather than initialize something, for example, connection to database, inside these functions, one can do such a task, only once, inside function `on_load` then store the connection into a static local variable that will be used inside the embedded functions.
 	
 	 - alway use embedded function with `static inline` keyword. For more information about advantage of `inline`, please refer to document of gcc: [An Inline Function is As Fast As a Macro](https://gcc.gnu.org/onlinedocs/gcc/Inline.html)
+
+# 7. Rules on a protocol plugin
+
+A rule can use the attributes of a protocol that an MMT-DPI plugin adds (a `.so` in the MMT-DPI plugin folder, for example one built with [mmt-plugin-generator](https://github.com/Montimage/mmt-plugin-generator)). Three things differ from rules on built-in protocols:
+
+1. **The plugin must be installed when mmt-security is built.** mmt-security does not look protocols up at run time: `make gen_dpi` writes `src/dpi/mmt_dpi.h` from the protocols MMT-DPI loads at build time, and `compile_rule`, the library and the probe use that table. Install the plugin into the MMT-DPI plugin folder, then run `make clean-all && make -j1 && make install` (`clean-all` removes the old header). Without it, `compile_rule` stops with `Protocol <name> has not implemented yet`. The probe must load the same plugin at run time, since the ids in the table are the plugin's. `src/dpi/mmt_dpi.h` is tracked in git: `make clean-all` deletes it and `make` writes it again with the plugin's protocols, so `git status` then shows it modified (plain `make` also writes it again when the MMT-DPI folder is newer than the file). Do not commit it (`git checkout src/dpi/mmt_dpi.h` restores the stock table).
+2. **Use the protocol name the plugin registers, as is.** Names are case-sensitive in rules. mmt-plugin-generator registers a plugin's protocol under its label in upper case, so the label `ocpp_example` gives `OCPP_EXAMPLE.action`. `./rule_info` on the compiled rule lists the resolved `proto.att (proto_id.att_id)`.
+3. **Such rules are not compiled by default.** `make sample_rules` and `make deb` compile only `rules/*.xml`, and a stock build has no plugin protocols. Rules on plugins are kept in `rules/properties_all/` and compiled by hand:
+
+```sh
+./compile_rule rules/230.ocpp_heartbeat_flood.so rules/properties_all/230.ocpp_heartbeat_flood.xml
+```
+
+Example: rules 230 and 231 use the OCPP 1.6-J plugin `ocpp_example` (mmt-plugin-generator `examples/ocpp`):
+
+| Rule | Detects | Settings (environment) |
+|---|---|---|
+| `230.ocpp_heartbeat_flood.xml` | a charge point session (`ip.src`, `tcp.src_port`) sending more than LIMIT Heartbeat CALLs within WINDOW seconds; reported once per window | `MMT_SEC_OCPP_HEARTBEAT_LIMIT` (10), `MMT_SEC_OCPP_HEARTBEAT_WINDOW_S` (10) |
+| `231.ocpp_charging_limit.xml` | a SetChargingProfile CALL whose first limit is above the site maximum | `MMT_SEC_OCPP_MAX_CURRENT_A` (32), `MMT_SEC_OCPP_MAX_POWER_W` (22000) |
+
+The settings are read by the rule's `on_load()`. The engine finds `on_load` and `on_unload` with `dlsym()`, so they must not be `static` (a `static` hook is never called and its settings are ignored); `make check` runs `check/check-rule-hooks.sh`, which fails on a rule XML that defines either as `static`.
+
+Detection limits:
+
+- Rule 230 counts per TCP session (`ip.src`, `tcp.src_port`): a flood spread over many connections, with at most LIMIT Heartbeats on each, is not flagged.
+- Rule 230's window is in whole seconds: it starts at the whole second of a session's first Heartbeat (`meta.utime`'s `tv_sec`) and a Heartbeat whose second is WINDOW or more later starts the next one, so a window lasts between WINDOW - 1 and WINDOW seconds from its first Heartbeat (about 9 to 10 s at the default).
+- Rule 231 checks only the first `chargingSchedulePeriod` (the plugin's `charging_limit_x10`): a SetChargingProfile whose first period is within the maximum and a later one above it is not flagged.
+
+Both rules also reference `ip.src`, `ip.dst`, `tcp.src_port` and `tcp.dest_port` in their event (`(ip.src != ip.dst)`, `(tcp.dest_port > 0)`, the usual idiom of the sample rules), so that each alert carries the two endpoints; an alert only contains the attributes its event uses, and a consumer such as a SOAR needs the addresses to attribute or block. The rules therefore match OCPP over IPv4/TCP.
+
+With mmt-probe, `security.ignore-remain-flow = true` (the default) skips every rule on the rest of a flow once any rule has raised an alert on it. On a flood where a TCP-level rule (for example 56, SYN flooding) fires first on each connection, rule 230 is then never evaluated; set it to `false`, or exclude those rules, where application-level alerts matter.
+
+Synthetic captures in `check/pcap-plugin/` (written by `check/pcap-plugin/gen_ocpp_pcaps.py`, scapy) check both rules, at the defaults and with each setting, against `check/pcap-plugin/cases` and `check/pcap-plugin/expect/`. `make check` cannot run them, since a stock build cannot compile these rules. With the plugin installed in the MMT-DPI plugin folder:
+
+```sh
+make clean-all && make -j1
+check/pcap-plugin/run.sh        # compiles rules/*.xml, 230 and 231, runs every case
+git checkout src/dpi/mmt_dpi.h  # back to the stock protocol table
+```
+
+| Capture | Content | Alerts at the defaults |
+|---|---|---|
+| `ocpp_230_heartbeat_flood` | CP A: 30 Heartbeats every 250 ms; CP B: 60 every 250 ms (two windows); CP C: 5 every 60 s | 230 × 3 (A once, B twice) |
+| `ocpp_231_charging_limit` | SetChargingProfile at 10, 90, 32, 32.1 and 16 A and at 22000 and 30000 W, each answered | 231 × 3 (90 A, 32.1 A, 30000 W) |
+| `ocpp_benign` | a normal CP over 10 min (Boot, Authorize, StatusNotification, a Heartbeat every 60 s, SetChargingProfile at 0, 10, 16 and 32 A and at 11000 and 22000 W); a CP at exactly 10 Heartbeats in 2.25 s; a CP at 1 Heartbeat per second for 20 s | none, from any rule |
+
+These pass with mmt-dpi 1.10.3 (`6a0afb46`) and the plugin from mmt-plugin-generator `f8ade97` (`examples/ocpp`, built with the generator's compile and link flags against the 1.10.3 headers).
+
+Measured on the Federated OCPP 1.6 Intrusion Detection Dataset (Zenodo record 14887131, CC-BY-4.0) with mmt-dpi 1.10.2 (`8e6faf4`), this branch's base (`a78a4fd`), mmt-probe `fbf0c3d` and the plugin from mmt-plugin-generator `220adc1` (retested at `73aa717` with mmt-dpi `main` `b89d409`, mmt-probe `1e00441` and the plugin from mmt-plugin-generator `f8ade97`: same alerts per rule):
+
+- Attack 3 (Heartbeat flooding, 100 fake charge points): rule 230 flags all 100 sessions, on the 11th Heartbeat (2.5 s after each session's first one), and no other session. Normal sessions in attacks 1 and 2 peak at 2 Heartbeats per 10 s.
+- Attack 1 (SetChargingProfile changed to 90 A by a MiTM): rule 231 flags 3 228 of the 3 229 manipulated messages (first copies; retransmitted copies are flagged again) and none of the 3 488 genuine 10 A ones; its first alert is on the first manipulated message.
