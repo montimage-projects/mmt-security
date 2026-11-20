@@ -1,23 +1,26 @@
 <beginning>
 <!-- Property 44: Probable TCP ACK/Window scan (4 different attempts in a row on different ports).
+     Each probe must come from the host that opened its session (ip.src == ip.client_addr; mmt-dpi takes the
+     sender of a session's first packet as its client). A server answering several connections of one client
+     sends the same pattern from its service port to the client's ports, but it never opened those sessions.
 -->
 <property value="THEN" delay_units="ms" delay_min="0+" delay_max="10" property_id="44" type_property="ATTACK" 
     description="Probable TCP ACK/Window scan (4 different attempts in a row on different ports).">
     <operator value="THEN" delay_units="ms" delay_min="0+" delay_max="10">
       <event value="COMPUTE" event_id="1" 
              description="TCP ACK packet header with a destination port field set (1)"
-             boolean_expression="(tcp.flags == 16)"/>
+             boolean_expression="((tcp.flags == 16)&amp;&amp;(ip.src == ip.client_addr))"/>
       <event value="COMPUTE" event_id="2" 
              description="TCP ACK packet header with another destination port field set (2)"
-             boolean_expression="((tcp.flags == 16)&amp;&amp;((tcp.dest_port != tcp.dest_port.1)&amp;&amp;((ip.src == ip.src.1)&amp;&amp;(ip.dst == ip.dst.1))))"/>
+             boolean_expression="(((tcp.flags == 16)&amp;&amp;(ip.src == ip.client_addr))&amp;&amp;((tcp.dest_port != tcp.dest_port.1)&amp;&amp;((ip.src == ip.src.1)&amp;&amp;(ip.dst == ip.dst.1))))"/>
     </operator>
     <operator value="THEN" delay_units="ms" delay_min="0+" delay_max="10">
       <event value="COMPUTE" event_id="3" 
              description="TCP ACK packet header with another destination port field set (3)"
-             boolean_expression="((tcp.flags == 16)&amp;&amp;((tcp.dest_port != tcp.dest_port.1)&amp;&amp;((tcp.dest_port != tcp.dest_port.2)&amp;&amp;((ip.src == ip.src.1)&amp;&amp;(ip.dst == ip.dst.1)))))"/>
+             boolean_expression="(((tcp.flags == 16)&amp;&amp;(ip.src == ip.client_addr))&amp;&amp;((tcp.dest_port != tcp.dest_port.1)&amp;&amp;((tcp.dest_port != tcp.dest_port.2)&amp;&amp;((ip.src == ip.src.1)&amp;&amp;(ip.dst == ip.dst.1)))))"/>
       <event value="COMPUTE" event_id="4"
              description="TCP ACK packet header with another destination port field set (4)"
-             boolean_expression="((tcp.flags == 16)&amp;&amp;((tcp.dest_port != tcp.dest_port.1)&amp;&amp;((tcp.dest_port != tcp.dest_port.2)&amp;&amp;((tcp.dest_port != tcp.dest_port.3)&amp;&amp;((ip.src == ip.src.1)&amp;&amp;(ip.dst == ip.dst.1)))))"/>
+             boolean_expression="(((tcp.flags == 16)&amp;&amp;(ip.src == ip.client_addr))&amp;&amp;((tcp.dest_port != tcp.dest_port.1)&amp;&amp;((tcp.dest_port != tcp.dest_port.2)&amp;&amp;((tcp.dest_port != tcp.dest_port.3)&amp;&amp;((ip.src == ip.src.1)&amp;&amp;(ip.dst == ip.dst.1)))))"/>
     </operator>
 </property>
 </beginning>
