@@ -1,7 +1,27 @@
 <beginning>
 <!-- Detection Rule 209: Detect invalid DICOM protocol version (not 1) in A-ASSOCIATE-RQ -->
+<!-- Coverage: mmt-dpi classifies a TCP flow as DICOM only on an A-ASSOCIATE-RQ/AC with
+     protocol version 1 (_is_dicom_association_open, src/mmt_dicom/dicom.c). An
+     association that opens with another version is not seen; the rule fires on a
+     version other than 1 in an A-ASSOCIATE-RQ/AC that follows a valid association on
+     the same connection. -->
+<!--
+     PDU boundaries: mmt-dpi reads a PDU header at the start of every TCP segment of a
+     DICOM flow, also when the segment is the middle of a PDU that spans segments, so
+     data bytes such as 01 00 00 00 01 00 read as an A-ASSOCIATE-RQ header. The rule
+     follows the PDU boundaries of each direction of the connection itself (each
+     header gives the next one, 6 + PDU length bytes later) and reads only headers
+     that start at a boundary. The boundary is set at each A-ASSOCIATE-RQ/AC that
+     mmt-dpi accepts at the start of a segment, unless that segment lies inside the
+     PDU being followed, and it is lost on missing data until the next one. A
+     connection whose first PDU mmt-dpi rejects is not classified as DICOM and is not
+     seen. PDU_TRACK_SLOTS connection directions are followed; the least recently seen
+     is dropped when the table is full. -->
 <embedded_functions><![CDATA[
 #include <mmt_core.h>
+#include <stdint.h>
+#include <string.h>
+
 static int em_is_dicom(const void *data) {
     proto_hierarchy_t *p = (proto_hierarchy_t *) data;
     int i;
@@ -10,10 +30,127 @@ static int em_is_dicom(const void *data) {
             return 1;
     return 0;
 }
+
+/* ---- PDU boundary tracker ---- */
+#define PDU_TRACK_SLOTS    4096 /* power of 2 */
+#define PDU_TRACK_PROBES   8
+#define PDU_TRACK_MAX_SKIP (16u << 20) /* an A-ASSOCIATE further away starts a new stream */
+#define PDU_AT_BOUNDARY    1 /* the segment starts at a PDU boundary */
+#define PDU_FLAGGED        2 /* a header this rule flags starts in the segment */
+
+/* the header this rule flags */
+static inline int pdu_track_bad(uint8_t type, uint32_t len) {
+    (void) type; (void) len;
+    return 0;
+}
+
+typedef struct {
+    uint32_t src, dst, ports;
+    uint32_t next;   /* TCP sequence number of the next PDU header */
+    uint64_t last;   /* 0: free slot */
+    int synced;
+} pdu_track_t;
+
+static pdu_track_t pdu_tracks[PDU_TRACK_SLOTS];
+static uint64_t pdu_track_tick = 0;
+/* the last segment seen, so that a rule evaluating it twice gets the same answer */
+static struct { uint32_t src, dst, ports, seq, n; int result; } pdu_track_memo;
+
+static pdu_track_t *pdu_track_lookup(uint32_t src, uint32_t dst, uint32_t ports) {
+    uint32_t h = (src * 2654435761u) ^ (dst * 2246822519u) ^ (ports * 3266489917u), i;
+    pdu_track_t *victim = NULL, *p;
+    for (i = 0; i < PDU_TRACK_PROBES; i++) {
+        p = &pdu_tracks[(h + i) & (PDU_TRACK_SLOTS - 1)];
+        if (p->last != 0 && p->src == src && p->dst == dst && p->ports == ports)
+            return p;
+        if (victim == NULL || p->last < victim->last)
+            victim = p;
+    }
+    memset(victim, 0, sizeof(*victim));
+    victim->src = src;
+    victim->dst = dst;
+    victim->ports = ports;
+    return victim;
+}
+
+/*
+ * Follow the PDU stream of one direction of a TCP connection; return PDU_AT_BOUNDARY
+ * and/or PDU_FLAGGED. dpi_pdu_type is dicom.pdu_type: 1..7 when mmt-dpi accepted a
+ * PDU header at the start of the segment, 0 otherwise.
+ */
+static int pdu_track(const void *ip_src, const void *ip_dst, double sport, double dport,
+                     double seq_nb, const void *payload, double payload_len, double dpi_pdu_type) {
+    const uint8_t *p = (const uint8_t *) payload;
+    uint32_t src, dst, ports, seq = (uint32_t) seq_nb, n = (uint32_t) payload_len, len;
+    int64_t off;
+    int result = 0;
+    pdu_track_t *d;
+
+    if (ip_src == NULL || ip_dst == NULL || p == NULL || n == 0)
+        return 0;
+    memcpy(&src, ip_src, sizeof(src));
+    memcpy(&dst, ip_dst, sizeof(dst));
+    ports = ((uint32_t) sport << 16) | (uint32_t) dport;
+    if (pdu_track_memo.src == src && pdu_track_memo.dst == dst && pdu_track_memo.ports == ports
+            && pdu_track_memo.seq == seq && pdu_track_memo.n == n)
+        return pdu_track_memo.result;
+
+    d = pdu_track_lookup(src, dst, ports);
+    d->last = ++pdu_track_tick;
+    off = (int32_t)(d->next - seq);
+    if (dpi_pdu_type == 1 || dpi_pdu_type == 2) {
+        /* an A-ASSOCIATE-RQ/AC accepted by mmt-dpi starts (or restarts) the stream,
+         * unless it lies inside the PDU being followed */
+        if (!d->synced || off < 0 || off > PDU_TRACK_MAX_SKIP) {
+            d->synced = 1;
+            off = 0;
+        }
+    }
+    if (!d->synced) {
+        result = 0;
+    } else if (off < 0) {
+        d->synced = 0; /* the data before this segment was not seen */
+    } else {
+        if (off == 0)
+            result |= PDU_AT_BOUNDARY;
+        while (off + 6 <= n) {
+            len = ((uint32_t)p[off + 2] << 24) | ((uint32_t)p[off + 3] << 16)
+                | ((uint32_t)p[off + 4] << 8) | p[off + 5];
+            if (pdu_track_bad(p[off], len))
+                result |= PDU_FLAGGED;
+            off += 6 + (int64_t) len;
+        }
+        if (off < n || off > 0x7FFFFFFF)
+            d->synced = 0; /* a header split across segments, or an absurd length */
+        else
+            d->next = seq + (uint32_t) off;
+    }
+
+    pdu_track_memo.src = src;
+    pdu_track_memo.dst = dst;
+    pdu_track_memo.ports = ports;
+    pdu_track_memo.seq = seq;
+    pdu_track_memo.n = n;
+    pdu_track_memo.result = result;
+    return result;
+}
+
+static int em_pdu_at_boundary(const void *ip_src, const void *ip_dst, double sport, double dport,
+                              double seq_nb, const void *payload, double payload_len, double dpi_pdu_type) {
+    return (pdu_track(ip_src, ip_dst, sport, dport, seq_nb, payload, payload_len, dpi_pdu_type)
+            & PDU_AT_BOUNDARY) != 0;
+}
+
+static int em_pdu_hdr_check(const void *ip_src, const void *ip_dst, double sport, double dport,
+                            double seq_nb, const void *payload, double payload_len, double dpi_pdu_type) {
+    return (pdu_track(ip_src, ip_dst, sport, dport, seq_nb, payload, payload_len, dpi_pdu_type)
+            & PDU_FLAGGED) != 0;
+}
+/* ---- end of PDU boundary tracker ---- */
 ]]></embedded_functions>
 <property property_id="209" type_property="ATTACK"
      description="Detect invalid DICOM protocol version">
     <event description="DICOM A-ASSOCIATE-RQ or A-ASSOCIATE-AC with protocol version != 1"
-        boolean_expression="((ip.src != 0) &amp;&amp; (#em_is_dicom(meta.proto_hierarchy) == 1) &amp;&amp; (dicom.pdu_type &gt; 0) &amp;&amp; (dicom.pdu_type &lt; 3) &amp;&amp; (dicom.proto_version != 1))"/>
+        boolean_expression="((ip.src != 0) &amp;&amp; ((#em_is_dicom(meta.proto_hierarchy) == 1) &amp;&amp; ((#em_pdu_at_boundary(ip.src, ip.dst, tcp.src_port, tcp.dest_port, tcp.seq_nb, tcp.p_payload, tcp.payload_len, dicom.pdu_type) == 1) &amp;&amp; (((((dicom.pdu_type == 1) || (dicom.pdu_type == 2)) &amp;&amp; (dicom.proto_version != 1)) &amp;&amp; (#is_exist(dicom.proto_version) &gt;= 0)) &amp;&amp; (#is_exist(dicom.pdu_type) &gt;= 0)))))"/>
 </property>
 </beginning>
