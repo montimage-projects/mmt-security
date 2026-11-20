@@ -49,12 +49,13 @@ expected files leave out.
      one client to one SCP port, each ending with a PDU of type 9 (12 alerts of
      200), a segment far from the stream (100 MiB ahead, 16 MiB + 1 behind) that
      must not blind the direction or make 216 forget the data (200, 216, 200),
-     and a P-DATA-TF sent only by the SCP before the client's A-ASSOCIATE-RQ
-     (216).
+     a P-DATA-TF sent only by the SCP before the client's A-ASSOCIATE-RQ
+     (216), and a far segment with the fixed fields of an A-ASSOCIATE-RQ but no
+     Application Context Item, ignored too (200).
    - `dicom_tracker_edges`: reuses of a 4-tuple: a TIME_WAIT reuse (new initial
-     sequence number = old + 65537) after a release, random initial sequence
-     numbers after a release and after a TCP reset, one 64 KiB beyond
-     `PDU_TRACK_NEAR` after a reset; a capture loss of 64 KiB less than
+     sequence number = old + 65537) after a release and after an A-ABORT,
+     random initial sequence numbers after a release and after a TCP reset, one
+     64 KiB beyond `PDU_TRACK_NEAR` after a reset; a capture loss of 64 KiB less than
      `PDU_TRACK_NEAR` at a PDU header, then data that starts like a whole
      A-ASSOCIATE-RQ; data that starts with the fixed fields of an
      A-ASSOCIATE-RQ but no Application Context Item, after a lost header and as
