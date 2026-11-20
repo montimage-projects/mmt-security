@@ -239,8 +239,9 @@ static inline size_t _update_and_register_protocols_attributes_to_extract( bool 
 			is_need_reassembly = true;
 		}
 	}
+	//a hint, not a problem: printed only with -v
 	if( is_need_reassembly && !is_enable_reassembly && verbose )
-		mmt_warn("The rules using tcp.tcp_session_payload_up or tcp.tcp_session_payload_down (e.g., rule 67) will not work: use -R to enable TCP reassembly");
+		mmt_info("The rules using tcp.tcp_session_payload_up or tcp.tcp_session_payload_down (e.g., rule 67) need -R (TCP reassembly) to fire");
 	return ret;
 }
 
@@ -611,7 +612,7 @@ int main(int argc, char** argv) {
 		mmt_info("Enabled IP defragmentation and TCP reassembly");
 	}
 
-	_update_and_register_protocols_attributes_to_extract( true );
+	_update_and_register_protocols_attributes_to_extract( verbose );
 
 
 	//Register a packet handler, it will be called for every processed packet

@@ -151,7 +151,7 @@ Option:
 ```
 
 TCP reassembly is off by default, as it keeps the payload of every TCP flow in memory (at most 4 MB per flow by default in MMT-DPI).
-Without `-R`, `mmt_sec_standalone` warns when a loaded rule needs `tcp.tcp_session_payload_up` or `tcp.tcp_session_payload_down`, and such a rule never fires.
+Without `-R`, a rule that needs `tcp.tcp_session_payload_up` or `tcp.tcp_session_payload_down` never fires; with `-v`, `mmt_sec_standalone` prints a hint about `-R` when such a rule is loaded.
 In mmt-probe, the same is done by `enable-ip-defragmentation = true` and `enable-tcp-reassembly = true`.
 
 ## mmt_sec_server
