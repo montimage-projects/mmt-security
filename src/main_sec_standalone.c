@@ -45,6 +45,9 @@ static mmt_sec_handler_t *sec_handler  = NULL;
 //handler of MMT-DPI
 static mmt_handler_t *mmt_dpi_handler = NULL;
 
+//enable IP defragmentation and TCP reassembly in MMT-DPI (option -R)
+static bool is_enable_reassembly = false;
+
 void usage(const char * prg_name) {
 	fprintf(stderr, "MMT-Security version %s using DPI version %s\n", mmt_sec_get_version_info(), mmt_version() );
 	fprintf(stderr, "\nUsage: %s [<option>]\n", prg_name);
@@ -57,6 +60,8 @@ void usage(const char * prg_name) {
 	fprintf(stderr, "\t-f <string>    : Output results to file, e.g., \"/home/tata/:5\" => output to folder /home/tata and each file contains reports during 5 seconds \n");
 	fprintf(stderr, "\t-r <string>    : Output results to redis, e.g., \"localhost:6379\"\n");
 	fprintf(stderr, "\t-g             : Ignore the rest of a flow when an alert was detetected on the flow.\n");
+	fprintf(stderr, "\t-R             : Enable IP defragmentation and TCP reassembly in MMT-DPI.\n");
+	fprintf(stderr, "\t                 Rules using tcp.tcp_session_payload_up or tcp.tcp_session_payload_down (e.g., rule 67) need it.\n");
 	fprintf(stderr, "\t-v             : Verbose.\n");
 	fprintf(stderr, "\t-l             : Prints the available rules then exit.\n");
 	fprintf(stderr, "\t-h             : Prints this help.\n");
@@ -75,7 +80,7 @@ size_t parse_options(int argc, char ** argv, char *filename, int *type, uint16_t
 	*verbose = NO;
 	*is_ignore = NO;
 	filename[0] = '\0';
-	while ((opt = getopt(argc, argv, "t:i:f:r:c:m:x:lhvg")) != EOF) {
+	while ((opt = getopt(argc, argv, "t:i:f:r:c:m:x:lhvgR")) != EOF) {
 		switch (opt) {
 		case 't':
 			optcount++;
@@ -122,6 +127,10 @@ size_t parse_options(int argc, char ** argv, char *filename, int *type, uint16_t
 		case 'v':
 			optcount++;
 			*verbose = YES;
+			break;
+		case 'R':
+			optcount++;
+			is_enable_reassembly = true;
 			break;
 		case 'h':
 		default:
@@ -207,6 +216,7 @@ static inline bool _register_proto_att_to_mmt_dpi( uint32_t proto_id, uint32_t a
 static inline size_t _update_and_register_protocols_attributes_to_extract( bool verbose ){
 	int i;
 	size_t ret = 0;
+	bool is_need_reassembly = false;
 	proto_atts_count = mmt_sec_get_unique_protocol_attributes( & proto_atts );
 
 	for( i=0; i<proto_atts_count; i++ ){
@@ -220,7 +230,17 @@ static inline size_t _update_and_register_protocols_attributes_to_extract( bool 
 		}else if( proto_atts[i]->proto_id == PROTO_IP && proto_atts[i]->att_id == IP_OPTS){
 			ret += _register_proto_att_to_mmt_dpi( PROTO_IP, IP_HEADER_LEN, verbose );
 		}
+		//tcp.tcp_session_payload_up/down => need its length and the TCP reassembly
+		else if( proto_atts[i]->proto_id == PROTO_TCP && proto_atts[i]->att_id == TCP_SESSION_PAYLOAD_UP ){
+			ret += _register_proto_att_to_mmt_dpi( PROTO_TCP, TCP_SESSION_PAYLOAD_UP_LEN, verbose );
+			is_need_reassembly = true;
+		}else if( proto_atts[i]->proto_id == PROTO_TCP && proto_atts[i]->att_id == TCP_SESSION_PAYLOAD_DOWN ){
+			ret += _register_proto_att_to_mmt_dpi( PROTO_TCP, TCP_SESSION_PAYLOAD_DOWN_LEN, verbose );
+			is_need_reassembly = true;
+		}
 	}
+	if( is_need_reassembly && !is_enable_reassembly && verbose )
+		mmt_warn("The rules using tcp.tcp_session_payload_up or tcp.tcp_session_payload_down (e.g., rule 67) will not work: use -R to enable TCP reassembly");
 	return ret;
 }
 
@@ -581,6 +601,15 @@ int main(int argc, char** argv) {
 		return EXIT_FAILURE;
 	}
 
+
+	if( is_enable_reassembly ){
+		//IP defragmentation, then reassembly of TCP segments into the flow's payload
+		if( !enable_mmt_reassembly( mmt_dpi_handler ) || !update_protocol( PROTO_TCP, TCP_ENABLE_REASSEMBLE ) ){
+			fprintf(stderr, "Cannot enable reassembly in MMT-DPI\n");
+			return EXIT_FAILURE;
+		}
+		mmt_info("Enabled IP defragmentation and TCP reassembly");
+	}
 
 	_update_and_register_protocols_attributes_to_extract( true );
 

@@ -128,6 +128,16 @@ static inline int dpi_message_set_void_data( const ipacket_t *pkt, const void *d
 	if( unlikely( data == NULL ))
 		return 0;
 
+	//reassembled TCP stream of a flow (needs mmt-dpi TCP reassembly):
+	// its length is given by the corresponding *_len attribute, that must be registered too
+	if( proto_id == PROTO_TCP && (att_id == TCP_SESSION_PAYLOAD_UP || att_id == TCP_SESSION_PAYLOAD_DOWN) ){
+		const uint32_t *len = (const uint32_t *) get_attribute_extracted_data( pkt, PROTO_TCP,
+				(att_id == TCP_SESSION_PAYLOAD_UP)? TCP_SESSION_PAYLOAD_UP_LEN : TCP_SESSION_PAYLOAD_DOWN_LEN );
+		if( len == NULL || *len == 0 )
+			return 0;
+		return set_element_data_message_t( msg, proto_id, att_id, data, MMT_SEC_MSG_DATA_TYPE_BINARY, *len );
+	}
+
 	switch( att_id ){
 	case PROTO_PAYLOAD:
 		new_data_type = MMT_SEC_MSG_DATA_TYPE_BINARY;
