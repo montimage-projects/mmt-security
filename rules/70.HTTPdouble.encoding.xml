@@ -3,36 +3,100 @@
 <beginning>
 <embedded_functions><![CDATA[
 //each function name should be prefixed by em_
+#include <strings.h>
+
+/*
+ * The TCP payload is analysed only when it starts an HTTP/1.x message: a
+ * status line ("HTTP/...") or a request line ("METHOD target HTTP/...").
+ * Header lines are read up to the empty line that ends the header block, so
+ * text in the message body is never taken for a header.
+ * Field names are compared case-insensitively (RFC 9110, section 5.1), and
+ * white space before the colon is tolerated (a known evasion).
+ */
+
+//number of comma-separated codings in [v, end), "identity" excluded
+static inline int em_http_count_codings( const char *v, const char *end ){
+	int n = 0;
+	const char *s, *e;
+	while( v < end ){
+		while( v < end && (*v == ' ' || *v == '\t' || *v == ',') )
+			v++;
+		s = v;
+		while( v < end && *v != ',' )
+			v++;
+		e = v;
+		while( e > s && (e[-1] == ' ' || e[-1] == '\t') )
+			e--;
+		if( e > s && !(e - s == 8 && strncasecmp( s, "identity", 8 ) == 0) )
+			n++;
+	}
+	return n;
+}
+
+//whether the header line [line, eol) has the field name #name; *value is set to the field value
+static inline bool em_http_name_is( const char *line, const char *eol, const char *name, const char **value ){
+	size_t len = strlen( name );
+	const char *c;
+	if( (size_t)(eol - line) <= len || strncasecmp( line, name, len ) != 0 )
+		return false;
+	c = line + len;
+	while( c < eol && (*c == ' ' || *c == '\t') )
+		c++;
+	if( c >= eol || *c != ':' )
+		return false;
+	*value = c + 1;
+	return true;
+}
+
+//whether the first line [str, eol) is an HTTP/1.x status line or request line
+static inline bool em_http_is_start_line( const char *str, const char *eol ){
+	const char *c;
+	if( eol - str >= 5 && memcmp( str, "HTTP/", 5 ) == 0 )
+		return true;
+	for( c = str; c + 6 <= eol; c++ )
+		if( memcmp( c, " HTTP/", 6 ) == 0 )
+			return true;
+	return false;
+}
+
 /**
-* Return:
-* - 0: ok
-* - 1: invalid
-* - 2: NULL
-*/
-static inline int em_check_double_encoding_http(const char *str){
-   
-   
-   const char* c = str;
-   while( *c != '\0' ){
-      if (*c=='T' && c[1]=='r' && c[2]=='a' && c[3]=='n' && c[4]=='s'){
-      	if (strstr(c, "Transfer-Encoding") != NULL) {
-      		while( *c != '\0' ){
-      			if (*c=='T' && c[1]=='r' && c[2]=='a' && c[3]=='n' && c[4]=='s'){
-     			 	if (strstr(c, "Transfer-Encoding") != NULL) return 1;
-     			 	break;
-     			 	}
-     			 if (*c=='C' && c[1]=='o' && c[2]=='n' && c[3]=='t' && c[4]=='e'){
-     			 	if (strstr(c, "Content-length") != NULL) return 1;
-     			 	break;
-     			 	}
-      		c++;
-      		}
-      	}
-      	break;
-      	} 
-      c ++;
-   }
-   return 0;
+ * Return:
+ * - 1: the header block of the HTTP message starting the payload has two
+ *      Transfer-Encoding headers or more, lists two transfer codings or more,
+ *      or has both Transfer-Encoding and Content-Length (RFC 9112, section
+ *      6.3: a request smuggling vector)
+ * - 0: otherwise
+ */
+static inline int em_check_double_encoding_http( const char *str ){
+	const char *end, *line, *eol, *vend, *val;
+	int codings = 0, lines = 0, content_length = 0;
+
+	if( str == NULL )
+		return 0;
+	end = str + mmt_mem_size( str );
+
+	eol = memchr( str, '\n', end - str );
+	if( eol == NULL || !em_http_is_start_line( str, eol ))
+		return 0;
+
+	for( line = eol + 1; line < end; line = eol + 1 ){
+		eol = memchr( line, '\n', end - line );
+		if( eol == NULL )
+			eol = end; //header block cut by the end of the segment
+		vend = eol;
+		if( vend > line && vend[-1] == '\r' )
+			vend--;
+		if( vend == line )
+			break;     //empty line: end of the header block
+		if( em_http_name_is( line, vend, "Transfer-Encoding", &val )){
+			lines ++;
+			codings += em_http_count_codings( val, vend );
+		}else if( em_http_name_is( line, vend, "Content-Length", &val ))
+			content_length ++;
+		if( eol == end )
+			break;
+	}
+	return ( lines >= 2 || codings >= 2 || (lines >= 1 && content_length >= 1) );
 }
 ]]></embedded_functions>
 <!-- Property 70: Detect HTTP double transfer encoding -->

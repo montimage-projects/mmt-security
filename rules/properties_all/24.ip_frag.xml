@@ -1,12 +1,16 @@
 <beginning>
-<!-- Property 24: Overlapping IP fragmentation : difference in offset of concomitant fragments < fragment length (allowed but could be an evasion).-->
+<!-- Property 24: Overlapping IP fragmentation : difference in offset of concomitant fragments < fragment length (allowed but could be an evasion).
+     Two fragments of one datagram (same identification, source and destination) overlap when the later one starts
+     inside the data of the earlier one: frag_offset.2 - frag_offset.1 < tot_len.1 - header_len.1, written
+     ((frag_offset.2 - frag_offset.1) + header_len.1) < tot_len.1 because the rule compiler needs a plain attribute on one side.
+     MMT gives ip.frag_offset and ip.header_len in bytes. Rule 25 covers fragments that arrive in reverse order.-->
 <property value="THEN" delay_units="ms" delay_min="0+" delay_max="10" property_id="24" type_property="EVASION" 
     description="Overlapping IP fragmentation : difference in offset of concomitant fragments less than fragment length (allowed but could be an evasion).">
       <event value="COMPUTE" event_id="1" 
              description="IP fragment followed by another"
              boolean_expression="((ip.identification &gt; 0)&amp;&amp;((ip.mf_flag == 1)&amp;&amp;((ip.frag_offset &gt;= 0)&amp;&amp;(ip.src != ip.dst))))"/>
       <event value="COMPUTE" event_id="2" 
-             description="IP fragment with same identification and differences in offsets less than length"
-             boolean_expression="((ip.identification == ip.identification.1)&amp;&amp;((ip.frag_offset &gt; ip.frag_offset.1)&amp;&amp;(((ip.frag_offset - ip.frag_offset.1) &lt; ip.tot_len)&amp;&amp;(ip.src != ip.dst))))"/>
+             description="Later fragment of the same datagram that starts inside the data of the first one"
+             boolean_expression="((ip.identification == ip.identification.1)&amp;&amp;((ip.frag_offset &gt; ip.frag_offset.1)&amp;&amp;((((ip.frag_offset - ip.frag_offset.1) + ip.header_len.1) &lt; ip.tot_len.1)&amp;&amp;((ip.src == ip.src.1)&amp;&amp;(ip.dst == ip.dst.1)))))"/>
 </property>
 </beginning>

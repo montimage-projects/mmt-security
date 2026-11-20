@@ -244,6 +244,93 @@ Found 1 rule.
 	- version         : 1.1.5 (70a367f - 2017-6-8 12:42:28), dpi version 1.6.8.0 (b3e727b)
 ```
  
+## 4.3 Build information of a compiled rule
+
+Every `.so` built by `compile_rule` records the environment it was built in. A
+deployment can therefore check that it fits the target system: the same rule
+ABI, the same mmt-dpi ids, the plugins it needs, the glibc it needs. The
+information is one JSON document, stored twice:
+
+- returned by the exported function `const char *mmt_sec_get_rule_build_info(void)`.
+  With `STATIC_LINK`, the name gets the rule's `RULE_SUFFIX`, like
+  `mmt_sec_get_plugin_info`;
+- in the ELF note section `.note.mmt.build` (owner `MMT`, type `0x4d4d5401`),
+  readable without loading the `.so`.
+
+```bash
+./rule_info --build-info rules/13.datainSYN.so          # indented
+./rule_info --build-info --json rules/13.datainSYN.so   # one line, for scripts
+readelf -n rules/13.datainSYN.so                         # the note (hex dump)
+readelf -p .note.mmt.build rules/13.datainSYN.so         # the note as text
+./rule_info --abi                                        # the rule ABI of this mmt-security
+```
+
+`rule_info --build-info` reads the note, without loading the `.so`; it calls
+the function only when the file has no note. A `.so` built before the build
+info existed has neither: it still loads and runs as before. `rule_info
+--build-info` then says so, and `--json` prints `null`. A file that is not an
+ELF shared object of this architecture, or whose section table or notes are
+malformed, is an error (exit code 1): the reader checks every offset and size,
+since it is meant for `.so` files that are not trusted yet. The existing `rule_version_info_t`
+(`mmt_sec_get_rule_version_info`, `version` in `rule_info_t`) is unchanged.
+
+Example (rule 13, built in ubuntu:24.04 with mmt-dpi 1.10.3 installed):
+
+```json
+{
+  "schema": 1,
+  "rule_ids": [13],
+  "xml": {"file": "13.datainSYN.xml", "sha256": "ee66f765...2225"},
+  "rule_abi": {"hash": "sha256:cdf30484...146a", "plugin_version": "1.2.7"},
+  "mmt_security": {"version": "1.2.20", "git": "0e2f9cb", "index": 1022000},
+  "dpi": {
+    "ids_from": "1.7.10 (fd93012d)", "ids_from_commit": "fd93012d",
+    "installed": "1.10.3 (6a0afb46)", "installed_commit": "6a0afb46",
+    "ids_match_installed": true,
+    "ids_hash": "sha256:1f88c382...1979",
+    "ids": [["ip", 178, "dst", 14, 8], ["ip", 178, "src", 13, 8],
+            ["tcp", 354, "flags", 6, 1], ["tcp", 354, "payload_len", 27, 3]],
+    "plugins": ["libmmt_tcpip.so"]
+  },
+  "build": {
+    "compiler": "gcc 13.3.0", "target": "aarch64-linux-gnu",
+    "cflags": "-O3 -fPIC -shared {source} -o {output} -I ./src/lib -I ./src/dpi -I/opt/mmt/security/include -I/opt/mmt/dpi/include",
+    "glibc_min": "GLIBC_2.17", "os": "Ubuntu 24.04.5 LTS",
+    "builder": null, "date": "2026-11-20T13:39:08Z"
+  }
+}
+```
+
+| field | meaning |
+|---|---|
+| `schema` | version of this layout (1). It is bumped when a field changes meaning. |
+| `rule_ids` | ids of the rules in the `.so` |
+| `xml.file`, `xml.sha256` | name of the rule XML, and the SHA-256 of its bytes |
+| `rule_abi.hash` | `sha256:` of the layout (`sizeof`/`offsetof`) of the structures a rule shares with the engine: `rule_info_t`, `proto_attribute_t`, `rule_version_info_t`, `message_t`, `message_element_t`, `mmt_array_t`, plus `REQUIRE_PLUGIN`. `rule_info --abi` prints the engine's layout and hash. |
+| `rule_abi.plugin_version` | `REQUIRE_PLUGIN`: the oldest rule version this mmt-security loads |
+| `mmt_security.version`, `.git`, `.index` | the mmt-security that compiled the rule (same as `rule_version_info_t`) |
+| `dpi.ids_from`, `.ids_from_commit` | the label (`mmt_version()`) of the DPI header compiled into `compile_rule`, and its commit. `compile_rule` takes the ids from that header's table, compiled in with it, not from the installed mmt-dpi. It is neither the `src/dpi/mmt_dpi.h` on disk nor the installed mmt-dpi: `make` can regenerate that file without rebuilding `compile_rule`, and the label can be wrong about the table (the committed header says `fd93012d` and holds 6b1c9f53's table). See [rule-abi-stability.md](rule-abi-stability.md#how-the-ids-get-into-a-rule-so). The ids themselves are `dpi.ids`. |
+| `dpi.installed`, `.installed_commit` | a separate fact: `mmt_version()` of the `libmmt_core` that `compile_rule` found with `dlopen` where it ran (`compile_rule` does not link it), or `null` if none was found. The ids do not come from it. |
+| `dpi.ids_match_installed` | `true` when every pair below resolves to the same ids and type in that installed `libmmt_core`, `false` when one differs, `null` if unknown |
+| `dpi.ids` | every `[proto, proto_id, att, att_id, dpi_type]` the rules use, as baked into the `.so`, sorted by proto then att |
+| `dpi.ids_hash` | `sha256:` of one line `proto,proto_id,att,att_id,dpi_type\n` per entry of `dpi.ids`, in that order (byte-wise sort on proto, then att) |
+| `dpi.plugins` | the plugin files of the installed mmt-dpi that register the protocols the rules use (found by `dladdr` on the protocol name each plugin gives mmt-dpi) or extract their attributes (`dladdr` on each attribute's extraction function), sorted. A `.so` needs them loaded by the engine's mmt-dpi. `libmmt_core` is not a plugin and is not listed, nor are its own protocols (`meta`, `unknown`), so a rule that uses only those has `[]`. `null` if no mmt-dpi was found. |
+| `build.compiler` | compiler of the `.so`, from its predefined macros (`gcc __VERSION__` or `clang __clang_version__`) |
+| `build.target` | target of that compiler, from its predefined macros (`__x86_64__`, `__aarch64__`, `__linux__`, `__GLIBC__`...), named as `gcc -dumpmachine` names it, e.g. `x86_64-linux-gnu`. With `-m32` it is `i686-linux-gnu`. |
+| `build.cflags` | the arguments `compile_rule` passed to `/usr/bin/gcc`, in their order, with the C file written `{source}` and the `.so` written `{output}`. The extra option of `compile_rule` comes last, after the source, so its `-l` libraries are linked. `null` with `-c`, where the C is compiled elsewhere. |
+| `build.glibc_min` | highest `GLIBC_x.y` symbol version the `.so` needs. `compile_rule` links twice to measure it. `null` with `-c`. |
+| `build.os` | `PRETTY_NAME` of `/etc/os-release` |
+| `build.builder` | `$MMT_SEC_BUILDER`, or `null` when it is not set. The host name is not recorded, since the `.so` may be distributed. CI sets it to the URL of the run. |
+| `build.date` | UTC build time, or `$SOURCE_DATE_EPOCH` when set; `null` when that time has no date (`gmtime_r` fails) or `$SOURCE_DATE_EPOCH` is not a number |
+
+Every string is UTF-8: a byte that is not valid UTF-8 (e.g., in a Latin-1 file
+name) becomes U+FFFD. `compile_rule` rejects an extra gcc option longer than
+about 9,900 bytes with an error, instead of truncating it.
+
+`MMT_SEC_BUILD_INFO_NO_DPI=1` makes `compile_rule` skip looking for an
+installed mmt-dpi (`dpi.installed`, `ids_match_installed` and `plugins` are then
+`null`).
+
 # 5. Default values
 
 In the XML file of a rule, if an attribute is absent then its value is set by default:

@@ -3,14 +3,17 @@
 The maximum packet length of an IPv4 packet is 65 535 bytes (2^16 - 1)
 The attacker sends a number of IP fragments with the regrouped payload at the end will be an ICMP packet bigger than 65 535 bytes 
 that can probably lead to buffer overflow / system crash.
+mmt-dpi never delivers a reassembled datagram longer than 65 535 bytes, so the overrun is detected on the fragment itself:
+its end, ip.frag_offset + (ip.tot_len - ip.header_len), lies beyond 65 535 (ip.frag_offset and ip.header_len are in bytes).
+The fragment that overruns carries no ICMP header, so the protocol is taken from ip.proto_id (1 = ICMP).
 -->
 <property value="THEN" delay_units="ms" delay_min="0" delay_max="0" property_id="51" type_property="ATTACK" 
           description="Ping of death attack">
       <event value="COMPUTE" event_id="1" 
-             description="A defragmented ICMP packet"
-             boolean_expression="((icmp.packet_count != 0) &amp;&amp; ((ip.df_flag + ip.mf_flag) ==0))"/>
+             description="ICMP fragment that ends beyond the IPv4 maximum of 65 535 bytes"
+             boolean_expression="((ip.proto_id == 1)&amp;&amp;(((ip.frag_offset + ip.tot_len) - ip.header_len) &gt; 65535))"/>
       <event value="COMPUTE" event_id="2" 
-             description="Packet length greater than 65 535"
-             boolean_expression="((ip.src != ip.dst)&amp;&amp;(meta.packet_len &gt; 65535))"/>
+             description="Print source and destination of IP"
+             boolean_expression="(ip.src != ip.dst)"/>
 </property>
 </beginning>

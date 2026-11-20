@@ -40,6 +40,9 @@ static inline uint32_t mmt_sec_get_version_number_from_string( const char *versi
 				break;
 			str ++;
 		}
+		//last number: do not jump over the final NUL
+		if( *str == '\0' )
+			break;
 		//jump over .
 		str ++;
 
@@ -64,6 +67,10 @@ const char *mmt_sec_get_version_number(){
 
 uint32_t mmt_sec_get_version_index(){
 	return mmt_sec_get_version_number_from_string( VERSION_NUMBER );
+}
+
+const char *mmt_sec_get_required_plugin_version(){
+	return REQUIRE_PLUGIN;
 }
 
 uint32_t mmt_sec_get_required_plugin_version_number(){

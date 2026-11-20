@@ -12,6 +12,7 @@
 #include "expression.h"
 #include "mmt_fsm.h"
 #include "version.h"
+#include "rule_build_info.h"
 
 #define STR_BUFFER_SIZE 10000
 #define _gen_comment( fd, format, ... ) fprintf( fd, "\n /** %d\n  * " format "\n  */\n ", __LINE__, ##__VA_ARGS__ )
@@ -528,9 +529,36 @@ void _iterate_variables_to_gen_structure( void *key, void *data, void *user_data
 	}
 }
 
+/**
+ * Unique (proto, att) of all rules of the file being generated, with the ids
+ * baked into it: they go into the build info (fork issue #6).
+ */
+static rule_build_info_id_t *_build_ids = NULL;
+static size_t _build_ids_count = 0, _build_ids_size = 0;
+
+static void _add_build_id( const variable_t *var ){
+	size_t i;
+	for( i=0; i<_build_ids_count; i++ )
+		if( strcmp( _build_ids[i].proto, var->proto ) == 0 && strcmp( _build_ids[i].att, var->att ) == 0 )
+			return;
+	if( _build_ids_count == _build_ids_size ){
+		_build_ids_size = _build_ids_size ? 2 * _build_ids_size : 32;
+		_build_ids = realloc( _build_ids, _build_ids_size * sizeof( _build_ids[0] ));
+		mmt_assert( _build_ids != NULL, "Not enough memory" );
+	}
+	_build_ids[ _build_ids_count ].proto    = var->proto;
+	_build_ids[ _build_ids_count ].att      = var->att;
+	_build_ids[ _build_ids_count ].proto_id = var->proto_id;
+	_build_ids[ _build_ids_count ].att_id   = var->att_id;
+	_build_ids[ _build_ids_count ].dpi_type = var->dpi_type;
+	_build_ids_count ++;
+}
+
 void _iterate_variables_to_gen_array_proto_att( void *key, void *data, void *user_data, size_t index, size_t total ){
 	FILE *fd = (FILE *)user_data;
 	variable_t *var = (variable_t *)data;
+
+	_add_build_id( var );
 
 	fprintf( fd, "%c{.proto = \"%s\", .proto_id = %"PRIu32", .att = \"%s\", .att_id = %"PRIu32", .data_type = %d, .dpi_type = %d}%s",
 			index == 0 ? '{':' ',
@@ -912,9 +940,114 @@ static inline bool _hash_function( const char*fn_name, const char *code ){
 }
 
 /**
+ * Write #str as the body of a C string literal (without the quotes)
+ */
+static void _gen_c_string_body( FILE *fd, const char *str, size_t len ){
+	size_t i;
+	for( i=0; i<len; i++ )
+		switch( str[i] ){
+		case '"':  fprintf( fd, "\\\"" ); break;
+		case '\\': fprintf( fd, "\\\\" ); break;
+		case '?':  fprintf( fd, "\\?" );  break; //no trigraph
+		case '\n': fprintf( fd, "\\n" );  break;
+		default:   fputc( str[i], fd );
+		}
+}
+
+/**
+ * Generate the build info of the rules (fork issue #6, doc/rule.md):
+ * - a function mmt_sec_get_rule_build_info() returning a JSON string,
+ * - the same bytes in an ELF note, section .note.mmt.build, owner "MMT".
+ * The compiler is the one that compiles this code: the JSON takes it and its
+ * target from its predefined macros (MMT_SEC_RULE_CC, MMT_SEC_RULE_TARGET).
+ */
+static void _gen_build_info( FILE *fd, rule_t *const* rules, size_t count, const rule_build_options_t *options ){
+	//each placeholder is a whole JSON string value: it becomes a macro
+	static const struct{ const char *key, *placeholder, *macro; } macros[] = {
+		{ "\"compiler\":\"", MMT_SEC_BUILD_INFO_CC_PLACEHOLDER,     "MMT_SEC_RULE_CC" },
+		{ "\"target\":\"",   MMT_SEC_BUILD_INFO_TARGET_PLACEHOLDER, "MMT_SEC_RULE_TARGET" },
+	};
+	rule_build_options_t opt = {0};
+	uint32_t *rule_ids = mmt_mem_alloc( (count + 1) * sizeof( uint32_t ));
+	char *json, *p, needle[64];
+	size_t i;
+
+	if( options != NULL )
+		opt = *options;
+	//the DPI header compiled into compile_rule: its table gave the ids
+	opt.dpi_header_version = mmt_version();
+
+	for( i=0; i<count; i++ )
+		rule_ids[i] = rules[i]->id;
+
+	json = mmt_sec_create_rule_build_info( &opt, rule_ids, count, _build_ids, _build_ids_count );
+
+	fprintf( fd, "\n\n /* BEGIN mmt-security rule build info (doc/rule.md) */" );
+	fprintf( fd, "\n#if defined(__clang__)\n #define MMT_SEC_RULE_CC \"clang \" __clang_version__" );
+	fprintf( fd, "\n#elif defined(__GNUC__)\n #define MMT_SEC_RULE_CC \"gcc \" __VERSION__" );
+	fprintf( fd, "\n#else\n #define MMT_SEC_RULE_CC \"unknown\"\n#endif" );
+	//the target triplet, as gcc -dumpmachine of that compiler names it
+	fprintf( fd, "\n#if defined(__x86_64__)\n #define MMT_SEC_RULE_ARCH \"x86_64\""
+			"\n#elif defined(__i386__)\n #define MMT_SEC_RULE_ARCH \"i686\""
+			"\n#elif defined(__aarch64__) && defined(__AARCH64EB__)\n #define MMT_SEC_RULE_ARCH \"aarch64_be\""
+			"\n#elif defined(__aarch64__)\n #define MMT_SEC_RULE_ARCH \"aarch64\""
+			"\n#elif defined(__arm__)\n #define MMT_SEC_RULE_ARCH \"arm\""
+			"\n#elif defined(__riscv) && __riscv_xlen == 64\n #define MMT_SEC_RULE_ARCH \"riscv64\""
+			"\n#elif defined(__powerpc64__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__\n #define MMT_SEC_RULE_ARCH \"powerpc64le\""
+			"\n#elif defined(__powerpc64__)\n #define MMT_SEC_RULE_ARCH \"powerpc64\""
+			"\n#elif defined(__s390x__)\n #define MMT_SEC_RULE_ARCH \"s390x\""
+			"\n#elif defined(__loongarch64)\n #define MMT_SEC_RULE_ARCH \"loongarch64\""
+			"\n#else\n #define MMT_SEC_RULE_ARCH \"unknown\"\n#endif" );
+	fprintf( fd, "\n#if defined(__linux__) && defined(__GLIBC__) && defined(__arm__) && defined(__ARM_PCS_VFP)"
+			"\n #define MMT_SEC_RULE_TARGET MMT_SEC_RULE_ARCH \"-linux-gnueabihf\""
+			"\n#elif defined(__linux__) && defined(__GLIBC__) && defined(__arm__)"
+			"\n #define MMT_SEC_RULE_TARGET MMT_SEC_RULE_ARCH \"-linux-gnueabi\""
+			"\n#elif defined(__linux__) && defined(__GLIBC__) && defined(__x86_64__) && defined(__ILP32__)"
+			"\n #define MMT_SEC_RULE_TARGET MMT_SEC_RULE_ARCH \"-linux-gnux32\""
+			"\n#elif defined(__linux__) && defined(__GLIBC__)"
+			"\n #define MMT_SEC_RULE_TARGET MMT_SEC_RULE_ARCH \"-linux-gnu\""
+			"\n#elif defined(__linux__)\n #define MMT_SEC_RULE_TARGET MMT_SEC_RULE_ARCH \"-linux\""
+			"\n#else\n #define MMT_SEC_RULE_TARGET MMT_SEC_RULE_ARCH \"-unknown\"\n#endif" );
+	fprintf( fd, "\n #define MMT_SEC_RULE_BUILD_INFO \"" );
+	p = json;
+	for( i=0; i<sizeof( macros ) / sizeof( macros[0] ); i++ ){
+		char *q;
+		//the key makes the match unique: a quote inside a JSON value is escaped
+		snprintf( needle, sizeof( needle ), "%s%s\"", macros[i].key, macros[i].placeholder );
+		q = strstr( p, needle );
+		mmt_assert( q != NULL, "Error 11b: build info without the %s placeholder", macros[i].macro );
+		q += strlen( macros[i].key );
+		_gen_c_string_body( fd, p, q - p );
+		fprintf( fd, "\" %s \"", macros[i].macro );
+		p = q + strlen( macros[i].placeholder );
+	}
+	_gen_c_string_body( fd, p, strlen( p ));
+	fprintf( fd, "\"" );
+	fprintf( fd, "\n #define " MMT_SEC_BUILD_INFO_SYMBOL " NAME(" MMT_SEC_BUILD_INFO_SYMBOL ")" );
+	fprintf( fd, "\n const char *" MMT_SEC_BUILD_INFO_SYMBOL "( void ){ return MMT_SEC_RULE_BUILD_INFO; }" );
+	fprintf( fd, "\n static const struct{ uint32_t namesz, descsz, type; char name[4];"
+			" char desc[ (sizeof( MMT_SEC_RULE_BUILD_INFO ) + 3) & ~3 ]; }"
+			"\n  _mmt_sec_rule_build_note __attribute__((used, section(\"" MMT_SEC_BUILD_NOTE_SECTION "\"), aligned(4))) ="
+			"\n  { sizeof( \"" MMT_SEC_BUILD_NOTE_OWNER "\" ), sizeof( MMT_SEC_RULE_BUILD_INFO ), 0x%x, \"" MMT_SEC_BUILD_NOTE_OWNER "\", MMT_SEC_RULE_BUILD_INFO };",
+			MMT_SEC_BUILD_NOTE_TYPE );
+	fprintf( fd, "\n /* END mmt-security rule build info */\n" );
+
+	free( json );
+	mmt_mem_free( rule_ids );
+}
+
+/**
  * Public API
  */
 int generate_fsm( const char* file_name, rule_t *const* rules, size_t count, const char*embedded_functions ){
+	return generate_fsm_with_build_options( file_name, rules, count, embedded_functions, NULL );
+}
+
+/**
+ * Public API
+ */
+int generate_fsm_with_build_options( const char* file_name, rule_t *const* rules, size_t count,
+		const char*embedded_functions, const rule_build_options_t *build_options ){
 	char *str_ptr;
 	size_t i;
 	//open file for writing
@@ -971,18 +1104,24 @@ int generate_fsm( const char* file_name, rule_t *const* rules, size_t count, con
 	//information of rules
 	_gen_rule_information( fd, rules, count );
 
+	//build information of the .so
+	_gen_build_info( fd, rules, count, build_options );
+	_build_ids_count = 0;
+
 	fclose(fd);
 
 	return 0;
 }
 
 /**
- * Compile the generated code
+ * The gcc arguments of #compile_gen_code, in the order gcc gets them:
+ *   <opt> -fPIC -shared <code_file> -o <lib_file> -I <incl_dir>
+ * #incl_dir ends with compile_rule's extra option: it must come after the
+ * source file, so that its -l libraries are linked (gcc links --as-needed).
+ * Returns the length written, or -1 when it does not fit in #size.
  */
-int compile_gen_code( const char *lib_file, const char *code_file, const char *incl_dir ){
-	char cmd_str[ 10000 ];
-
-	sprintf( cmd_str, "/usr/bin/gcc %s -fPIC -shared  %s -o %s -I %s",
+int compile_gen_code_args( char *buf, size_t size, const char *lib_file, const char *code_file, const char *incl_dir ){
+	int n = snprintf( buf, size, "%s -fPIC -shared %s -o %s -I %s",
 			//add debug flag if need
 #ifdef DEBUG_MODE
 			"-g -O0 -DDEBUG_MODE"
@@ -994,6 +1133,22 @@ int compile_gen_code( const char *lib_file, const char *code_file, const char *i
 	#endif
 #endif
 			, code_file, lib_file, incl_dir );
+	return ( n < 0 || (size_t) n >= size ) ? -1 : n;
+}
+
+/**
+ * Compile the generated code
+ */
+int compile_gen_code( const char *lib_file, const char *code_file, const char *incl_dir ){
+	char cmd_str[ 3 * COMPILE_GEN_CODE_MAX_LEN ];
+	const char *gcc = "/usr/bin/gcc ";
+	size_t n = strlen( gcc );
+
+	memcpy( cmd_str, gcc, n );
+	if( compile_gen_code_args( cmd_str + n, sizeof( cmd_str ) - n, lib_file, code_file, incl_dir ) < 0 ){
+		mmt_error( "The gcc command to compile %s is longer than %zu bytes", code_file, sizeof( cmd_str ) - 1 );
+		return -1;
+	}
 
 	mmt_debug("Compile rules: %s", cmd_str );
 	return system ( cmd_str );
