@@ -26,6 +26,9 @@ MMT_DPI_DIR := $(MMT_BASE)/dpi
 #get git version abbrev
 GIT_VERSION := $(shell git log --format="%h" -n 1)
 VERSION     := 1.2.20
+# minimum MMT-DPI version required by the deb and rpm packages (readme.md):
+# the latest release, the one CI tests (DPI_VERSION in .github/workflows/c-cpp.yml)
+MIN_DPI_VERSION := 1.10.3
 
 CACHE_LINESIZE := 64 #$(shell getconf LEVEL1_DCACHE_LINESIZE)
 
@@ -282,6 +285,7 @@ deb: all lib sample_rules copy_files
         \nPriority: standard \
         \nArchitecture: all \
         \nMaintainer: Montimage <contact@montimage.com> \
+        \nDepends: mmt-dpi (>= $(MIN_DPI_VERSION)) \
         \nDescription: MMT-Security: An intrusion detection system \
         \n  Version id: $(GIT_VERSION). Build time: `date +"%Y-%m-%d %H:%M:%S"` \
         \nHomepage: http://www.montimage.com" \
@@ -309,7 +313,7 @@ rpm: all lib sample_rules copy_files
       \nGroup: Development/Libraries\
       \nURL: http://montimage.com/\
       \n\
-      \nRequires:  mmt-dpi >= 1.6.9\
+      \nRequires:  mmt-dpi >= $(MIN_DPI_VERSION)\
       \nBuildRoot: %{_topdir}/BUILD/%{name}-%{version}-%{release}\
       \n\
       \n%description\
