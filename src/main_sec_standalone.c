@@ -62,6 +62,9 @@ void usage(const char * prg_name) {
 	fprintf(stderr, "\t-g             : Ignore the rest of a flow when an alert was detetected on the flow.\n");
 	fprintf(stderr, "\t-R             : Enable IP defragmentation and TCP reassembly in MMT-DPI.\n");
 	fprintf(stderr, "\t                 Rules using tcp.tcp_session_payload_up or tcp.tcp_session_payload_down (e.g., rule 67) need it.\n");
+	fprintf(stderr, "\t                 It costs memory, as MMT-DPI keeps the payload of each TCP flow (at most 4 MB per flow).\n");
+	fprintf(stderr, "\t                 A reassembled stream that does not fit in \"input.max_message_size\" (mmt-security.conf) is skipped:\n");
+	fprintf(stderr, "\t                 such rules see a flow only until its stream reaches that size.\n");
 	fprintf(stderr, "\t-v             : Verbose.\n");
 	fprintf(stderr, "\t-l             : Prints the available rules then exit.\n");
 	fprintf(stderr, "\t-h             : Prints this help.\n");
@@ -159,6 +162,14 @@ size_t parse_options(int argc, char ** argv, char *filename, int *type, uint16_t
 	return 0;
 }
 
+//true if a rule uses tcp.tcp_session_payload_up or tcp.tcp_session_payload_down
+static bool has_tcp_session_payload = false;
+
+static inline bool _is_tcp_session_payload( const proto_attribute_t *p ){
+	return p->proto_id == PROTO_TCP
+			&& (p->att_id == TCP_SESSION_PAYLOAD_UP || p->att_id == TCP_SESSION_PAYLOAD_DOWN);
+}
+
 /**
  * Convert a pcap packet to a message being understandable by mmt-security.
  * The function returns NULL if the packet contains no interested information.
@@ -176,7 +187,14 @@ static inline message_t* _get_packet_info( const ipacket_t *pkt ){
 	msg->flow_id   = get_session_id_from_packet( pkt );
 	//get a list of proto/attributes being used by mmt-security
 	for( i=0; i<proto_atts_count; i++ )
-		dpi_message_set_data( pkt, proto_atts[i]->dpi_type, msg, proto_atts[i]->proto_id, proto_atts[i]->att_id );
+		if( ! _is_tcp_session_payload( proto_atts[i] ))
+			dpi_message_set_data( pkt, proto_atts[i]->dpi_type, msg, proto_atts[i]->proto_id, proto_atts[i]->att_id );
+	//the reassembled TCP streams last: they can be big, and must not take
+	// the room of the other attributes in #msg
+	if( has_tcp_session_payload )
+		for( i=0; i<proto_atts_count; i++ )
+			if( _is_tcp_session_payload( proto_atts[i] ))
+				dpi_message_set_data( pkt, proto_atts[i]->dpi_type, msg, proto_atts[i]->proto_id, proto_atts[i]->att_id );
 
 	if( likely( msg->elements_count ))
 		return msg;
@@ -239,6 +257,7 @@ static inline size_t _update_and_register_protocols_attributes_to_extract( bool 
 			is_need_reassembly = true;
 		}
 	}
+	has_tcp_session_payload = is_need_reassembly;
 	//a hint, not a problem: printed only with -v
 	if( is_need_reassembly && !is_enable_reassembly && verbose )
 		mmt_info("The rules using tcp.tcp_session_payload_up or tcp.tcp_session_payload_down (e.g., rule 67) need -R (TCP reassembly) to fire");
@@ -503,6 +522,10 @@ static inline void termination(){
 
 	fprintf(stderr, "%12zu messages received\n", total_received_reports );
 	fprintf(stderr, "%12zu alerts generated\n", alerts_count );
+	if( dpi_message_get_skipped_tcp_session_payload_count() > 0 )
+		mmt_warn("Skipped the reassembled TCP stream of %zu packets, as it did not fit in \"%s\"",
+				dpi_message_get_skipped_tcp_session_payload_count(),
+				mmt_sec_get_config_name( MMT_SEC__CONFIG__INPUT__MAX_MESSAGE_SIZE ));
 
 	pcap_close( pcap );
 

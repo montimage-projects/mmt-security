@@ -135,6 +135,9 @@ Option:
    -g             : Ignore the rest of a flow when an alert was detetected on the flow.
    -R             : Enable IP defragmentation and TCP reassembly in MMT-DPI.
                     Rules using tcp.tcp_session_payload_up or tcp.tcp_session_payload_down (e.g., rule 67) need it.
+                    It costs memory, as MMT-DPI keeps the payload of each TCP flow (at most 4 MB per flow).
+                    A reassembled stream that does not fit in "input.max_message_size" (mmt-security.conf) is skipped:
+                    such rules see a flow only until its stream reaches that size.
    -v             : Verbose.
    -l             : Prints the available rules then exit.
    -h             : Prints this help.
@@ -152,6 +155,11 @@ Option:
 
 TCP reassembly is off by default, as it keeps the payload of every TCP flow in memory (at most 4 MB per flow by default in MMT-DPI).
 Without `-R`, a rule that needs `tcp.tcp_session_payload_up` or `tcp.tcp_session_payload_down` never fires; with `-v`, `mmt_sec_standalone` prints a hint about `-R` when such a rule is loaded.
+
+What `-R` costs:
+
+- **Memory and time.** On `bigFlows.pcap` (791,615 packets, all rules), RSS grows from about 206 MB to 624 MB, and the run time from about 5.6 s to 6.3 s.
+- **`input.max_message_size`.** The reassembled stream of a flow is copied into the message of each of its packets, after all the other attributes. Once it no longer fits in the room left in the message, it is skipped for that packet, and so for the rest of the flow: a rule on the stream only sees a flow until its stream reaches about `input.max_message_size` bytes. The other attributes of the packet are not affected. `mmt_sec_standalone` warns once, at the first skipped stream, and prints the number of skipped streams at the end. `input.max_message_size` is 32824 bytes in the shipped `mmt-security.conf` (3000 when no `mmt-security.conf` is found). Raising it lets rules see longer streams, but every message is allocated with that size, so it costs that much memory for each message waiting in the rule threads' buffers (`security.smp.ring_size`).
 In mmt-probe, the same is done by `enable-ip-defragmentation = true` and `enable-tcp-reassembly = true`.
 
 ## mmt_sec_server

@@ -140,7 +140,7 @@ int set_element_data_message_t( message_t *msg, uint32_t proto_id, uint32_t att_
 	int index;
 
 	//check if enough room to stock data
-	if( unlikely (msg->_data_index + data_length + SIZE_OF_MMT_MEMORY_T + 1 >= msg->_data_length )){
+	if( unlikely( ! has_room_in_message_t( msg, data_length ))){
 		mmt_warn( "Report %"PRIu64" for %d.%d is too big (req. %zu, avail. %d bytes), must increase \"%s\"",
 				msg->counter,
 				proto_id, att_id, data_length + SIZE_OF_MMT_MEMORY_T, msg->_data_length - msg->_data_index,
