@@ -413,8 +413,17 @@ char *mmt_sec_elf_read_build_note( const char *so_path ){
 		while( off + sizeof( ElfW(Nhdr) ) <= end ){
 			const ElfW(Nhdr) *nh = (const ElfW(Nhdr) *)( data + off );
 			size_t name_off = off + sizeof( *nh );
-			size_t desc_off = name_off + ((nh->n_namesz + 3) & ~3u);
-			size_t next     = desc_off + ((nh->n_descsz + 3) & ~3u);
+			size_t desc_off, next;
+			/* raw sizes must fit the section before the aligned (+3 & ~3)
+			 * math below: computing it in uint32_t wraps for sizes >=
+			 * 0xFFFFFFFD, which would let a crafted note pass the bounds
+			 * check and make strndup read far past the file buffer. */
+			if( (size_t) nh->n_namesz > end - name_off )
+				break;
+			desc_off = name_off + (((size_t) nh->n_namesz + 3) & ~(size_t) 3);
+			if( desc_off > end || (size_t) nh->n_descsz > end - desc_off )
+				break;
+			next = desc_off + (((size_t) nh->n_descsz + 3) & ~(size_t) 3);
 			if( next > end || next <= off )
 				break;
 			if( nh->n_type == MMT_SEC_BUILD_NOTE_TYPE && nh->n_namesz == sizeof( MMT_SEC_BUILD_NOTE_OWNER )
