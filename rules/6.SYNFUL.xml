@@ -14,11 +14,16 @@ https://cloud.google.com/blog/topics/threat-intelligence/synful-knock-acis/
    URG flag is clear.
 
 Property 6 flags the knock attempt (step 1) on the SYN alone.
-Property 80 flags the implant's answer (step 2): it proves that a compromised
-router answered.
+Property 84 flags the implant's answer (step 2): it proves that a compromised
+router answered. (Ids 80 and 81 belong to the parked eNodeB rules in
+rules/properties_all/80.81.enodeb_security_rules.xml.bak, and 82 and 83 are
+used on the upstream fed4fire branch.)
 
-Sequence numbers are compared modulo 2^32. The SYN accepts the 0xC123D
-difference in both directions, as the article does not give its sign.
+Sequence numbers are compared modulo 2^32. The article fixes the sign of the
+SYN's difference: the SYN/ACK copies SYN.ack into its seq and acknowledges
+SYN.seq + 1, so its ack - seq = 0xC123E means SYN seq - ack = 0xC123D.
+Property 6 also accepts the reverse sign (ack - seq = 0xC123D) as a deliberate
+tolerance: it costs about 2 values in 2^32 for a SYN with a non-zero ack.
 -->
 <embedded_functions><![CDATA[
 #include <stdint.h>
@@ -86,8 +91,8 @@ static inline bool em_synful_is_implant_synack( double flags, double seq, double
            boolean_expression="((ip.src != ip.dst) &amp;&amp; (tcp.dest_port == tcp.dest_port))"/>
 </property>
 
-<!-- Property 80: SYNful Knock implant answer: SYN/ACK with ack - seq = 0xC123E, urgent pointer 1 without URG and the hard-coded options. -->
-<property value="THEN" delay_units="ms" delay_min="0" delay_max="0" property_id="80" type_property="ATTACK"
+<!-- Property 84: SYNful Knock implant answer: SYN/ACK with ack - seq = 0xC123E, urgent pointer 1 without URG and the hard-coded options. -->
+<property value="THEN" delay_units="ms" delay_min="0" delay_max="0" property_id="84" type_property="ATTACK"
     description="SYNful Knock implant answer: TCP SYN/ACK whose acknowledgement and sequence numbers differ by 0xC123E, with urgent pointer 1 while URG is clear and the hard-coded options 02 04 05 b4 01 01 04 02 01 03 03 05. The source is a router implanted by SYNful Knock.">
     <event value="COMPUTE" event_id="1"
            description="TCP SYN/ACK fingerprint of the SYNful Knock implant"
