@@ -15,11 +15,13 @@
      Destinations are tracked in a fixed table of 4096 slots, indexed by a hash that mixes every bit of the
      destination address and port with a random seed drawn once per process (in on_load), so that the slots
      of a destination cannot be predicted. When all 8 slots probed for a new destination are busy with other
-     destinations of the current window, the one with the fewest SYN is taken over: a flooded destination
-     keeps its count, since taking its slot would need 8 other destinations with more SYN, each of which is
-     reported itself.
-     For tests only, MMT_SEC_SYN_FLOOD_HASH_SEED (a decimal integer from 0 to 4294967295) sets the seed:
-     0 gives the unseeded hash.
+     destinations of the current window, the one with the fewest SYN is taken over, and on a tie the one whose
+     window started last: a burst of new destinations then churns one slot, and does not flush a destination
+     that has started counting. The seed is what defends against an attacker who targets the 8 slots of a
+     victim: with a known seed, destinations crafted to share them can still evict the victim (by one new
+     destination after each SYN of the flood, or by 7 destinations kept just below the threshold).
+     For tests only, MMT_SEC_SYN_FLOOD_HASH_SEED (a decimal integer from 0 to 4294967295, also read by rule
+     56) sets the seed: 0 gives the unseeded hash. Setting it is logged with a warning.
      The table is shared by all the engine instances of a process (the threads of mmt-probe) and protected
      by a mutex, so that each window gives exactly one alert.
 -->
@@ -92,7 +94,7 @@ static void em_syn_flood_set_seed(){
 	if( str != NULL ){
 		if( em_syn_flood_parse( str, 0, UINT32_MAX, &v )){
 			em_syn_flood_seed = (uint32_t) v;
-			mmt_info( "Rule 57: hash seed set by MMT_SEC_SYN_FLOOD_HASH_SEED (for tests only)" );
+			mmt_warn( "Rule 57: hash seed set by MMT_SEC_SYN_FLOOD_HASH_SEED (for tests only)" );
 			return;
 		}
 		mmt_warn( "Rule 57: ignored MMT_SEC_SYN_FLOOD_HASH_SEED=\"%s\": expected a decimal integer from 0 to %lu; using a random seed",
@@ -150,12 +152,13 @@ static inline int em_syn_flood_rate_reached( const void *ip_dst, double port, co
 		if( slot == NULL && ( !cand->used || now - cand->start_us > em_syn_flood_window_us ))
 			slot = cand;
 	}
-	//all 8 slots busy with other destinations of their window: take the one with the fewest SYN
+	//all 8 slots busy with other destinations of their window: take the one with the fewest SYN, and on a
+	//tie the one whose window started last (a burst of new destinations churns that slot)
 	if( slot == NULL ){
 		slot = &em_syn_flood_table[ hash % EM_SYN_FLOOD_SLOTS ];
 		for( i = 1; i < EM_SYN_FLOOD_PROBES; i++ ){
 			cand = &em_syn_flood_table[ (hash + i) % EM_SYN_FLOOD_SLOTS ];
-			if( cand->count < slot->count )
+			if( cand->count < slot->count || ( cand->count == slot->count && cand->start_us > slot->start_us ))
 				slot = cand;
 		}
 	}
