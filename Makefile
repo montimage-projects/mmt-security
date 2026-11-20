@@ -323,7 +323,7 @@ rpm: all lib sample_rules copy_files
       \n%prep\
       \nrm -rf %{buildroot}\
       \nmkdir -p %{buildroot}/$(INSTALL_DIR)\
-      \ncp -rL $(TMP_DIR)/* %{buildroot}/$(INSTALL_DIR)\
+      \ncp -rL $(CURDIR)/$(TMP_DIR)/* %{buildroot}/$(INSTALL_DIR)\
       \nmkdir -p %{buildroot}/etc/ld.so.conf.d/\
       \necho "$(INSTALL_DIR)/lib" >> %{buildroot}/etc/ld.so.conf.d/mmt-security.conf\
       \n\
