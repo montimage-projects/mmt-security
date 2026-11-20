@@ -9,13 +9,18 @@
 #     that of rule 57 alone on the same pcap;
 #  3. rule 57's counter gives exactly one alert per window when 8 threads
 #     count SYNs to one destination at once (check/syn_flood_threads.c);
-#  4. rule 57 draws its hash seed per process, MMT_SEC_SYN_FLOOD_HASH_SEED sets
-#     it (check/syn_flood_seed.c), and with the unseeded hash (seed 0), the 8
-#     ports of check/pcap/57.syn_flood_crafted_ports.pcap that share the
-#     victim's home slot do not hide the victim;
+#  4. rules 56 and 57 draw their hash seeds per process, MMT_SEC_SYN_FLOOD_HASH_SEED
+#     sets them (check/syn_flood_seed.c) and is logged with a warning, and with
+#     the unseeded hash (seed 0), the 8 ports of
+#     check/pcap/57.syn_flood_crafted_ports.pcap that share the victim's home
+#     slot do not hide the victim;
 #  5. rule 56 gives no false alert when more than 65536 handshakes are pending
 #     at once and all complete, and reports only on a packet to the victim
-#     server port (check/syn_flood_rule56.c).
+#     server port (check/syn_flood_rule56.c);
+#  6. the servers of check/pcap/56.crafted_servers_attack.pcap, crafted for the
+#     unseeded hash, still hide the victim from rule 56 with seed 0: the pcap
+#     keeps proving that the seed is what defends (make check runs it with
+#     another seed, from its .env file, and expects the 3 alerts of the victim).
 #
 # Usage: check/check-syn-flood-rules.sh [path/to/mmt_sec_standalone]
 set -u
@@ -91,19 +96,35 @@ else
 	fail "cannot compile check/syn_flood_threads.c"
 fi
 
+perl -0777 -ne 'print $1 if /<!\[CDATA\[(.*?)\]\]>/s' rules/56.syn_flooding.xml > "$TMP/rule56.c"
+for rule in 56 57; do
+	echo
+	echo "Testing rule $rule's hash seed"
+	seedvar=em_syn_flood_seed
+	[ $rule = 56 ] && seedvar=em_syn56_seed
+	if gcc -O2 -pthread -DRULE_C="\"$TMP/rule$rule.c\"" -DSEED=$seedvar -o "$TMP/seed" check/syn_flood_seed.c; then
+		s1=$("$TMP/seed" 2>/dev/null); s2=$("$TMP/seed" 2>/dev/null)
+		s57=$(MMT_SEC_SYN_FLOOD_HASH_SEED=57 "$TMP/seed" 2>/dev/null)
+		bad=$(MMT_SEC_SYN_FLOOD_HASH_SEED=-1 "$TMP/seed" 2>&1 >/dev/null | grep -c "WARN Rule $rule: ignored MMT_SEC_SYN_FLOOD_HASH_SEED")
+		echo "  two processes: seeds $s1 and $s2; MMT_SEC_SYN_FLOOD_HASH_SEED=57: $s57; =-1: $bad warning(s)"
+		[ -n "$s1" ] && [ "$s1" != "$s2" ] || fail "rule $rule does not draw a new hash seed per process"
+		[ "$s57" = 57 ] || fail "rule $rule: MMT_SEC_SYN_FLOOD_HASH_SEED=57 gives the seed $s57"
+		[ "$bad" = 1 ] || fail "rule $rule: MMT_SEC_SYN_FLOOD_HASH_SEED=-1 gives $bad warnings, expected 1"
+	else
+		fail "cannot compile check/syn_flood_seed.c for rule $rule"
+	fi
+done
+
 echo
-echo "Testing rule 57's hash seed"
-if gcc -O2 -pthread -DRULE_C="\"$TMP/rule57.c\"" -o "$TMP/seed" check/syn_flood_seed.c; then
-	s1=$("$TMP/seed" 2>/dev/null); s2=$("$TMP/seed" 2>/dev/null)
-	s57=$(MMT_SEC_SYN_FLOOD_HASH_SEED=57 "$TMP/seed" 2>/dev/null)
-	bad=$(MMT_SEC_SYN_FLOOD_HASH_SEED=-1 "$TMP/seed" 2>&1 >/dev/null | grep -c "WARN Rule 57: ignored MMT_SEC_SYN_FLOOD_HASH_SEED")
-	echo "  two processes: seeds $s1 and $s2; MMT_SEC_SYN_FLOOD_HASH_SEED=57: $s57; =-1: $bad warning(s)"
-	[ -n "$s1" ] && [ "$s1" != "$s2" ] || fail "rule 57 does not draw a new hash seed per process"
-	[ "$s57" = 57 ] || fail "MMT_SEC_SYN_FLOOD_HASH_SEED=57 gives the seed $s57"
-	[ "$bad" = 1 ] || fail "MMT_SEC_SYN_FLOOD_HASH_SEED=-1 gives $bad warnings, expected 1"
-else
-	fail "cannot compile check/syn_flood_seed.c"
-fi
+echo "Testing that the hash seed override is logged as a warning"
+# rules 56 and 57 together on a pcap with a SYN flood, the override set
+rm -rf "$TMP/out"; mkdir "$TMP/out"
+MMT_SEC_SYN_FLOOD_HASH_SEED=0 "$STANDALONE" -x 1-55,58-99999 -t check/pcap/56.syn_flood_rst_ack.pcap -f "$TMP/out/" > "$TMP/log" 2>&1
+for rule in 56 57; do
+	w=$(grep -c "WARN.*Rule $rule: hash seed set by MMT_SEC_SYN_FLOOD_HASH_SEED" "$TMP/log")
+	echo "  rule $rule: $w warning(s)"
+	[ "$w" = 1 ] || fail "rule $rule does not log MMT_SEC_SYN_FLOOD_HASH_SEED=0 as a warning"
+done
 
 echo
 echo "Testing rule 57 against 8 ports crafted to share the victim's home slot (unseeded hash)"
@@ -115,8 +136,14 @@ echo "  MMT_SEC_SYN_FLOOD_HASH_SEED=0: $n alert(s), $v for the victim 192.168.1.
 [ "$v" = 1 ] || fail "rule 57 does not report the victim 192.168.1.10:80 of $PCAP57C with the unseeded hash"
 
 echo
+echo "Testing rule 56 against servers crafted to share the victim's slots (unseeded hash)"
+PCAP56C=check/pcap/56.crafted_servers_attack.pcap
+n=$(alerts 56 "$PCAP56C" MMT_SEC_SYN_FLOOD_HASH_SEED=0)
+echo "  MMT_SEC_SYN_FLOOD_HASH_SEED=0: $n alert(s) (make check expects 3 with the seed of its .env file)"
+[ "$n" = 0 ] || fail "rule 56 gives $n alerts on $PCAP56C with the unseeded hash, expected 0: the pcap no longer targets the unseeded hash"
+
+echo
 echo "Testing rule 56's C: more than 65536 pending handshakes, side of the victim"
-perl -0777 -ne 'print $1 if /<!\[CDATA\[(.*?)\]\]>/s' rules/56.syn_flooding.xml > "$TMP/rule56.c"
 if gcc -O2 -pthread -DRULE_C="\"$TMP/rule56.c\"" -o "$TMP/rule56" check/syn_flood_rule56.c; then
 	"$TMP/rule56" || fail "rule 56 gave a false alert when its FIFO was full, missed the control flood, or reported on a packet from the server port"
 else

@@ -25,6 +25,31 @@ under 100 KB, so the packets are minimal Ethernet + IPv4 + TCP headers.
   (MMT_SEC_SYN_FLOOD_HASH_SEED=0), these 8 ports share the home slot of the
   victim, so they fill all its 8 probed slots: rule 57 must still report the
   victim (and the 8th port).
+- 56.crafted_servers_control.pcap: a real-source flood of 60 SYN/s for 3 s
+  (below rule 57's threshold) to 172.31.77.10:80, from t=1.2 s; the client
+  resets every SYN-ACK. Completed handshakes between two other hosts every
+  50 ms for 5 s. Rule 56 must report the victim 3 times (1/s).
+- 56.crafted_servers_attack.pcap: the same flood, plus an attack on rule 56's
+  server table with servers crafted for the unseeded hash (seed 0) to share the
+  victim's 8 probed slots: 8 of them get 3 spoofed SYN-ACKs each at t=0 (their
+  alerts then wait for ever, nothing is sent to them), and after each half-open
+  handshake of the victim, a new one sends a SYN-ACK that its client resets.
+  With the unseeded hash, each new server evicts the victim, which never
+  reaches 3 half-open handshakes: 0 alerts. With any other seed
+  (check/pcap/56.crafted_servers_attack.env), rule 56 must report the victim 3
+  times, as in the control.
+- 57.syn_flood_flush_lowcount.pcap: 120 SYN/s for 1 s to 192.168.1.10:80, and
+  destinations crafted for the unseeded hash to share its 8 probed slots, one
+  SYN each: 8 in the first 8 ms, then one between two SYNs of the victim. Run
+  with MMT_SEC_SYN_FLOOD_HASH_SEED=0 (check/pcap/57.syn_flood_flush_lowcount.env):
+  all the slots then have 1 SYN, and on such a tie a new destination must take
+  the slot whose window started last (the previous new destination), not the
+  victim's: rule 57 must report the victim once.
+- 56.57.syn_flood_spoofed_short.pcap: a spoofed flood of 60 SYN in 0.8 s to
+  172.31.77.10:80 (below rule 57's threshold), with the server's SYN-ACK
+  retransmissions 1 s and 3 s later, then 4 s of completed handshakes between
+  two other hosts, and no packet to port 80. It documents a gap: no alert of
+  rule 56 (it reports on a packet to the server port) nor of rule 57.
 """
 import os
 import random
@@ -149,13 +174,118 @@ def crafted_ports():
     return pkts
 
 
+def ip_le(ip):
+    """the network-order address as the rules read it into a uint32_t (little-endian: x86_64, aarch64)"""
+    return struct.unpack("<I", bytes(int(b) for b in ip.split(".")))[0]
+
+
+def home56(ip, port, seed=0):
+    """home slot of server ip:port in rule 56's server table (4096 slots), as em_syn56_server()"""
+    return mix32(mix32(ip_le(ip) ^ seed) ^ port) % 4096
+
+
+def ip_str(v):
+    return "%d.%d.%d.%d" % (v >> 24, (v >> 16) & 255, (v >> 8) & 255, v & 255)
+
+
+def other_traffic(pkts, t0, duration, step):
+    """completed handshakes between two other hosts, every step s for duration s"""
+    for k in range(int(round(duration / step))):
+        t = t0 + k * step
+        sport, seq_cli, seq_srv = 20000 + k, random.getrandbits(32), random.getrandbits(32)
+        pkts.append(pkt(t, "10.5.5.5", "10.6.6.6", sport, 443, "S", seq_cli))
+        pkts.append(pkt(t + 0.001, "10.6.6.6", "10.5.5.5", 443, sport, "SA", seq_srv, seq_cli + 1, to_server=False))
+        pkts.append(pkt(t + 0.002, "10.5.5.5", "10.6.6.6", sport, 443, "A", seq_cli + 1, seq_srv + 1))
+
+
+def crafted_servers(attack):
+    victim, client = "172.31.77.10", "172.31.77.20"
+    home = home56(victim, 80)
+    servers, x = [], 1
+    while len(servers) < 8 + 180:
+        ip = ip_str(0x0A000000 + x)
+        x += 1
+        if home56(ip, 80) == home:
+            servers.append(ip)
+    pkts = []
+    if attack:
+        # 8 crafted servers, 3 half-open handshakes each (SYN-ACKs that no client answers)
+        for k in range(8):
+            for i in range(3):
+                pkts.append(pkt(T0 + k * 0.001 + i * 0.0001, servers[k], ip_str(0x0B000000 + k * 8 + i), 80, 2000 + i,
+                                "SA", random.getrandbits(32), random.getrandbits(32), to_server=False))
+    for i in range(180):
+        t = T0 + 1.2 + i / 60
+        sport, seq_cli = 10000 + i, random.getrandbits(32)
+        syn_synack(pkts, t, client, sport, victim, seq_cli)
+        pkts.append(pkt(t + 0.0002, client, victim, sport, 80, "R", seq_cli + 1))
+        if attack:
+            # a new crafted server: a SYN-ACK, reset by its client (half-open at once)
+            srv, cli, seq_srv = servers[8 + i], ip_str(0x0C000000 + i), random.getrandbits(32)
+            pkts.append(pkt(t + 0.0003, srv, cli, 80, 3000, "SA", seq_srv, random.getrandbits(32), to_server=False))
+            pkts.append(pkt(t + 0.0004, cli, srv, 3000, 80, "R", random.getrandbits(32)))
+    other_traffic(pkts, T0, 5.0, 0.05)
+    pkts.sort(key=lambda p: p.time)
+    return pkts
+
+
+def crafted_servers_control():
+    return crafted_servers(False)
+
+
+def crafted_servers_attack():
+    return crafted_servers(True)
+
+
+def flush_lowcount():
+    victim = "192.168.1.10"
+    home = home57(victim, 80)
+    keys, x = [], 1
+    while len(keys) < 8 + 119:
+        ip = ip_str(0xC0A80000 + (x >> 4))
+        port = 1024 + (x & 15) * 4000
+        x += 1
+        if (ip, port) != (victim, 80) and home57(ip, port) == home:
+            keys.append((ip, port))
+    pkts = []
+
+    def syn(t, dst, dport):
+        pkts.append(pkt(T0 + t, spoofed_ip(), dst, random.randrange(1024, 65536), dport, "S", random.getrandbits(32)))
+    syn(0.0, victim, 80)
+    for j in range(8):
+        syn(0.0005 + j * 0.001, *keys[j])
+    for i in range(1, 120):
+        syn(i / 120, victim, 80)
+        syn(i / 120 + 1 / 240, *keys[7 + i])
+    pkts.sort(key=lambda p: p.time)
+    return pkts
+
+
+def spoofed_short():
+    victim = "172.31.77.10"
+    pkts = []
+    for i in range(60):
+        t = T0 + i * 0.8 / 60
+        client, sport, seq_cli, seq_srv = ip_str(0x0D000000 + i), 30000 + i, random.getrandbits(32), random.getrandbits(32)
+        pkts.append(pkt(t, client, victim, sport, 80, "S", seq_cli))
+        for dt in (0.0001, 1.0, 3.0):
+            pkts.append(pkt(t + dt, victim, client, 80, sport, "SA", seq_srv, seq_cli + 1, to_server=False))
+    other_traffic(pkts, T0 + 0.9, 4.0, 0.02)
+    pkts.sort(key=lambda p: p.time)
+    return pkts
+
+
 def main():
     out = sys.argv[1] if len(sys.argv) > 1 else "."
     for name, gen in (("57.syn_flood_lan_decoys", lan_decoys),
                       ("56.57.syn_flood_fast", fast_flood),
                       ("56.syn_flood_rst_ack", rst_ack_clients),
                       ("56.syn_flood_short_tail", short_flood_tail),
-                      ("57.syn_flood_crafted_ports", crafted_ports)):
+                      ("57.syn_flood_crafted_ports", crafted_ports),
+                      ("56.crafted_servers_control", crafted_servers_control),
+                      ("56.crafted_servers_attack", crafted_servers_attack),
+                      ("57.syn_flood_flush_lowcount", flush_lowcount),
+                      ("56.57.syn_flood_spoofed_short", spoofed_short)):
         random.seed(name)
         path = os.path.join(out, name + ".pcap")
         wrpcap(path, gen())

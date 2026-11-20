@@ -365,6 +365,8 @@ endif
 TEST_INDEX=1
 # options of mmt_sec_standalone for check/pcap/X.pcap, read from check/pcap/X.opt if it exists (e.g. -R)
 CHECK_OPT = $(shell cat check/pcap/$*.opt 2>/dev/null)
+# environment variables for check/pcap/X.pcap, read from check/pcap/X.env if it exists (e.g. MMT_SEC_HTTP2_SEED=1)
+CHECK_ENV = $(shell cat check/pcap/$*.env 2>/dev/null)
 _prepare: compile_rule standalone sample_rules
 	@echo "==============================="
 check/expect/%.csv :
@@ -380,7 +382,7 @@ _print.%:
 #one test
 _check.%: _print.% check/expect/%.csv check/pcap/%.pcap
 	$(QUIET) $(RM) /tmp/mmt-security*.csv
-	$(QUIET) bash -c "$(VALGRIND) ./$(MAIN_STAND_ALONE) $(CHECK_OPT) -t check/pcap/$*.pcap -f /tmp/"
+	$(QUIET) bash -c "$(CHECK_ENV) $(VALGRIND) ./$(MAIN_STAND_ALONE) $(CHECK_OPT) -t check/pcap/$*.pcap -f /tmp/"
 #starting by rule id (rm timestamp, filename, probe-id)
 	$(QUIET) bash -c "cut -d, -f5- /tmp/mmt-security*.csv  > /tmp/mmt-security-res.csv"
 	$(QUIET) bash -c "cut -d, -f5- check/expect/$*.csv     > /tmp/mmt-security-expect.csv"

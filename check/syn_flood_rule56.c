@@ -24,6 +24,9 @@
 #include <sys/time.h>
 #include <arpa/inet.h>
 
+#define mmt_warn( ... ) ( fprintf( stderr, __VA_ARGS__ ), fputc( '\n', stderr ))
+#define mmt_info( ... ) ( fprintf( stderr, __VA_ARGS__ ), fputc( '\n', stderr ))
+
 #include RULE_C
 
 #define STEP_US 10   //100 000 packets per second
@@ -38,6 +41,7 @@ int main(){
 	long i, j, alerts = 0, control = 0;
 	uint64_t t;
 
+	on_load(); //the hash seed of this process
 	//1. 100 000 completed handshakes in 1 s, the ACK 0.8 s after the SYN-ACK, then 1 s of SYNs to that port
 	for( i = 0; i < 280000; i++ ){
 		t = (uint64_t) i * STEP_US;
