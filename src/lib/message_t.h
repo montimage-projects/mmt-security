@@ -62,6 +62,15 @@ typedef struct message_struct{
 #define MSG_OVERFLOW 1
 #define MSG_DROP     2
 
+/**
+ * Return true if #data_length bytes of data still fit in the room left in #msg,
+ * i.e., if #set_element_data_message_t can copy them without MSG_OVERFLOW.
+ * The size of #msg is given by "input.max_message_size".
+ */
+static inline bool has_room_in_message_t( const message_t *msg, size_t data_length ){
+	return (size_t)msg->_data_index + data_length + SIZE_OF_MMT_MEMORY_T + 1 < msg->_data_length;
+}
+
 message_t *create_message_t();
 
 message_t *clone_message_t( const message_t msg, bool is_copy_data );

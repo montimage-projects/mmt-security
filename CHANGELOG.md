@@ -1,4 +1,10 @@
 # Unreleased
+- mmt_sec_standalone: new option `-R` enables IP defragmentation and TCP reassembly in MMT-DPI, so rules on `tcp.tcp_session_payload_up`/`tcp.tcp_session_payload_down` (e.g., rule 67, EICAR split over TCP segments) can fire. It is off by default: it costs memory (MMT-DPI keeps each TCP flow's payload), and a reassembled stream that does not fit in `input.max_message_size` is skipped, with one warning per run and a count at the end (see readme.md). Without `-R`, `-v` prints a hint when such a rule is loaded (Montimage/mmt-security#42)
+- engine: rules testing a TCP flag attribute equal to 0 (e.g., `tcp.flags == 0`, rule 42 TCP NULL scan) now fire; zero-valued TCP flags were dropped (Montimage/mmt-security#28)
+- compile_rule: stricter `delay_min`, `delay_max`, `counter_min` and `counter_max` values. A value must be a non-negative integer, with an optional leading `+`, optionally followed by one `+` or `-` that makes the bound strict (e.g., `5`, `+5`, `0+`, `6-`). Values such as `"0.5"`, `" 0"`, `"0++"` or `"1s"` were silently read as something else; a rule using them now fails to compile, with a message naming the attribute and its value. All rules shipped in rules/ compile as before. Third-party rules may need fixing (Montimage/mmt-security#52)
+- compile_rule: no longer crashes (stack overflow) when it stops on an error in a rule file, and stops at the end of an unterminated string constant (Montimage/mmt-security#52)
+- compile_rule: exits with a non-zero status when gcc fails to compile the generated code; it used to exit 0 (Montimage/mmt-security#52)
+- CI builds and checks against MMT-DPI v1.10.3 (was 6b1c9f5, v1.7.10 plus 36 commits); v1.10.0 to v1.10.2 lose the TCP payload of reassembled IPv4 fragments, so `make check` 19.SQLI fails with them (Montimage/mmt-security#18)
 - rules 230 and 231 (in rules/properties_all) for OCPP 1.6-J: Heartbeat flooding and SetChargingProfile limit above the site maximum; they need the OCPP 1.6-J protocol plugin of mmt-plugin-generator (doc/rule.md, section 7); their alerts carry ip.src, ip.dst, tcp.src_port and tcp.dest_port
 
 # Version 1.2.20 (05 Nov 2026)
