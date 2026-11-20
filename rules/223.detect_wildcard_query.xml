@@ -1,36 +1,82 @@
 <beginning>
 <!-- Detection Rule 223: Detect wildcard enumeration patterns in DICOM Patient Name -->
 <!-- Catches fuzz rules 65, 73-74: C-FIND wildcard enumeration for patient data exfiltration -->
+<!-- A Patient Name with a wildcard ('*' or '?') is an ordinary C-FIND key; only a burst
+     of them is enumeration. Wildcard values are counted per peer pair (ip.src, ip.dst)
+     in a sliding window: one alerts when it is at least the WILDCARD_THRESHOLD-th
+     from the same source to the same destination within WILDCARD_WINDOW_US
+     (10 wildcard queries in 10 s). Up to WILDCARD_SLOTS peer pairs are tracked; the
+     least recently seen pair is dropped when the table is full. -->
 <embedded_functions><![CDATA[
-static int wildcard_query_count = 0;
-#define WILDCARD_THRESHOLD 5
+#include <stdint.h>
+#include <string.h>
+#include <sys/time.h>
 
-static int em_check_wildcard_enum(const char *val) {
-    if (val == NULL)
+#define WILDCARD_THRESHOLD 10
+#define WILDCARD_WINDOW_US 10000000ULL /* 10 s */
+#define WILDCARD_SLOTS     1024        /* power of 2 */
+#define WILDCARD_PROBES    8
+
+typedef struct {
+    uint32_t src, dst;
+    uint64_t last_us;                  /* 0: free slot */
+    uint32_t head, count;              /* ring of the last THRESHOLD - 1 query times */
+    uint64_t t[WILDCARD_THRESHOLD - 1];
+} wildcard_peer_t;
+
+static wildcard_peer_t wildcard_peers[WILDCARD_SLOTS];
+
+static wildcard_peer_t *wildcard_lookup(uint32_t src, uint32_t dst) {
+    uint32_t h = (src * 2654435761u) ^ (dst * 2246822519u), i;
+    wildcard_peer_t *victim = NULL, *p;
+    for (i = 0; i < WILDCARD_PROBES; i++) {
+        p = &wildcard_peers[(h + i) & (WILDCARD_SLOTS - 1)];
+        if (p->last_us != 0 && p->src == src && p->dst == dst)
+            return p;
+        if (victim == NULL || p->last_us < victim->last_us)
+            victim = p;
+    }
+    memset(victim, 0, sizeof(*victim));
+    victim->src = src;
+    victim->dst = dst;
+    return victim;
+}
+
+static int em_check_wildcard_enum(const void *ip_src, const void *ip_dst, const void *utime, const char *val) {
+    struct timeval tv;
+    uint32_t src, dst;
+    uint64_t now;
+    wildcard_peer_t *p;
+    int alert;
+
+    if (ip_src == NULL || ip_dst == NULL || utime == NULL || val == NULL)
         return 0;
-    /* Detect wildcard patterns: *, ?, single-char + wildcard */
-    int has_wildcard = 0;
-    const char *p = val;
-    while (*p) {
-        if (*p == '*' || *p == '?') {
-            has_wildcard = 1;
-            break;
-        }
-        p++;
-    }
-    if (has_wildcard) {
-        wildcard_query_count++;
-        /* Alert if we see many wildcard queries (enumeration behavior) */
-        if (wildcard_query_count >= WILDCARD_THRESHOLD)
-            return 1;
-    }
-    return 0;
+    if (strchr(val, '*') == NULL && strchr(val, '?') == NULL)
+        return 0;
+
+    memcpy(&src, ip_src, sizeof(src));
+    memcpy(&dst, ip_dst, sizeof(dst));
+    memcpy(&tv, utime, sizeof(tv)); /* meta.utime is a struct timeval */
+    now = (uint64_t)tv.tv_sec * 1000000ULL + (uint64_t)tv.tv_usec;
+    if (now == 0)
+        now = 1;
+
+    p = wildcard_lookup(src, dst);
+    /* when the ring is full, t[head] is the oldest of the previous THRESHOLD - 1 queries */
+    alert = (p->count == WILDCARD_THRESHOLD - 1 && now >= p->t[p->head]
+             && now - p->t[p->head] <= WILDCARD_WINDOW_US);
+    p->t[p->head] = now;
+    p->head = (p->head + 1) % (WILDCARD_THRESHOLD - 1);
+    if (p->count < WILDCARD_THRESHOLD - 1)
+        p->count++;
+    p->last_us = now;
+    return alert;
 }
 ]]></embedded_functions>
 
 <property property_id="223" type_property="ATTACK"
-     description="Detect DICOM C-FIND wildcard enumeration (patient data exfiltration attempt)">
-    <event description="Multiple DICOM data PDVs with wildcard patterns in Patient Name"
-        boolean_expression="((ip.src != 0) &amp;&amp; (dicom.pdu_type == 4) &amp;&amp; (#em_check_wildcard_enum(dicom.patient_name) == 1))"/>
+     description="Detect DICOM C-FIND wildcard enumeration (10 or more wildcard Patient Name queries in 10 seconds from one source to one destination)">
+    <event description="Burst of DICOM data PDVs with wildcard patterns in Patient Name"
+        boolean_expression="((ip.src != 0) &amp;&amp; (dicom.pdu_type == 4) &amp;&amp; (#em_check_wildcard_enum(ip.src, ip.dst, meta.utime, dicom.patient_name) == 1))"/>
 </property>
 </beginning>
