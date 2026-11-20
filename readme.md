@@ -21,6 +21,8 @@ The repository contains mmt-security toolset:
 
 Suppose on your machine, you have:
 
+- *MMT-DPI* installed in `/opt/mmt/dpi`. CI builds and checks against MMT-DPI v1.10.3 (see `DPI_VERSION` in `.github/workflows/c-cpp.yml`). Avoid MMT-DPI v1.10.0 to v1.10.2: they lose the TCP payload of reassembled IPv4 fragments ([mmt-dpi#84](https://github.com/Montimage/mmt-dpi/issues/84)), so `make check` 19.SQLI fails.
+
 - *libxml2-dev, libpcap-dev, libconfuse-dev* :  `sudo apt-get install libxml2-dev libpcap-dev libconfuse-dev`
 
 - Optional: *hiredis*
