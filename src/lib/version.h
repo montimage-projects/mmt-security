@@ -38,6 +38,11 @@ uint32_t mmt_sec_get_version_index();
  */
 uint32_t mmt_sec_get_required_plugin_version_number();
 
+/**
+ * Oldest rule .so version this engine loads (REQUIRE_PLUGIN), e.g., "1.2.7"
+ */
+const char *mmt_sec_get_required_plugin_version();
+
 const char *mmt_sec_get_version_info();
 
 #endif /* SRC_LIB_VERSION_H_ */

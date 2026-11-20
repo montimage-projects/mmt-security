@@ -1,11 +1,34 @@
 <beginning>
-<property value="THEN" delay_units="ms" delay_min="0" delay_max="0" property_id="78" type_property="TEST" 
-    description="Ensure INT is valid">
-      <event value="COMPUTE" event_id="1" 
+<!--
+Property 78: every INT packet must carry the switch ID of at least one hop.
+
+mmt-dpi gives int.hop_switch_ids only when the switch-ID bit (bit 15) of the
+INT instruction bitmap is set. As MMT-Security verifies an event only when all
+the proto.att of its boolean expression are present, an event on
+int.hop_switch_ids alone is never verified for a packet without switch IDs, so
+the property could never be not_respected. #is_exist() removes the attribute
+from that presence filter: event 2 is verified on every INT packet and the
+embedded function receives NULL when the attribute is absent.
+-->
+<embedded_functions><![CDATA[
+#include <mmt_core.h>
+static inline bool em_int_has_switch_ids( const void *data ){
+	const mmt_u32_array_t *ids = (const mmt_u32_array_t *) data;
+	//switch-ID bit not set in the instruction bitmap
+	if( ids == NULL )
+		return false;
+	//switch-ID bit set but no hop pushed its metadata
+	return ids->len > 0;
+}
+]]></embedded_functions>
+
+<property value="THEN" delay_units="ms" delay_min="0" delay_max="0" property_id="78" type_property="TEST"
+    description="Ensure INT is valid: each INT packet carries the switch ID of at least one hop">
+      <event value="COMPUTE" event_id="1"
              description="Having INT"
              boolean_expression="( int.packet_count > 0 )"/>
-      <event value="COMPUTE" event_id="2" 
-             description="INT Data"
-             boolean_expression="(int.hop_switch_ids != '')"/>
+      <event value="COMPUTE" event_id="2"
+             description="INT Data: switch IDs present"
+             boolean_expression="((#is_exist( int.hop_switch_ids ) == true) &amp;&amp; (#em_int_has_switch_ids( int.hop_switch_ids ) == true))"/>
 </property>
 </beginning>

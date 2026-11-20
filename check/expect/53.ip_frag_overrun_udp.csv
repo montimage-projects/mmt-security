@@ -1,0 +1,1 @@
+10,0,"",1795182364,53,"detected","evasion","IP fragment overrun",{"event_1":{"timestamp":1795000000.000500,"counter":2,"attributes":[["ip.header_len",20],["ip.tot_len",220],["ip.frag_offset",65480]]},"event_2":{"timestamp":1795000000.000500,"counter":2,"attributes":[["ip.src","10.1.0.1"],["ip.dst","10.1.0.2"]]}}

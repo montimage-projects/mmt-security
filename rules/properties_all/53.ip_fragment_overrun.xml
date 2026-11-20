@@ -2,14 +2,16 @@
 <!-- Property 53: This rule aims to detect "IP fragment overrun" attack. Ref: https://en.wikipedia.org/wiki/IP_fragmentation_attack
 The maximum packet length of an IPv4 packet is 65 535 bytes (2^16 - 1)
 The IP Fragment Overrun exploit is when a reassembled fragmented datagram exceeds the declared IP data length or the maximum datagram length. By definition, no IP datagram should be larger than 65,535 bytes. Systems that try to process these large datagrams can crash, and can be indicative of a denial of service attempt.
+mmt-dpi never delivers a reassembled datagram longer than 65 535 bytes, so the overrun is detected on the fragment itself:
+its end, ip.frag_offset + (ip.tot_len - ip.header_len), lies beyond 65 535 (ip.frag_offset and ip.header_len are in bytes).
 -->
 <property value="THEN" delay_units="ms" delay_min="0" delay_max="0" property_id="53" type_property="EVASION" 
           description="IP fragment overrun">
       <event value="COMPUTE" event_id="1" 
-             description="A defragmented packet"
-             boolean_expression="((ip.df_flag + ip.mf_flag) ==0)"/>
+             description="IP fragment that ends beyond the IPv4 maximum of 65 535 bytes"
+             boolean_expression="(((ip.frag_offset + ip.tot_len) - ip.header_len) &gt; 65535)"/>
       <event value="COMPUTE" event_id="2" 
-             description="Packet length greater than 65 535"
-             boolean_expression="((ip.src != ip.dst)&amp;&amp;(meta.packet_len &gt; 65535))"/>
+             description="Print source and destination of IP"
+             boolean_expression="(ip.src != ip.dst)"/>
   </property>
 </beginning>

@@ -107,6 +107,34 @@ static inline int _get_sign( const char *str ){
 	}
 }
 
+/**
+ * Check the value of a delay_min, delay_max, counter_min or counter_max attribute.
+ * Accepted: an optional '+', decimal digits, then an optional '+' or '-' that makes
+ * the bound strict (for example "0", "10", "0+", "6-").
+ * Any other value halts with an error naming the attribute.
+ */
+static inline uint64_t _parse_delay_value( const char *attr_name, const char *str ){
+	const char *p = str;
+	char *end;
+	uint64_t val;
+
+	mmt_assert( str[0] != '-', "Error 13j: \"%s\" must not be negative. Note: you can use value=BEFORE", attr_name );
+
+	if( *p == '+' )
+		p ++;
+	mmt_assert( *p >= '0' && *p <= '9',
+			"Error 13k: Invalid value \"%s\" of attribute \"%s\": expected a non-negative integer, optionally followed by '+' or '-' (for example \"0\", \"10\", \"0+\")",
+			str, attr_name );
+
+	errno = 0;
+	val = strtoull( p, &end, 10 );
+	mmt_assert( errno == 0, "Error 13k: Value \"%s\" of attribute \"%s\" is too big", str, attr_name );
+	mmt_assert( *end == '\0' || ((*end == '+' || *end == '-') && end[1] == '\0'),
+			"Error 13k: Invalid value \"%s\" of attribute \"%s\": expected a non-negative integer, optionally followed by '+' or '-' (for example \"0\", \"10\", \"0+\")",
+			str, attr_name );
+	return val;
+}
+
 static inline uint64_t _parse_unsigned_int( const char * str, const char *error_message ){
 	mmt_assert( str[0] != '-', "%s: %s", error_message, str );
 	return atoll( str );
@@ -140,24 +168,19 @@ rule_delay_t *_parse_rule_delay( const xmlNode *xml_node ){
 		xml_attr_value = (char *)ptr;
 
 		if( str_equal( xml_attr_name, "delay_min" ) ){
-			mmt_assert( xml_attr_value[0] != '-', "Error 13j: \"delay_min\" must not be negative. Note: you can use value=BEFORE" );
-
-			delay->time_min = (uint64_t) atoll( xml_attr_value );
+			delay->time_min = _parse_delay_value( "delay_min", xml_attr_value );
 			time_min_sign = _get_sign( xml_attr_value );
 			has_delay = YES;
 		}else if( str_equal( xml_attr_name, "delay_max" ) ){
-			mmt_assert( xml_attr_value[0] != '-', "Error 13j: \"delay_max\" must not be negative. Note: you can use value=BEFORE" );
-			delay->time_max = (uint64_t) atoll( xml_attr_value );
+			delay->time_max = _parse_delay_value( "delay_max", xml_attr_value );
 			time_max_sign = _get_sign( xml_attr_value );
 			has_delay = YES;
 		}else if( str_equal( xml_attr_name, "counter_min" ) ){
-			mmt_assert( xml_attr_value[0] != '-', "Error 13j: \"counter_min\" must not be negative. Note: you can use value=BEFORE" );
-			delay->counter_min = (uint64_t) atoll( xml_attr_value );
+			delay->counter_min = _parse_delay_value( "counter_min", xml_attr_value );
 			counter_min_sign = _get_sign( xml_attr_value );
 			has_delay = YES;
 		}else if( str_equal( xml_attr_name, "counter_max" ) ){
-			mmt_assert( xml_attr_value[0] != '-', "Error 13j: \"counter_max\" must not be negative. Note: you can use value=BEFORE" );
-			delay->counter_max= (uint64_t) atoll( xml_attr_value );
+			delay->counter_max = _parse_delay_value( "counter_max", xml_attr_value );
 			counter_max_sign = _get_sign( xml_attr_value );
 			has_delay = YES;
 		}else if( str_equal( xml_attr_name, "delay_units" ) ){
@@ -460,10 +483,15 @@ size_t read_rules_from_file( const char * file_name,  rule_t ***properties_arr, 
 	xmlDoc *xml_doc = NULL;
 	xmlNode *root_node = NULL, *xml_node;
 
-	rule_t *array[MAX_RULE_COUNT], *rule_ptr ;
-	char string[ MAX_STRING_SIZE ], *string_ptr;
+	//allocated on the heap, not the stack: a 1.3 MB stack frame here made
+	// backtrace() crash (SIGSEGV on arm64) when a parse error halts the program
+	rule_t **array, *rule_ptr ;
+	char *string, *string_ptr;
 	size_t rules_count = 0, size, string_size, i;
 	xmlChar *xml_content;
+
+	array  = mmt_mem_alloc( MAX_RULE_COUNT * sizeof( rule_t *) );
+	string = mmt_mem_alloc( MAX_STRING_SIZE );
 
 	*properties_arr = NULL;
 	//safe string
@@ -537,11 +565,13 @@ size_t read_rules_from_file( const char * file_name,  rule_t ***properties_arr, 
 	xmlCleanupParser();
 
 	//copy result to a new array
-	*properties_arr = mmt_mem_dup( &array, rules_count * sizeof( rule_t *) );
+	*properties_arr = mmt_mem_dup( array, rules_count * sizeof( rule_t *) );
 
 
 	*embedded_functions = mmt_mem_dup( string, string_size );
 
+	mmt_mem_free( array );
+	mmt_mem_free( string );
 	return rules_count;
 }
 
