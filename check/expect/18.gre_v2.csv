@@ -1,0 +1,1 @@
+10,0,"",1795182363,18,"detected","attack","Invalid GRE version detected",{"event_1":{"timestamp":1795000000.000000,"counter":1,"attributes":[["gre.version",2]]},"event_2":{"timestamp":1795000000.000000,"counter":1,"attributes":[["ip.src","10.1.0.1"],["ip.dst","10.1.0.2"]]}}
