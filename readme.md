@@ -111,7 +111,17 @@ This application prints information of rules encoded in a binary file (.so).
 ./rule_info
 #print information of rules encoded in `rules/40.TCP_SYN_scan.so`
 ./rule_info rules/40.TCP_SYN_scan.so
+#print the build information of `rules/40.TCP_SYN_scan.so` (indented, or one JSON line)
+./rule_info --build-info rules/40.TCP_SYN_scan.so
+./rule_info --build-info --json rules/40.TCP_SYN_scan.so
 ```
+
+Every compiled rule records where and how it was built: the rule ABI hash, the
+mmt-security and mmt-dpi versions, the (proto, att) ids it uses and their hash,
+the mmt-dpi plugins it needs, the compiler, target, CFLAGS, minimum glibc, OS,
+builder, and the SHA-256 of its XML. It is exported by
+`mmt_sec_get_rule_build_info()` and stored in the ELF note `.note.mmt.build`
+(`readelf -n`). The fields are listed in [doc/rule.md](doc/rule.md#43-build-information-of-a-compiled-rule).
 
 ## mmt_sec_standalone
 
