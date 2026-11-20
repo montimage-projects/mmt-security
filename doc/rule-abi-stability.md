@@ -5,8 +5,8 @@ mmt-dpi can be loaded safely into another. It also says whether the rule ABI
 changed between mmt-security tags. It is the A0 experiment of Track A (fork
 issue #5). The build-info, bundle and loader-check work builds on it.
 
-Measured on 2026-11-20 at `a70bfff` (the ids and layouts are the same as at
-`main` `0e2f9cb`), in `ubuntu:24.04` containers (aarch64, gcc 13.3.0). The
+Measured on 2026-11-20 at `6a95b61` (fork `main` `c658615` plus this report),
+in `ubuntu:24.04` containers (aarch64, gcc 13.3.0). The
 measurements can be reproduced with:
 
 ```sh
@@ -26,18 +26,18 @@ reported), and the image by digest. The apt build packages are not pinned;
 ## Verdict
 
 - **No protocol or attribute id changed** between the mmt-dpi versions measured
-  (fd93012d, 6b1c9f53, v1.8.0, v1.10.2, v1.10.3). This holds for the 96
-  (proto, att) pairs used by the 95 rules, and for the whole DPI registry
+  (fd93012d, 6b1c9f53, v1.8.0, v1.10.2, v1.10.3). This holds for the 98
+  (proto, att) pairs used by the 96 rules of the 95 `rules/*.xml` files, and for the whole DPI registry
   (679 protocols and 7530 attributes in v1.10.3). The same goes for the
   attribute data types (`dpi_type`) the rules use, and for the `data_types`
   enum.
 - So a rule `.so` built against any of 6b1c9f53, v1.8.0, v1.10.2, v1.10.3 or the
-  committed header reads the right attributes on any of them: **0 of 95 rules
+  committed header reads the right attributes on any of them: **0 of 96 rules
   are affected**.
 - Pairs do go missing. The 30 DICOM rules (200-229) use `dicom.*`, which
   fd93012d does not have. Loaded into such a DPI, those rules register unknown
   ids (`register_extraction_attribute` fails silently,
-  `src/main_sec_standalone.c:189-200`) and never fire. Nothing logs it.
+  `src/main_sec_standalone.c:216-228`) and never fire. Nothing logs it.
 - Between releases the registry grows (fd93012d to 6b1c9f53: +1 protocol and
   +31 attributes, DICOM; 6b1c9f53 to 1.8.0: +2 protocols and +20 attributes;
   1.8.0 to 1.10.2: +7 protocols and +85 attributes), loses one attribute
@@ -51,7 +51,7 @@ reported), and the image by digest. The apt build packages are not pinned;
 ## How the ids get into a rule `.so`
 
 1. `compile_rule` resolves each `proto.att` of a rule to numbers when it parses
-   the rule (`src/lib/expression.c:94-96`: `get_protocol_id_by_name`,
+   the rule (`src/lib/expression.c:94-98`: `get_protocol_id_by_name`,
    `get_attribute_id_by_protocol_id_and_attribute_name`,
    `get_attribute_data_type`).
 2. Those functions are **not** the ones in `libmmt_core`. They are `static inline`
@@ -63,7 +63,7 @@ reported), and the image by digest. The apt build packages are not pinned;
    (`src/lib/gen_code.c:535`, `.proto_id = ..., .att_id = ..., .dpi_type = ...`).
    They are compiled into the `.so`.
 4. At run time the engine registers those numbers with the running `libmmt_core`
-   (`src/main_sec_standalone.c:189-224`). Nothing resolves the names again.
+   (`src/main_sec_standalone.c:216-262`). Nothing resolves the names again.
 
 So the ids a rule bakes are those of the table **compiled into the
 `compile_rule` binary** (into `expression.o`), and its DPI label is the
@@ -100,7 +100,7 @@ Two consequences, both reproduced by `tools/dpi-id-stability/header-regen.sh`
 
 Transcript, in `ubuntu:24.04` (aarch64) with the mmt-dpi v1.10.2 and v1.10.3
 release `.deb`s (checked against each release's SHA256SUMS), on
-`git archive HEAD` at `a70bfff` extracted with `tar -m` (files get the
+`git archive HEAD` at `6a95b61` extracted with `tar -m` (files get the
 extraction time, as with a `git clone`). The probe is rule 15 with
 `http.user_agent` replaced by `http.header`, an attribute that the committed
 table has and 1.10.x does not. "Data type for http.header has not implemented
@@ -113,26 +113,26 @@ $ tar -C /b -xmf /w/sec.tar
 $ dpkg -i /w/debs/mmt-dpi_1.10.3.deb >/dev/null; dpkg-query -W mmt-dpi
   mmt-dpi	1.10.3-6a0afb46
 $ stat -c '%y %n' /opt/mmt/dpi /b/src/dpi/mmt_dpi.h
-  2026-11-20 14:16:44.175087809 +0000 /opt/mmt/dpi
-  2026-11-20 14:16:43.833084882 +0000 /b/src/dpi/mmt_dpi.h
+  2026-11-20 16:26:12.802590914 +0000 /opt/mmt/dpi
+  2026-11-20 16:26:12.553589560 +0000 /b/src/dpi/mmt_dpi.h
   make -n all regenerates the header: yes
 $ tar -C /a -xmf /w/sec.tar    # a checkout made while 1.10.3 is installed
   make -n all regenerates the header: no
 $ stat -c '%y %n' /opt/mmt/dpi /opt/mmt/dpi/lib
-  2026-11-20 14:16:44.175087809 +0000 /opt/mmt/dpi
-  2026-11-20 14:16:44.198088005 +0000 /opt/mmt/dpi/lib
+  2026-11-20 16:26:12.802590914 +0000 /opt/mmt/dpi
+  2026-11-20 16:26:12.818591001 +0000 /opt/mmt/dpi/lib
 $ dpkg -i /w/debs/mmt-dpi_1.10.2.deb >/dev/null; dpkg-query -W mmt-dpi    # downgrade
   dpkg: warning: downgrading mmt-dpi from 1.10.3-6a0afb46 to 1.10.2-a84a6050
   mmt-dpi	1.10.2-a84a6050
 $ stat -c '%y %n' /opt/mmt/dpi /opt/mmt/dpi/lib
-  2026-11-20 14:16:44.175087809 +0000 /opt/mmt/dpi
-  2026-11-20 14:16:44.838093480 +0000 /opt/mmt/dpi/lib
+  2026-11-20 16:26:12.802590914 +0000 /opt/mmt/dpi
+  2026-11-20 16:26:13.270593458 +0000 /opt/mmt/dpi/lib
   make -n all regenerates the header: no
 $ dpkg -i /w/debs/mmt-dpi_1.10.3.deb >/dev/null; dpkg-query -W mmt-dpi    # upgrade
   mmt-dpi	1.10.3-6a0afb46
 $ stat -c '%y %n' /opt/mmt/dpi /opt/mmt/dpi/lib
-  2026-11-20 14:16:44.175087809 +0000 /opt/mmt/dpi
-  2026-11-20 14:16:45.284097294 +0000 /opt/mmt/dpi/lib
+  2026-11-20 16:26:12.802590914 +0000 /opt/mmt/dpi
+  2026-11-20 16:26:13.584595165 +0000 /opt/mmt/dpi/lib
   make -n all regenerates the header: no
 
 == (b) the header is regenerated, the objects are not rebuilt
@@ -150,14 +150,14 @@ $ make -j1 all 2>&1 | grep -E 'Generate|COMPILE'    # nothing in src/lib is reco
   [COMPILE] main_sec_standalone.o
   [COMPILE] standalone
 $ head -c 110 src/dpi/mmt_dpi.h; echo; cmp -s src/dpi/mmt_dpi.h /orig/src/dpi/mmt_dpi.h && echo 'same as committed' || echo 'differs from committed (git status: modified)'
-  /* This code is generated automatically on 2026-11-20 14:16:48 using MMT-DPI v1.10.3 (6a0afb46). */
+  /* This code is generated automatically on 2026-11-20 16:26:15 using MMT-DPI v1.10.3 (6a0afb46). */
   differs from committed (git status: modified)
 $ probe; baked; label    # still the committed table and label
   probe http.header: HALT_SEC: Error 2: Data type for http.header has not implemented yet
   dpi version 1.7.10 (fd93012d)
   gen_code.o holds: 1.7.10 (fd93012d)
 $ make clean >/dev/null; make -j1 all >/dev/null 2>&1; head -c 110 src/dpi/mmt_dpi.h; echo
-  /* This code is generated automatically on 2026-11-20 14:16:48 using MMT-DPI v1.10.3 (6a0afb46). */
+  /* This code is generated automatically on 2026-11-20 16:26:15 using MMT-DPI v1.10.3 (6a0afb46). */
 $ probe; baked; label    # after make clean
   probe http.header: HALT_SEC: Error 2: Attribute http.header has not implemented yet
   dpi version 1.10.3 (6a0afb46)
@@ -256,7 +256,7 @@ Checks that hold in every container:
 
 ### Build on X, load on Y
 
-Each cell counts the rules (of 95) that have at least one missing pair, or a
+Each cell counts the rules (of 96) that have at least one missing pair, or a
 pair whose `proto_id`, `att_id` or `dpi_type` differs, when a `.so` built with
 the row's header is loaded into the column's `libmmt_core`.
 
@@ -271,7 +271,7 @@ the row's header is loaded into the column's `libmmt_core`.
 
 The 30 rules are the DICOM rules 200-229 (16 `dicom.*` pairs, proto id 701). With
 the fd93012d header, `compile_rule` refuses them
-(`Error 2: Protocol dicom has not implemented yet`). With the 65 rules it can
+(`Error 2: Protocol dicom has not implemented yet`). With the 66 rules it can
 build, a fd93012d `.so` is safe on every later version.
 
 ### Whole DPI registry
@@ -295,12 +295,12 @@ matches the copy in `src/main_gen_dpi.c`.
 
 These are not baked into rule `.so` files, but they assume ids:
 
-- `src/lib/message_t.c:158` hardcodes `proto_id == 354` (TCP) and
+- `src/lib/message_t.c:158` used to hardcode `proto_id == 354` (TCP) and
   `6 <= att_id <= 14` (`flags`, `fin`, `syn`, `rst`, `psh`, `ack`, `urg`, `ece`,
-  `cwr`). This drops zero-valued TCP flags. Both numbers hold in all five
-  versions measured, but a renumbered TCP would silently break every flag rule.
-  Montimage#28 tracks it in another batch; it is not changed here.
-- `src/main_sec_standalone.c:217-221` and `src/lib/dpi_message_t.h:112-161` use
+  `cwr`) to drop zero-valued TCP flags. Both numbers hold in all five versions
+  measured. The Montimage#28 fix (fork PR #11, now in `main`) removed that
+  filter, so no hardcoded id is left there.
+- `src/main_sec_standalone.c:245-256` and `src/lib/dpi_message_t.h:112-200` use
   `PROTO_TCP`, `PROTO_IP`, `TCP_PAYLOAD_LEN`, `IP_OPTS` and so on. They come from
   the installed mmt-dpi headers when the engine is built, so they always match
   the DPI the engine is linked against.
@@ -456,20 +456,20 @@ The rules encoded with the committed header are byte-identical in every containe
 
 ### Coverage
 
-- 95 rule files, 95 rules (properties), 96 distinct (proto, att) pairs.
+- 95 rule files, 96 rules (properties), 98 distinct (proto, att) pairs.
 - compile_rule cannot encode 30 rule file(s) with the regenerated header of fd93012d (200, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215, 216, 217, 218, 219, 220, 221, 222, 223, 224, 225, 226, 227, 228, 229): `HALT_SEC: Error 2: Protocol dicom has not implemented yet.`
 
 ### Regenerated header vs. libmmt_core at run time
 
-- fd93012d: all 96 pairs agree
-- 6b1c9f53: all 96 pairs agree
-- v1.8.0: all 96 pairs agree
-- v1.10.2: all 96 pairs agree
-- v1.10.3: all 96 pairs agree
+- fd93012d: all 98 pairs agree
+- 6b1c9f53: all 98 pairs agree
+- v1.8.0: all 98 pairs agree
+- v1.10.2: all 98 pairs agree
+- v1.10.3: all 98 pairs agree
 
 ### (proto, att) pairs whose ids differ
 
-16 of 96 pairs differ (an id changes or the pair is missing) across the sources; 0 change dpi_type.
+16 of 98 pairs differ (an id changes or the pair is missing) across the sources; 0 change dpi_type.
 
 | proto.att | committed-header | fd93012d | 6b1c9f53 | v1.8.0 | v1.10.2 | v1.10.3 | rules |
 |---|---|---|---|---|---|---|---|
@@ -492,7 +492,7 @@ The rules encoded with the committed header are byte-identical in every containe
 
 ### Build on X, load on Y: rules whose baked ids are wrong
 
-Rows: the header the `.so` was compiled with. Columns: the libmmt_core it is loaded into. Cell: rules (of 95) with at least one missing pair, or a pair whose proto_id, att_id or dpi_type differs; 0 means every rule is safe.
+Rows: the header the `.so` was compiled with. Columns: the libmmt_core it is loaded into. Cell: rules (of 96) with at least one missing pair, or a pair whose proto_id, att_id or dpi_type differs; 0 means every rule is safe.
 
 | built with \ loaded into | fd93012d | 6b1c9f53 | v1.8.0 | v1.10.2 | v1.10.3 |
 |---|---|---|---|---|---|
@@ -528,7 +528,7 @@ Counts of `to`. Protocols and attributes are counted separately; an attribute of
 
 ### All pairs
 
-<details><summary>96 pairs, proto_id/att_id/dpi_type per source, and the rule ids using each</summary>
+<details><summary>98 pairs, proto_id/att_id/dpi_type per source, and the rule ids using each</summary>
 
 | proto.att | committed-header | fd93012d | 6b1c9f53 | v1.8.0 | v1.10.2 | v1.10.3 | rules |
 |---|---|---|---|---|---|---|---|
@@ -553,8 +553,8 @@ Counts of `to`. Protocols and attributes are counted separately; an attribute of
 | dicom.proto_version | 701/3/2 | missing | 701/3/2 | 701/3/2 | 701/3/2 | 701/3/2 | 209 |
 | dicom.status | 701/16/2 | missing | 701/16/2 | 701/16/2 | 701/16/2 | 701/16/2 | 202,203 |
 | dtls.client_hello_cipher_suite | 660/6/32 | 660/6/32 | 660/6/32 | 660/6/32 | 660/6/32 | 660/6/32 | 79 |
+| dtls.p_data | 660/4097/5 | 660/4097/5 | 660/4097/5 | 660/4097/5 | 660/4097/5 | 660/4097/5 | 79 |
 | dtls.packet_count | 660/4099/4 | 660/4099/4 | 660/4099/4 | 660/4099/4 | 660/4099/4 | 660/4099/4 | 79 |
-| dtls.version | 660/2/2 | 660/2/2 | 660/2/2 | 660/2/2 | 660/2/2 | 660/2/2 | 79 |
 | ethernet.dst | 99/2/6 | 99/2/6 | 99/2/6 | 99/2/6 | 99/2/6 | 99/2/6 | 4 |
 | ethernet.packet_count | 99/4099/4 | 99/4099/4 | 99/4099/4 | 99/4099/4 | 99/4099/4 | 99/4099/4 | 4 |
 | ethernet.proto | 99/1/2 | 99/1/2 | 99/1/2 | 99/1/2 | 99/1/2 | 99/1/2 | 11 |
@@ -578,7 +578,7 @@ Counts of `to`. Protocols and attributes are counted separately; an attribute of
 | ip.client_addr | 178/19/8 | 178/19/8 | 178/19/8 | 178/19/8 | 178/19/8 | 178/19/8 | 79 |
 | ip.client_port | 178/21/2 | 178/21/2 | 178/21/2 | 178/21/2 | 178/21/2 | 178/21/2 | 79 |
 | ip.df_flag | 178/7/1 | 178/7/1 | 178/7/1 | 178/7/1 | 178/7/1 | 178/7/1 | 51,52,53 |
-| ip.dst | 178/14/8 | 178/14/8 | 178/14/8 | 178/14/8 | 178/14/8 | 178/14/8 | 57 rules |
+| ip.dst | 178/14/8 | 178/14/8 | 178/14/8 | 178/14/8 | 178/14/8 | 178/14/8 | 58 rules |
 | ip.frag_offset | 178/9/2 | 178/9/2 | 178/9/2 | 178/9/2 | 178/9/2 | 178/9/2 | 9,21,22,23,24,25 |
 | ip.identification | 178/5/2 | 178/5/2 | 178/5/2 | 178/5/2 | 178/5/2 | 178/5/2 | 21,22,23,24,25,52,75 |
 | ip.ip_frag_packets_count | 178/23/4 | 178/23/4 | 178/23/4 | 178/23/4 | 178/23/4 | 178/23/4 | 8 |
@@ -591,7 +591,7 @@ Counts of `to`. Protocols and attributes are counted separately; an attribute of
 | ip.rf_flag | 178/6/1 | 178/6/1 | 178/6/1 | 178/6/1 | 178/6/1 | 178/6/1 | 65 |
 | ip.server_addr | 178/20/8 | 178/20/8 | 178/20/8 | 178/20/8 | 178/20/8 | 178/20/8 | 79 |
 | ip.server_port | 178/22/2 | 178/22/2 | 178/22/2 | 178/22/2 | 178/22/2 | 178/22/2 | 79 |
-| ip.src | 178/13/8 | 178/13/8 | 178/13/8 | 178/13/8 | 178/13/8 | 178/13/8 | 87 rules |
+| ip.src | 178/13/8 | 178/13/8 | 178/13/8 | 178/13/8 | 178/13/8 | 178/13/8 | 88 rules |
 | ip.tot_len | 178/4/2 | 178/4/2 | 178/4/2 | 178/4/2 | 178/4/2 | 178/4/2 | 9,24,25 |
 | ip.version | 178/1/1 | 178/1/1 | 178/1/1 | 178/1/1 | 178/1/1 | 178/1/1 | 59 |
 | ipv6.dst | 182/9/9 | 182/9/9 | 182/9/9 | 182/9/9 | 182/9/9 | 182/9/9 | 72 |
@@ -615,18 +615,20 @@ Counts of `to`. Protocols and attributes are counted separately; an attribute of
 | sctp_data.data_ppid | 631/7/3 | 631/7/3 | 631/7/3 | 631/7/3 | 631/7/3 | 631/7/3 | 92,93 |
 | sctp_data.data_stream | 631/5/2 | 631/5/2 | 631/5/2 | 631/5/2 | 631/5/2 | 631/5/2 | 91 |
 | sctp_data.data_tsn | 631/4/3 | 631/4/3 | 631/4/3 | 631/4/3 | 631/4/3 | 631/4/3 | 90 |
-| tcp.ack_nb | 354/4/3 | 354/4/3 | 354/4/3 | 354/4/3 | 354/4/3 | 354/4/3 | 6 |
-| tcp.dest_port | 354/2/2 | 354/2/2 | 354/2/2 | 354/2/2 | 354/2/2 | 354/2/2 | 1,40,42,43,44,45,47 |
+| tcp.ack_nb | 354/4/3 | 354/4/3 | 354/4/3 | 354/4/3 | 354/4/3 | 354/4/3 | 6,84 |
+| tcp.dest_port | 354/2/2 | 354/2/2 | 354/2/2 | 354/2/2 | 354/2/2 | 354/2/2 | 1,6,40,42,43,44,45,47 |
 | tcp.fin | 354/7/1 | 354/7/1 | 354/7/1 | 354/7/1 | 354/7/1 | 354/7/1 | 28 |
-| tcp.flags | 354/6/1 | 354/6/1 | 354/6/1 | 354/6/1 | 354/6/1 | 354/6/1 | 1,6,13,40,42,43,44,45,47,56 |
+| tcp.flags | 354/6/1 | 354/6/1 | 354/6/1 | 354/6/1 | 354/6/1 | 354/6/1 | 1,6,13,40,42,43,44,45,47,56,84 |
+| tcp.p_data | 354/4097/5 | 354/4097/5 | 354/4097/5 | 354/4097/5 | 354/4097/5 | 354/4097/5 | 84 |
 | tcp.p_payload | 354/4098/5 | 354/4098/5 | 354/4098/5 | 354/4098/5 | 354/4098/5 | 354/4098/5 | 54,68,69,70,71,72,76 |
 | tcp.payload_len | 354/27/3 | 354/27/3 | 354/27/3 | 354/27/3 | 354/27/3 | 354/27/3 | 13 |
 | tcp.psh | 354/10/1 | 354/10/1 | 354/10/1 | 354/10/1 | 354/10/1 | 354/10/1 | 28 |
 | tcp.rst | 354/9/1 | 354/9/1 | 354/9/1 | 354/9/1 | 354/9/1 | 354/9/1 | 47 |
-| tcp.seq_nb | 354/3/3 | 354/3/3 | 354/3/3 | 354/3/3 | 354/3/3 | 354/3/3 | 6 |
-| tcp.src_port | 354/1/2 | 354/1/2 | 354/1/2 | 354/1/2 | 354/1/2 | 354/1/2 | 1,47 |
+| tcp.seq_nb | 354/3/3 | 354/3/3 | 354/3/3 | 354/3/3 | 354/3/3 | 354/3/3 | 6,84 |
+| tcp.src_port | 354/1/2 | 354/1/2 | 354/1/2 | 354/1/2 | 354/1/2 | 354/1/2 | 1,47,84 |
 | tcp.tcp_session_payload_up | 354/24/5 | 354/24/5 | 354/24/5 | 354/24/5 | 354/24/5 | 354/24/5 | 67 |
 | tcp.urg | 354/12/1 | 354/12/1 | 354/12/1 | 354/12/1 | 354/12/1 | 354/12/1 | 28,66 |
+| tcp.urg_pointer | 354/17/2 | 354/17/2 | 354/17/2 | 354/17/2 | 354/17/2 | 354/17/2 | 84 |
 | udp.dest_port | 376/2/2 | 376/2/2 | 376/2/2 | 376/2/2 | 376/2/2 | 376/2/2 | 27 |
 
 </details>
