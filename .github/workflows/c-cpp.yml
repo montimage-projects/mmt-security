@@ -15,6 +15,9 @@ jobs:
   build:
 
     runs-on: ubuntu-latest
+    env:
+      # recorded as build.builder in every rule .so (doc/rule.md); unset, it is null
+      MMT_SEC_BUILDER: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
 
     steps:
     - name: Initialize variables
