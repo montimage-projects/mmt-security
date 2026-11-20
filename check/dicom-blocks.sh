@@ -1,5 +1,6 @@
 #!/bin/bash
-# The DICOM rules share blocks of embedded C, kept in check/gen/dicom/blocks/:
+# The DICOM rules share two blocks of embedded C, kept in check/gen/dicom/blocks/:
+#   pdu_track.c   the PDU boundary tracker, in the rules listed in TRACK
 #   dimse_walk.c  the DIMSE command set walker, in the rules listed in WALK
 # Each copy runs from the block's first line to its last ("---- end of ..."),
 # in rules/<rule>.xml and in its mirror rules/properties_all/<rule>.xml.
@@ -14,7 +15,7 @@ set -u
 cd "$(dirname "$0")/.."
 
 BLOCKS=check/gen/dicom/blocks
-TRACK=""
+TRACK="200 208 209 216 219 220 221 224 226 227 228"
 WALK="201 202 213"
 INC=/opt/mmt/dpi/include
 WRITE=0
@@ -51,7 +52,7 @@ splice() {
 }
 
 fail=0
-for pair in "$WALK:dimse_walk.c"; do
+for pair in "$TRACK:pdu_track.c" "$WALK:dimse_walk.c"; do
 	block=$BLOCKS/${pair##*:}
 	for id in ${pair%%:*}; do
 		f=$(rule_file "$id")

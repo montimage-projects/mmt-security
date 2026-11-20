@@ -1,0 +1,249 @@
+/* ---- PDU boundary tracker ---- */
+/*
+ * Copied verbatim into rules 200, 208, 209, 216, 219, 220, 221, 224, 226, 227 and
+ * 228 from check/gen/dicom/blocks/pdu_track.c by check/dicom-blocks.sh --write;
+ * make check fails when a copy differs. Edit that file, not a copy. Each rule
+ * defines before this block PDU_TRACK_BOTH_WAYS and pdu_track_bad(), the PDU
+ * headers it flags.
+ *
+ * Requires mmt-dpi 1.9.0 or later: the tracker reads tcp.payload_len bytes of
+ * tcp.p_payload, and mmt-security copies only the captured bytes of tcp.p_payload;
+ * mmt-dpi bounds tcp.payload_len by the captured bytes since 1.9.0.
+ *
+ * mmt-dpi reads a PDU header at the start of every TCP segment of a DICOM flow,
+ * also when the segment is the middle of a PDU that spans segments, so data bytes
+ * such as 01 00 00 00 01 00 read as an A-ASSOCIATE-RQ header. The tracker follows
+ * the PDU boundaries of each direction of a TCP connection itself: each header
+ * gives the next one, 6 + PDU length bytes later. A header split across segments
+ * is completed from the next segment. A missing segment inside a PDU body does not
+ * matter; retransmitted data is not read twice.
+ *
+ * The stream is taken up only at an A-ASSOCIATE-RQ/AC that mmt-dpi accepts at the
+ * start of a segment and that cannot be data (pdu_track_assoc): the fixed fields
+ * mmt-dpi checks and, as first variable item, the Application Context Item with
+ * the DICOM Application Context Name. A direction seen for the first time takes it
+ * from its first such segment; a direction that lost the boundary takes it back
+ * only from a segment that holds exactly that PDU, as stacks send one. While the
+ * boundary is followed, nothing in the data restarts it.
+ *
+ * Limits (evasion): the rules see only what lies at the boundaries followed.
+ * - A connection is followed only from an A-ASSOCIATE as above; a connection
+ *   whose first PDU mmt-dpi rejects is not classified as DICOM at all.
+ * - The boundary is lost when the segment holding (part of) a PDU header is not
+ *   seen: lost, reordered, or not given to the rule (mmt-dpi gives no
+ *   tcp.payload_len for a TCP payload of 3 bytes or less in an IPv4 packet padded
+ *   to the Ethernet minimum, and a tcp.p_payload larger than the
+ *   input.max_message_size of mmt-security is not given). The direction is then
+ *   blind until an A-ASSOCIATE in a segment of its own.
+ * - A PDU length above 2 GiB loses the boundary.
+ * - PDU_TRACK_SLOTS connection directions are followed per thread; the least
+ *   recently seen of PDU_TRACK_PROBES candidates is dropped when they are taken.
+ * - A connection reusing the addresses and ports of a followed one is taken as a
+ *   new stream when its sequence numbers are more than PDU_TRACK_NEAR bytes from
+ *   the old one's, as for a new random initial sequence number (99% of reuses).
+ *
+ * The state is per thread (__thread): mmt-probe evaluates the rules in each of its
+ * worker threads, and it gives all the packets of a TCP connection to the same
+ * worker; mmt-security evaluates a rule in one thread.
+ */
+#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
+
+#define PDU_TRACK_SLOTS  4096        /* power of 2 */
+#define PDU_TRACK_PROBES 8
+#define PDU_TRACK_NEAR   (16u << 20) /* a retransmission or a gap is nearer than this */
+#define PDU_AT_BOUNDARY  1           /* the segment starts at a PDU boundary */
+#define PDU_FLAGGED      2           /* a header that pdu_track_bad() flags is in the segment */
+
+typedef struct {
+    uint32_t src, dst, ports;
+    uint32_t next;     /* TCP sequence number of the next PDU header */
+    uint32_t end;      /* TCP sequence number of the byte after the data seen */
+    uint32_t seen;     /* PDU types seen at a boundary: bit t for type t, bit 8 for a type above 7 */
+    uint64_t last;     /* 0: free slot */
+    uint8_t synced;    /* next is a PDU boundary */
+    uint8_t npend;     /* first bytes of the header at next, seen at the end of the data */
+    uint8_t pend[5];
+} pdu_track_t;
+
+static __thread pdu_track_t pdu_tracks[PDU_TRACK_SLOTS];
+static __thread uint64_t pdu_track_tick;
+
+static inline uint32_t pdu_track_hash(uint32_t src, uint32_t dst, uint32_t ports) {
+    uint32_t h = (src * 2654435761u) ^ (dst * 2246822519u) ^ (ports * 3266489917u);
+    /* murmur3 finaliser: every input bit reaches the low bits used as index
+     * (the source port is in the high half of ports) */
+    h ^= h >> 16;
+    h *= 0x85ebca6bu;
+    h ^= h >> 13;
+    h *= 0xc2b2ae35u;
+    h ^= h >> 16;
+    return h;
+}
+
+static pdu_track_t *pdu_track_lookup(uint32_t src, uint32_t dst, uint32_t ports, int create) {
+    uint32_t h = pdu_track_hash(src, dst, ports), i;
+    pdu_track_t *victim = NULL, *p;
+    for (i = 0; i < PDU_TRACK_PROBES; i++) {
+        p = &pdu_tracks[(h + i) & (PDU_TRACK_SLOTS - 1)];
+        if (p->last != 0 && p->src == src && p->dst == dst && p->ports == ports)
+            return p;
+        if (victim == NULL || p->last < victim->last)
+            victim = p;
+    }
+    if (!create)
+        return NULL;
+    memset(victim, 0, sizeof(*victim));
+    victim->src = src;
+    victim->dst = dst;
+    victim->ports = ports;
+    return victim;
+}
+
+static inline uint32_t pdu_track_be32(const uint8_t *p) {
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+}
+
+static inline uint32_t pdu_track_bit(uint8_t type) {
+    return type > 7 ? 1u << 8 : 1u << type;
+}
+
+/*
+ * An A-ASSOCIATE-RQ/AC at the start of a segment that cannot be data: type 1 or 2,
+ * reserved byte 0, a length of 68 to 65535, protocol version 1, reserved bytes 0
+ * (_is_dicom_association_open in mmt-dpi), then an Application Context Item (10H)
+ * with the DICOM Application Context Name 1.2.840.10008.3.1.1.1 (PS3.7 annex A.2.1,
+ * PS3.8 section 9.3.2.1). fresh: the first segment of the direction; otherwise
+ * the segment must hold exactly this PDU.
+ */
+static int pdu_track_assoc(const uint8_t *p, uint32_t n, int fresh) {
+    static const char ctx[] = "1.2.840.10008.3.1.1.1";
+    uint32_t len;
+    if (n < 78 + sizeof(ctx) - 1)
+        return 0;
+    if ((p[0] != 1 && p[0] != 2) || p[1] != 0 || p[6] != 0 || p[7] != 1 || p[8] != 0 || p[9] != 0)
+        return 0;
+    len = pdu_track_be32(p + 2);
+    if (len < 68 || len > 65535)
+        return 0;
+    if (p[74] != 0x10 || p[75] != 0 || ((p[76] << 8) | p[77]) < sizeof(ctx) - 1
+            || memcmp(p + 78, ctx, sizeof(ctx) - 1) != 0)
+        return 0;
+    return fresh || n == 6 + len;
+}
+
+/*
+ * Follow the PDU stream of one direction of a TCP connection; return PDU_AT_BOUNDARY
+ * and/or PDU_FLAGGED. dpi_pdu_type is dicom.pdu_type: 1..7 when mmt-dpi accepted a
+ * PDU header at the start of the segment, 0 otherwise. Call it once per packet.
+ */
+static int pdu_track(const void *ip_src, const void *ip_dst, double sport, double dport,
+                     double seq_nb, const void *payload, double payload_len, double dpi_pdu_type) {
+    const uint8_t *p = (const uint8_t *) payload;
+    uint32_t src, dst, ports, seq = (uint32_t) seq_nb, n = (uint32_t) payload_len, len, seen, skip = 0;
+    uint8_t hdr[6];
+    int64_t off;
+    int32_t behind;
+    int result = 0, fresh;
+    pdu_track_t *d, *r = NULL;
+
+    if (ip_src == NULL || ip_dst == NULL || p == NULL || n == 0)
+        return 0;
+    memcpy(&src, ip_src, sizeof(src));
+    memcpy(&dst, ip_dst, sizeof(dst));
+    ports = (((uint32_t) sport & 0xFFFF) << 16) | ((uint32_t) dport & 0xFFFF);
+
+    d = pdu_track_lookup(src, dst, ports, 1);
+    fresh = (d->last == 0);
+    d->last = ++pdu_track_tick;
+    if (PDU_TRACK_BOTH_WAYS)
+        r = pdu_track_lookup(dst, src, (ports << 16) | (ports >> 16), 0);
+
+    if (d->synced) {
+        behind = (int32_t)(d->end - seq); /* > 0: the segment starts inside the data seen */
+        if (behind > 0 && (uint32_t) behind <= PDU_TRACK_NEAR) {
+            if ((uint32_t) behind >= n)
+                return 0; /* a retransmission */
+            skip = (uint32_t) behind;
+        } else if (behind == 0 || (behind < 0 && d->npend == 0 && (int32_t)(d->next - seq) >= 0)) {
+            skip = 0; /* in order, or after a gap inside a PDU body */
+        } else if (behind > 0 || (uint32_t) -(int64_t) behind > PDU_TRACK_NEAR) {
+            /* far from the stream: a new connection with the same addresses and ports */
+            d->synced = 0;
+            d->npend = 0;
+            d->seen = 0;
+            if (r != NULL)
+                r->seen = 0;
+            fresh = 1;
+        } else {
+            d->synced = 0; /* data missing at the next PDU header */
+        }
+    }
+    if (!d->synced) {
+        if ((dpi_pdu_type != 1 && dpi_pdu_type != 2) || !pdu_track_assoc(p, n, fresh))
+            return 0;
+        d->synced = 1;
+        d->next = seq;
+        d->npend = 0;
+        skip = 0;
+    }
+
+    seen = d->seen | (r != NULL ? r->seen : 0);
+    if (d->npend > 0) {
+        /* complete the header split across segments; the segment holds the bytes after
+         * the data seen from skip on */
+        uint32_t k = 6u - d->npend;
+        memcpy(hdr, d->pend, d->npend);
+        if (n - skip < k) {
+            memcpy(d->pend + d->npend, p + skip, n - skip);
+            d->npend += (uint8_t)(n - skip);
+            d->end = seq + n;
+            return 0;
+        }
+        memcpy(hdr + d->npend, p + skip, k);
+        len = pdu_track_be32(hdr + 2);
+        if (pdu_track_bad(hdr[0], len, seen))
+            result |= PDU_FLAGGED;
+        seen |= pdu_track_bit(hdr[0]);
+        d->seen |= pdu_track_bit(hdr[0]);
+        d->npend = 0;
+        off = (int64_t) skip + k + len;
+    } else {
+        off = (int32_t)(d->next - seq);
+        if (off == 0)
+            result |= PDU_AT_BOUNDARY;
+    }
+    while (off + 6 <= (int64_t) n) {
+        len = pdu_track_be32(p + off + 2);
+        if (pdu_track_bad(p[off], len, seen))
+            result |= PDU_FLAGGED;
+        seen |= pdu_track_bit(p[off]);
+        d->seen |= pdu_track_bit(p[off]);
+        off += 6 + (int64_t) len;
+    }
+    d->end = seq + n;
+    if (off > 0x7FFFFFFF) {
+        d->synced = 0; /* an absurd PDU length */
+        return result;
+    }
+    if (off < (int64_t) n) {
+        d->npend = (uint8_t)(n - off); /* a header split across segments: 1 to 5 bytes here */
+        memcpy(d->pend, p + off, d->npend);
+    }
+    d->next = seq + (uint32_t) off;
+    return result;
+}
+
+static int em_pdu_at_boundary(const void *ip_src, const void *ip_dst, double sport, double dport,
+                              double seq_nb, const void *payload, double payload_len, double dpi_pdu_type) {
+    return (pdu_track(ip_src, ip_dst, sport, dport, seq_nb, payload, payload_len, dpi_pdu_type)
+            & PDU_AT_BOUNDARY) != 0;
+}
+
+static int em_pdu_hdr_check(const void *ip_src, const void *ip_dst, double sport, double dport,
+                            double seq_nb, const void *payload, double payload_len, double dpi_pdu_type) {
+    return (pdu_track(ip_src, ip_dst, sport, dport, seq_nb, payload, payload_len, dpi_pdu_type)
+            & PDU_FLAGGED) != 0;
+}
+/* ---- end of PDU boundary tracker ---- */
