@@ -149,7 +149,7 @@ These are not baked into rule `.so` files, but they assume ids:
   `6 <= att_id <= 14` (`flags`, `fin`, `syn`, `rst`, `psh`, `ack`, `urg`, `ece`,
   `cwr`). This drops zero-valued TCP flags. Both numbers hold in all five
   versions measured, but a renumbered TCP would silently break every flag rule.
-  It is fixed separately under Montimage#28 and is not changed here.
+  Montimage#28 tracks it in another batch; it is not changed here.
 - `src/main_sec_standalone.c:217-221` and `src/lib/dpi_message_t.h:112-161` use
   `PROTO_TCP`, `PROTO_IP`, `TCP_PAYLOAD_LEN`, `IP_OPTS` and so on. They come from
   the installed mmt-dpi headers when the engine is built, so they always match
