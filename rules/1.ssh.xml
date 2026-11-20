@@ -4,6 +4,8 @@
      5 SYNs to port 22 from one client to one server, from 5 different source ports (a retransmitted SYN is
      not a new attempt), within about 10 s, then a SYN-ACK from the server (it is listening). The threshold is above a short
      burst of normal logins (scp then ssh, a few commands in a row); password guessers open many connections.
+     A client that runs many ssh commands in a row (5 connections within 10 s) still trips it; OpenSSH connection
+     multiplexing (ControlMaster/ControlPersist) runs them over one TCP connection and avoids that.
      delay_min is 0, not 0+, so that parallel attempts captured with the same timestamp are counted.
 -->
 <property value="THEN" delay_units="s" delay_min="0" delay_max="10" property_id="1" type_property="ATTACK"
