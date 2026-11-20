@@ -273,13 +273,9 @@ An example of `COMPUTE`rule:
  - use only the proto.att in boolean expression when need. 
 
    - Please refer to the usage of function `is_exist` in section 2.3 to get an example.
-   - Use explicitly the following tcp flags to filter out unwanted verification: tcp.fin, tcp.syn, tcp.rst, tcp.psh, tcp.ack, tcp.urg, tcp.ece, tcp.cwr.
-  		
-  	  For example, the 2 following boolean expressions have the same meaning:
-  		
-    `(tcp.flags == 4)` and `((tcp.flags == 4) && (tcp.rst == 1))`
-  		
-  	  They both return `true` when only RST flag of a TCP packet is on, but the latter is better as MMT verifies its rule only when `tcp.flags` and `tcp.rst` are not zero. Usually less than about 1% packets having `tcp.rst != 0`, consequently the rule using the second expression will be verified against only 1% packets.
+   - TCP flag attributes (`tcp.flags`, `tcp.fin`, `tcp.syn`, `tcp.rst`, `tcp.psh`, `tcp.ack`, `tcp.urg`, `tcp.ece`, `tcp.cwr`) are present in every TCP packet, also when their value is 0, so a rule can test, e.g., `(tcp.flags == 0)` (TCP NULL scan, rule 42) or `(tcp.ack == 0)`.
+   
+     Up to version 1.2.20, MMT-Security dropped these attributes when their value was 0, so such tests never matched, and adding `(tcp.rst == 1)` to an expression made MMT-Security skip it on the packets without RST. This is no longer the case: write `(tcp.flags == 4)` rather than `((tcp.flags == 4) && (tcp.rst == 1))`.
 
  - reduce `delay_max` of a rule to a suitable value. 
 

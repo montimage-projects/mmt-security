@@ -151,12 +151,9 @@ int set_element_data_message_t( message_t *msg, uint32_t proto_id, uint32_t att_
 	else if( unlikely( data_length == 0 || data == NULL )){
 		return MSG_CONTINUE;
 	}
-	//special filter for:
-	//- proto_id = TCP
-	//- att_id = FLAGS, FIN, SYN, RST, PSH, ACK, URG, ECE, CWR
-	//=> if its data is zero => obmit => consider as NULL
-	else if( proto_id == 354 && data_type == MMT_SEC_MSG_DATA_TYPE_NUMERIC && (*(double*) data)  == 0 && (6 <= att_id && att_id <= 14 ))
-		return MSG_CONTINUE;
+	//Note: a zero value is a value. TCP flag attributes (tcp.flags, tcp.fin, ...,
+	// tcp.cwr) equal to 0 used to be dropped here, so a rule testing
+	// tcp.flags == 0 never matched (Montimage/mmt-security#28).
 
 
 	index = mmt_sec_hash_proto_attribute( proto_id, att_id );
