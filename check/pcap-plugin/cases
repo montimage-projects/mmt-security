@@ -1,0 +1,21 @@
+# Cases of check/pcap-plugin/run.sh, one per line:
+#   <capture in pcap/, without .pcap> | <settings, NAME=value separated by spaces, or -> | <rule>=<alerts> ...
+# A rule that is not listed must raise no alert (every rule of rules/ is loaded).
+# With no settings, the alerts must also be those of expect/<capture>.csv.
+
+# the defaults: 10 Heartbeats / 10 s, 32 A, 22000 W
+ocpp_230_heartbeat_flood | - | 230=3
+ocpp_231_charging_limit  | - | 231=3
+ocpp_benign              | - |
+
+# each setting changes the alerts (on_load must be found by dlsym: no `static`)
+ocpp_230_heartbeat_flood | MMT_SEC_OCPP_HEARTBEAT_LIMIT=40 |
+ocpp_230_heartbeat_flood | MMT_SEC_OCPP_HEARTBEAT_WINDOW_S=5 | 230=5
+ocpp_benign              | MMT_SEC_OCPP_HEARTBEAT_WINDOW_S=30 | 230=1
+ocpp_231_charging_limit  | MMT_SEC_OCPP_MAX_CURRENT_A=100 | 231=1
+ocpp_231_charging_limit  | MMT_SEC_OCPP_MAX_POWER_W=40000 | 231=2
+ocpp_benign              | MMT_SEC_OCPP_HEARTBEAT_LIMIT=5 MMT_SEC_OCPP_MAX_CURRENT_A=12 MMT_SEC_OCPP_MAX_POWER_W=10000 | 230=3 231=4
+
+# invalid values keep the defaults
+ocpp_230_heartbeat_flood | MMT_SEC_OCPP_HEARTBEAT_LIMIT=abc MMT_SEC_OCPP_HEARTBEAT_WINDOW_S=-5 | 230=3
+ocpp_231_charging_limit  | MMT_SEC_OCPP_MAX_CURRENT_A=0 MMT_SEC_OCPP_MAX_POWER_W=abc | 231=3
