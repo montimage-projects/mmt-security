@@ -11,45 +11,51 @@
 </property>
 
 <embedded_functions><![CDATA[
-static mmt_hash_t *table = NULL;
+#include <strings.h>
 
-static inline int em_check_WannaCry(const char * str){
-   return ( mmt_hash_search( table, str, strlen( str ) ) != NULL );
-}
-
-const char* domain_lst[] = {
+//WannaCry kill-switch domains
+static const char* domain_lst[] = {
 "iuqerfsodp9ifjaposdfjhgosurijfaewrwergwea.com",
 "ifferfsodp9ifjaposdfjhgosurijfaewrwergwea.com",
 "ayylmaotjhsstasdfasdfasdfasdfasdfasdfasdf.com",
 "iuqssfsodp9ifjaposdfjhgosurijfaewrwergwea.com",
-"iuqerfsodp9ifjaposdfjhgosurijfaewrwergweb.com",  
+"iuqerfsodp9ifjaposdfjhgosurijfaewrwergweb.com",
 };
 
+/**
+ * Return 1 if the HTTP Host is a listed domain or one of its subdomains
+ * (e.g., "www." that the malware requests), otherwise 0.
+ * The Host is compared case-insensitively, after removing a ":port" suffix,
+ * surrounding white space and a trailing dot.
+ */
+static inline int em_check_WannaCry(const char * str){
+	const char *end, *c;
+	size_t len, dlen;
+	int i;
+	const int length = sizeof( domain_lst ) / sizeof( domain_lst[0] );
 
-//This fuction is called when the rules in this files being loaded into MMT-Security
-void on_load(){   
-   int i;
-   int length = sizeof( domain_lst ) / sizeof( domain_lst[0] );
-   const char*str;
-   
-   //create a new hash table
-   table = mmt_hash_create();
-   mmt_debug("Rule 38.Wannacry: Created a table for checking WannaCry having %d URI", length );
-   
-   //add items to the hash table
-   for( i=0; i<length; i++ ){
-      str = domain_lst[i];
-      
-      if( !mmt_hash_add( table, str, strlen(str), (void*) str, false ) )
-         break; 
-   } 
-}//end on_load()
+	if( str == NULL )
+		return 0;
+	while( *str == ' ' || *str == '\t' )
+		str ++;
+	//host name ends at ':' (port) or at white space
+	for( end = str; *end != '\0' && *end != ':' && *end != ' ' && *end != '\t' && *end != '\r' && *end != '\n'; end++ )
+		;
+	if( end > str && end[-1] == '.' )
+		end --;
+	len = end - str;
 
-//This fuction is called when exiting MMT-Security
-void on_unload(){
-   mmt_hash_free( table );
-}//end on_unload()
-
+	for( i=0; i<length; i++ ){
+		dlen = strlen( domain_lst[i] );
+		if( len < dlen )
+			continue;
+		c = end - dlen;
+		//the domain itself, or a subdomain: the domain is preceded by a dot
+		if( strncasecmp( c, domain_lst[i], dlen ) == 0 && (c == str || c[-1] == '.') )
+			return 1;
+	}
+	return 0;
+}
 ]]></embedded_functions>
 
 
