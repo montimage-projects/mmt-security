@@ -1,36 +1,221 @@
 <beginning>
 <!-- Detection Rule 220: Detect DICOM association flooding (high rate of A-ASSOCIATE-RQ) -->
 <!-- Catches fuzz rule 56: association flooding with high nb-copies -->
+<!-- The rate is counted per peer pair (ip.src, ip.dst of the A-ASSOCIATE-RQ) in a
+     sliding window: an A-ASSOCIATE-RQ alerts when the same source sent at least
+     ASSOC_FLOOD_THRESHOLD others to the same destination in the previous
+     ASSOC_FLOOD_WINDOW_US, i.e. every RQ beyond the 20th within 5 s alerts.
+     Up to ASSOC_FLOOD_SLOTS peer pairs are tracked; the least recently seen pair
+     is dropped when the table is full. -->
+<!--
+     PDU boundaries: mmt-dpi reads a PDU header at the start of every TCP segment of a
+     DICOM flow, also when the segment is the middle of a PDU that spans segments, so
+     data bytes such as 01 00 00 00 01 00 read as an A-ASSOCIATE-RQ header. The rule
+     follows the PDU boundaries of each direction of the connection itself (each
+     header gives the next one, 6 + PDU length bytes later) and reads only headers
+     that start at a boundary. The boundary is set at each A-ASSOCIATE-RQ/AC that
+     mmt-dpi accepts at the start of a segment, unless that segment lies inside the
+     PDU being followed, and it is lost on missing data until the next one. A
+     connection whose first PDU mmt-dpi rejects is not classified as DICOM and is not
+     seen. PDU_TRACK_SLOTS connection directions are followed; the least recently seen
+     is dropped when the table is full. -->
 <embedded_functions><![CDATA[
-static int assoc_count = 0;
-static long last_window_start = 0;
-#define ASSOC_FLOOD_THRESHOLD 20
-#define ASSOC_FLOOD_WINDOW_SEC 5
+#include <mmt_core.h>
+#include <stdint.h>
+#include <string.h>
 
-static int em_check_assoc_flood(const void *utime_ptr) {
-    long now;
-    if (utime_ptr == NULL) {
-        now = 0;
-    } else {
-        now = (long)(*(const uint64_t *)utime_ptr / 1000000);
-    }
-    if (last_window_start == 0)
-        last_window_start = now;
-    if (now - last_window_start > ASSOC_FLOOD_WINDOW_SEC) {
-        assoc_count = 1;
-        last_window_start = now;
-        return 0;
-    }
-    assoc_count++;
-    if (assoc_count > ASSOC_FLOOD_THRESHOLD)
-        return 1;
+static int em_is_dicom(const void *data) {
+    proto_hierarchy_t *p = (proto_hierarchy_t *) data;
+    int i;
+    for (i = 0; i < p->len; i++)
+        if (p->proto_path[i] == 701)
+            return 1;
     return 0;
 }
-]]></embedded_functions>
 
+/* ---- PDU boundary tracker ---- */
+#define PDU_TRACK_SLOTS    4096 /* power of 2 */
+#define PDU_TRACK_PROBES   8
+#define PDU_TRACK_MAX_SKIP (16u << 20) /* an A-ASSOCIATE further away starts a new stream */
+#define PDU_AT_BOUNDARY    1 /* the segment starts at a PDU boundary */
+#define PDU_FLAGGED        2 /* a header this rule flags starts in the segment */
+
+/* the header this rule flags */
+static inline int pdu_track_bad(uint8_t type, uint32_t len) {
+    (void) type; (void) len;
+    return 0;
+}
+
+typedef struct {
+    uint32_t src, dst, ports;
+    uint32_t next;   /* TCP sequence number of the next PDU header */
+    uint64_t last;   /* 0: free slot */
+    int synced;
+} pdu_track_t;
+
+static pdu_track_t pdu_tracks[PDU_TRACK_SLOTS];
+static uint64_t pdu_track_tick = 0;
+/* the last segment seen, so that a rule evaluating it twice gets the same answer */
+static struct { uint32_t src, dst, ports, seq, n; int result; } pdu_track_memo;
+
+static pdu_track_t *pdu_track_lookup(uint32_t src, uint32_t dst, uint32_t ports) {
+    uint32_t h = (src * 2654435761u) ^ (dst * 2246822519u) ^ (ports * 3266489917u), i;
+    pdu_track_t *victim = NULL, *p;
+    for (i = 0; i < PDU_TRACK_PROBES; i++) {
+        p = &pdu_tracks[(h + i) & (PDU_TRACK_SLOTS - 1)];
+        if (p->last != 0 && p->src == src && p->dst == dst && p->ports == ports)
+            return p;
+        if (victim == NULL || p->last < victim->last)
+            victim = p;
+    }
+    memset(victim, 0, sizeof(*victim));
+    victim->src = src;
+    victim->dst = dst;
+    victim->ports = ports;
+    return victim;
+}
+
+/*
+ * Follow the PDU stream of one direction of a TCP connection; return PDU_AT_BOUNDARY
+ * and/or PDU_FLAGGED. dpi_pdu_type is dicom.pdu_type: 1..7 when mmt-dpi accepted a
+ * PDU header at the start of the segment, 0 otherwise.
+ */
+static int pdu_track(const void *ip_src, const void *ip_dst, double sport, double dport,
+                     double seq_nb, const void *payload, double payload_len, double dpi_pdu_type) {
+    const uint8_t *p = (const uint8_t *) payload;
+    uint32_t src, dst, ports, seq = (uint32_t) seq_nb, n = (uint32_t) payload_len, len;
+    int64_t off;
+    int result = 0;
+    pdu_track_t *d;
+
+    if (ip_src == NULL || ip_dst == NULL || p == NULL || n == 0)
+        return 0;
+    memcpy(&src, ip_src, sizeof(src));
+    memcpy(&dst, ip_dst, sizeof(dst));
+    ports = ((uint32_t) sport << 16) | (uint32_t) dport;
+    if (pdu_track_memo.src == src && pdu_track_memo.dst == dst && pdu_track_memo.ports == ports
+            && pdu_track_memo.seq == seq && pdu_track_memo.n == n)
+        return pdu_track_memo.result;
+
+    d = pdu_track_lookup(src, dst, ports);
+    d->last = ++pdu_track_tick;
+    off = (int32_t)(d->next - seq);
+    if (dpi_pdu_type == 1 || dpi_pdu_type == 2) {
+        /* an A-ASSOCIATE-RQ/AC accepted by mmt-dpi starts (or restarts) the stream,
+         * unless it lies inside the PDU being followed */
+        if (!d->synced || off < 0 || off > PDU_TRACK_MAX_SKIP) {
+            d->synced = 1;
+            off = 0;
+        }
+    }
+    if (!d->synced) {
+        result = 0;
+    } else if (off < 0) {
+        d->synced = 0; /* the data before this segment was not seen */
+    } else {
+        if (off == 0)
+            result |= PDU_AT_BOUNDARY;
+        while (off + 6 <= n) {
+            len = ((uint32_t)p[off + 2] << 24) | ((uint32_t)p[off + 3] << 16)
+                | ((uint32_t)p[off + 4] << 8) | p[off + 5];
+            if (pdu_track_bad(p[off], len))
+                result |= PDU_FLAGGED;
+            off += 6 + (int64_t) len;
+        }
+        if (off < n || off > 0x7FFFFFFF)
+            d->synced = 0; /* a header split across segments, or an absurd length */
+        else
+            d->next = seq + (uint32_t) off;
+    }
+
+    pdu_track_memo.src = src;
+    pdu_track_memo.dst = dst;
+    pdu_track_memo.ports = ports;
+    pdu_track_memo.seq = seq;
+    pdu_track_memo.n = n;
+    pdu_track_memo.result = result;
+    return result;
+}
+
+static int em_pdu_at_boundary(const void *ip_src, const void *ip_dst, double sport, double dport,
+                              double seq_nb, const void *payload, double payload_len, double dpi_pdu_type) {
+    return (pdu_track(ip_src, ip_dst, sport, dport, seq_nb, payload, payload_len, dpi_pdu_type)
+            & PDU_AT_BOUNDARY) != 0;
+}
+
+static int em_pdu_hdr_check(const void *ip_src, const void *ip_dst, double sport, double dport,
+                            double seq_nb, const void *payload, double payload_len, double dpi_pdu_type) {
+    return (pdu_track(ip_src, ip_dst, sport, dport, seq_nb, payload, payload_len, dpi_pdu_type)
+            & PDU_FLAGGED) != 0;
+}
+/* ---- end of PDU boundary tracker ---- */
+
+#include <stdint.h>
+#include <string.h>
+#include <sys/time.h>
+
+#define ASSOC_FLOOD_THRESHOLD 20
+#define ASSOC_FLOOD_WINDOW_US 5000000ULL /* 5 s */
+#define ASSOC_FLOOD_SLOTS     1024       /* power of 2 */
+#define ASSOC_FLOOD_PROBES    8
+
+typedef struct {
+    uint32_t src, dst;
+    uint64_t last_us;                   /* 0: free slot */
+    uint32_t head, count;               /* ring of the previous RQ times */
+    uint64_t t[ASSOC_FLOOD_THRESHOLD];
+} assoc_flood_peer_t;
+
+static assoc_flood_peer_t assoc_flood_peers[ASSOC_FLOOD_SLOTS];
+
+static assoc_flood_peer_t *assoc_flood_lookup(uint32_t src, uint32_t dst) {
+    uint32_t h = (src * 2654435761u) ^ (dst * 2246822519u), i;
+    assoc_flood_peer_t *victim = NULL, *p;
+    for (i = 0; i < ASSOC_FLOOD_PROBES; i++) {
+        p = &assoc_flood_peers[(h + i) & (ASSOC_FLOOD_SLOTS - 1)];
+        if (p->last_us != 0 && p->src == src && p->dst == dst)
+            return p;
+        if (victim == NULL || p->last_us < victim->last_us)
+            victim = p;
+    }
+    memset(victim, 0, sizeof(*victim));
+    victim->src = src;
+    victim->dst = dst;
+    return victim;
+}
+
+/* meta.utime is a struct timeval (MMT_DATA_TIMEVAL) */
+static int em_check_assoc_flood(const void *ip_src, const void *ip_dst, const void *utime) {
+    struct timeval tv;
+    uint32_t src, dst;
+    uint64_t now;
+    assoc_flood_peer_t *p;
+    int alert;
+
+    if (ip_src == NULL || ip_dst == NULL || utime == NULL)
+        return 0;
+    memcpy(&src, ip_src, sizeof(src));
+    memcpy(&dst, ip_dst, sizeof(dst));
+    memcpy(&tv, utime, sizeof(tv));
+    now = (uint64_t)tv.tv_sec * 1000000ULL + (uint64_t)tv.tv_usec;
+    if (now == 0)
+        now = 1;
+
+    p = assoc_flood_lookup(src, dst);
+    /* when the ring is full, t[head] is the oldest of the previous THRESHOLD RQ */
+    alert = (p->count == ASSOC_FLOOD_THRESHOLD && now >= p->t[p->head]
+             && now - p->t[p->head] <= ASSOC_FLOOD_WINDOW_US);
+    p->t[p->head] = now;
+    p->head = (p->head + 1) % ASSOC_FLOOD_THRESHOLD;
+    if (p->count < ASSOC_FLOOD_THRESHOLD)
+        p->count++;
+    p->last_us = now;
+    return alert;
+}
+]]></embedded_functions>
 <property property_id="220" type_property="ATTACK"
-     description="Detect DICOM association flooding (more than 20 A-ASSOCIATE-RQ in 5 seconds)">
-    <event description="High rate of DICOM A-ASSOCIATE-RQ packets"
-        boolean_expression="((ip.src != 0) &amp;&amp; (dicom.pdu_type == 1) &amp;&amp; (#em_check_assoc_flood(meta.utime) == 1))"/>
+     description="Detect DICOM association flooding (more than 20 A-ASSOCIATE-RQ in 5 seconds from one source to one destination)">
+    <event description="High rate of DICOM A-ASSOCIATE-RQ packets between one source and one destination"
+        boolean_expression="((ip.src != 0) &amp;&amp; ((#em_is_dicom(meta.proto_hierarchy) == 1) &amp;&amp; ((#em_pdu_at_boundary(ip.src, ip.dst, tcp.src_port, tcp.dest_port, tcp.seq_nb, tcp.p_payload, tcp.payload_len, dicom.pdu_type) == 1) &amp;&amp; (((dicom.pdu_type == 1) &amp;&amp; (#em_check_assoc_flood(ip.src, ip.dst, meta.utime) == 1)) &amp;&amp; (#is_exist(dicom.pdu_type) &gt;= 0)))))"/>
 </property>
 </beginning>
