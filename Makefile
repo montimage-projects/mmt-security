@@ -424,6 +424,11 @@ check-properties-all:
 	[ $$missing -eq 0 ] || exit 1
 	@echo "All rules/*.xml have a copy in rules/properties_all/"
 
+# the DICOM rules' shared C blocks match check/gen/dicom/blocks/ and compile on their own
+check: check-dicom-blocks
+check-dicom-blocks:
+	@./check/dicom-blocks.sh -I $(MMT_DPI_DIR)/include
+
 # no rule may define on_load/on_unload as static: dlsym() would not find them
 check-rule-hooks:
 	@./check/check-rule-hooks.sh

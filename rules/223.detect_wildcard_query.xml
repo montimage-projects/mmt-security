@@ -6,7 +6,14 @@
      in a sliding window: one alerts when it is at least the WILDCARD_THRESHOLD-th
      from the same source to the same destination within WILDCARD_WINDOW_US
      (10 wildcard queries in 10 s). Up to WILDCARD_SLOTS peer pairs are tracked; the
-     least recently seen pair is dropped when the table is full. -->
+     least recently seen pair is dropped when the table is full. A burst spread over
+     several sources is not aggregated, and under mmt-probe the count is per worker
+     thread, so a pair whose connections go to different workers is counted in parts.
+     Not seen: dicom.patient_name comes from mmt-dpi, which reads a P-DATA-TF only
+     when its PDU header starts a TCP segment with at least 10 bytes, so a C-FIND of
+     a stack that writes the 12-byte PDU and PDV header in a segment of its own, as
+     DCMTK findscu does by default, is not counted: a DCMTK enumeration is not
+     detected. -->
 <embedded_functions><![CDATA[
 #include <stdint.h>
 #include <string.h>
@@ -24,10 +31,20 @@ typedef struct {
     uint64_t t[WILDCARD_THRESHOLD - 1];
 } wildcard_peer_t;
 
-static wildcard_peer_t wildcard_peers[WILDCARD_SLOTS];
+/* per thread (__thread): mmt-probe evaluates the rules in each of its worker threads
+ * and gives a TCP connection to one worker, so the count of a pair whose connections
+ * go to different workers is split between them */
+static __thread wildcard_peer_t wildcard_peers[WILDCARD_SLOTS];
 
 static wildcard_peer_t *wildcard_lookup(uint32_t src, uint32_t dst) {
     uint32_t h = (src * 2654435761u) ^ (dst * 2246822519u), i;
+    /* murmur3 finaliser: the low bits used as index depend on every address bit
+     * (without it they depend only on the first octets of each address) */
+    h ^= h >> 16;
+    h *= 0x85ebca6bu;
+    h ^= h >> 13;
+    h *= 0xc2b2ae35u;
+    h ^= h >> 16;
     wildcard_peer_t *victim = NULL, *p;
     for (i = 0; i < WILDCARD_PROBES; i++) {
         p = &wildcard_peers[(h + i) & (WILDCARD_SLOTS - 1)];
