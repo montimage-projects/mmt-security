@@ -19,10 +19,11 @@ with '{' or '['. An alert is raised when the body
   e.g., the random characters written by a fuzzer such as 5Greplay.
   Newline-delimited JSON is valid, and so is any nesting depth.
 Ordinary JSON text is not reported: a '#', '%', '$' or '\' alone ("#ff0000",
-"10%", "100%natural", "$5", "C:\\Users"), a URL escape ("%3d", "%2d"), a
-single "../" ("../images/logo.png"), markdown code ("Use `git status`"),
-jQuery ("$(document).ready", "$(this).hide()", "$('#id')"), printf
-documentation ("%s has %d items").
+"10%", "100%natural", "$5", "C:\\Users"), a URL escape ("%3d", "%2d"), URL-encoded
+text ("Rock%20n%20Roll", "it%20s%20s"), a single "../" ("../images/logo.png"),
+markdown code ("Use `git status`"), jQuery on this, document or window
+("$(document).ready", "$( document ).ready", "$(this).hide()") or on a
+selector ("$('#id')"), printf documentation ("%s has %d items").
 
 So, by design, these attack bodies are not reported either:
 - a backtick that is not after a shell operator and does not span a whole
@@ -30,9 +31,14 @@ So, by design, these attack bodies are not reported either:
 - conversions that are not next to each other: "%x, %x, %x";
 - a "%d" conversion with a width of 2 hex digits, read as a URL escape:
   "%10d%10d" (but "%08x", "%20s" and "%10n" are conversions);
+- a conversion whose 2-digit width is a printable URL escape (20 to 7e),
+  after a letter or a digit and before another '%', read as URL-encoded
+  text: "AAAA%20x%20x" (but "AAAA%10x%10x" and "%20s%20s" are reported);
 - a single "../": "../etc/passwd", "../..";
 - "$(...)" followed by '.' when it starts with a quote, "this", "document" or
   "window": "$(document.cookie).x".
+And these benign bodies are reported: jQuery on another object, such as a
+variable or an expression: "$(el).hide()", "$(e.target).closest('li')".
 
 Each mmt-security thread tracks MMT_SEC_HTTP2_CONNECTIONS connections
 (environment variable, 128 by default; the least recently used one is
@@ -685,6 +691,24 @@ static inline bool json_backtick_close( const uint8_t *p, uint32_t len, uint32_t
 	return false;
 }
 
+static inline int hex_value( uint8_t c ){
+	return isdigit( c ) ? c - '0' : tolower( c ) - 'a' + 10;
+}
+
+/**
+ * Whether the "%XX" at #i, followed by the conversion letter at #j, is a URL
+ * escape in URL-encoded text, not a conversion with a width: the escape is a
+ * printable character, it follows a letter or a digit that does not end a
+ * conversion (#conv_end is the end of the last one), and the letter is
+ * followed by another '%' ("Rock%20n%20Roll", "it%20s%20s").
+ */
+static inline bool url_escape_in_text( const uint8_t *p, uint32_t len, uint32_t i, uint32_t j, uint32_t conv_end ){
+	int c = hex_value( p[i+1] ) * 16 + hex_value( p[i+2] );
+	return j == i + 3 && j + 1 < len && p[j+1] == '%'
+		&& c >= 0x20 && c < 0x7F
+		&& i > 0 && isalnum( p[i-1] ) && i != conv_end;
+}
+
 /**
  * Injection and fuzzing patterns in a JSON body. Ordinary text is not
  * reported: '#', '%', '$' or '\' alone ("#ff0000", "10%", "$5", "C:\\Users"),
@@ -692,8 +716,9 @@ static inline bool json_backtick_close( const uint8_t *p, uint32_t len, uint32_t
  * jQuery ("$(document).ready"), printf documentation ("%s has %d items").
  */
 static inline bool json_has_injection( const uint8_t *p, uint32_t len ){
-	uint32_t i, j, k, run = 0, conv_end = 0;
+	uint32_t i, j, k, q, run = 0, conv_end = 0;
 	uint8_t prev;
+	bool conv;
 	for( i=0; i<len; i++ ){
 		switch( p[i] ){
 		case '%':
@@ -705,11 +730,12 @@ static inline bool json_has_injection( const uint8_t *p, uint32_t len ){
 			if( i + 2 < len && p[i+1] == '0' && p[i+2] == '0' )
 				return true;
 			//URL escape "%XX", unless it starts a "%s", "%x", "%X", "%p" or "%n" conversion with a width
-			// ("%08x", "%20s", "%10n"): dots "%2e%2e" are reported, the others are text
-			// ("%3d", "%2d": a "%d" conversion cannot be told from a URL escape)
+			// ("%08x", "%20s", "%10n") outside URL-encoded text: dots "%2e%2e" are reported, the others
+			// are text ("%3d", "%2d": a "%d" conversion cannot be told from a URL escape)
+			conv = ( j < len && p[j] != '\0' && strchr( "sxXp", p[j] ) != NULL )
+					|| ( j < len && p[j] == 'n' && (j + 1 >= len || !isalpha( p[j+1] )) );
 			if( i + 2 < len && isxdigit( p[i+1] ) && isxdigit( p[i+2] )
-					&& !( j < len && p[j] != '\0' && strchr( "sxXp", p[j] ) != NULL )
-					&& !( j < len && p[j] == 'n' && (j + 1 >= len || !isalpha( p[j+1] )) )){
+					&& (!conv || url_escape_in_text( p, len, i, j, conv_end ))){
 				if( i + 5 < len && strncasecmp( (const char *)p + i, "%2e%2e", 6 ) == 0 )
 					return true;
 				break;
@@ -729,15 +755,18 @@ static inline bool json_has_injection( const uint8_t *p, uint32_t len ){
 		case '$': //command substitution "$(cmd)", not jQuery: "$(this).hide()", "$('#id')", "$(\"#id\")"
 			if( i + 1 >= len || p[i+1] != '(' )
 				break;
-			if( i + 2 < len && (p[i+2] == '\'' || p[i+2] == '\\') )
+			//spaces after '(': "$( document ).ready" (jQuery's documented style)
+			for( q = i + 2; q < len && q < i + 64 && p[q] == ' '; q++ )
+				;
+			if( q < len && (p[q] == '\'' || p[q] == '\\') )
 				break;
-			for( k = i + 2; k < len && k < i + 256 && p[k] != ')' && p[k] != '"'; k++ )
+			for( k = q; k < len && k < i + 256 && p[k] != ')' && p[k] != '"'; k++ )
 				;
 			//a method call on the jQuery object of this, document or window ("$(document).ready"),
 			// not "$(whoami).log"
 			if( k < len && p[k] == ')' && k + 1 < len && p[k+1] == '.'
-					&& (mem_starts( p + i + 2, k - i - 2, "this" ) || mem_starts( p + i + 2, k - i - 2, "document" )
-						|| mem_starts( p + i + 2, k - i - 2, "window" )) )
+					&& (mem_starts( p + q, k - q, "this" ) || mem_starts( p + q, k - q, "document" )
+						|| mem_starts( p + q, k - q, "window" )) )
 				break;
 			return true;
 		case '`': //command substitution "`cmd`": a whole value ("`reboot`") or after a shell operator ("x;`id`")

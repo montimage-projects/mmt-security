@@ -392,7 +392,22 @@ attacks = [
     b'{"q":"AAAA%10n"}',
     b'{"f":"$(whoami).log"}',                                     # not jQuery (review 2, F6)
 ]
-for i, body in enumerate(benign + attacks):
+# review 3, N2 and N3, after the others
+benign3 = [
+    b'{"q":"Rock%20n%20Roll"}',                                   # URL-encoded text
+    b'{"q":"fish%20n%20chips"}',
+    b'{"q":"it%20s%20s"}',
+    b'{"code":"$( document ).ready(fn)","h":"$( this ).hide()"}',  # jQuery, spaces after '('
+]
+attacks3 = [
+    b'{"q":"AAAA%10x%10x"}',                                      # %10 is not printable: a width
+    b'{"q":"AAAA%08x%08x%08x"}',
+    b'{"q":"%25x%25x%25x"}',                                      # not after a letter or a digit
+    b'{"q":"x%20n"}',                                             # "%n" at the end of the text
+    b'{"q":"$( id )"}',                                           # not this, document or window
+    b'{"h":"$(el).hide()"}',                                      # benign, reported by design
+]
+for i, body in enumerate(benign + attacks + benign3 + attacks3):
     a = Conn(c, 48000 + i)
     a.h2_setup()
     json_request(a, body)
