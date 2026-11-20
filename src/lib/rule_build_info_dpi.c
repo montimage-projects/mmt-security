@@ -23,12 +23,13 @@
 
 typedef const char *(*_version_fn)( void );
 typedef int (*_init_fn)( void );
-typedef void (*_close_fn)( void );
 typedef uint32_t (*_proto_id_fn)( const char * );
 typedef uint32_t (*_att_id_fn)( uint32_t, const char * );
 typedef long (*_att_type_fn)( uint32_t, uint32_t );
 typedef void (*_att_iter_cb)( attribute_metadata_t *, uint32_t, void * );
 typedef void (*_att_iter_fn)( uint32_t, _att_iter_cb, void * );
+
+static int _dpi_initialized = 0;
 
 static void *_sym( void *lib, const char *name ){
 	return dlsym( lib ? lib : RTLD_DEFAULT, name );
@@ -50,7 +51,6 @@ void mmt_sec_rule_build_info_probe_dpi( const rule_build_info_id_t *ids, size_t 
 	void *lib = NULL;
 	_version_fn  f_version;
 	_init_fn     f_init;
-	_close_fn    f_close;
 	_proto_id_fn f_proto;
 	_att_id_fn   f_att;
 	_att_type_fn f_type;
@@ -74,7 +74,6 @@ void mmt_sec_rule_build_info_probe_dpi( const rule_build_info_id_t *ids, size_t 
 	}
 	f_version = (_version_fn)  _sym( lib, "mmt_version" );
 	f_init    = (_init_fn)     _sym( lib, "init_extraction" );
-	f_close   = (_close_fn)    _sym( lib, "close_extraction" );
 	f_proto   = (_proto_id_fn) _sym( lib, "get_protocol_id_by_name" );
 	f_att     = (_att_id_fn)   _sym( lib, "get_attribute_id_by_protocol_id_and_attribute_name" );
 	f_type    = (_att_type_fn) _sym( lib, "get_attribute_data_type" );
@@ -85,7 +84,13 @@ void mmt_sec_rule_build_info_probe_dpi( const rule_build_info_id_t *ids, size_t 
 	if( f_init == NULL || f_proto == NULL || f_att == NULL || f_type == NULL || f_iter == NULL )
 		goto end;
 
-	f_init();
+	//once per process, and never closed: mmt-dpi 1.7.x (e.g., 6b1c9f53) crashes in
+	// init_extraction() called again after close_extraction(), and compile_rule
+	// probes twice (it compiles the .so twice). compile_rule exits right after.
+	if( !_dpi_initialized ){
+		f_init();
+		_dpi_initialized = 1;
+	}
 	*ids_match = 1;
 	plugins = calloc( count + 1, sizeof( char * ));
 	for( i = 0; i < count; i++ ){
@@ -114,9 +119,6 @@ void mmt_sec_rule_build_info_probe_dpi( const rule_build_info_id_t *ids, size_t 
 		if( j == n_plugins )
 			plugins[ n_plugins++ ] = strdup( base );
 	}
-	if( f_close != NULL )
-		f_close();
-
 	/* JSON array, sorted */
 	if( plugins != NULL ){
 		for( i = 0; i < n_plugins; i++ )
