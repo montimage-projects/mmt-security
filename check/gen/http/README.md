@@ -10,14 +10,22 @@ rebuilds the committed files byte for byte:
     python3 gen_h2.py ../../pcap       # 97.http2_hpack_bomb, 98.http2_fuzzing
     python3 gen_review.py ../../pcap   # 33.trojan_generic_uris_benign, 71.http_body_continuation,
                                        # 97.http2_state_evasion, 97.http2_hpack_table_size_zero,
-                                       # 98.http2_state_evasion, 98.http2_fuzzing_benign_json
+                                       # 98.http2_state_evasion, 98.http2_fuzzing_benign_json,
+                                       # 97.98.http2_conn_table
 
 `gen_http1.py` and `gen_h2.py` come from fork PR #12, `gen_review.py` from the
-fixes of its review. Each script comments every case: what it tests, and
+fixes of its two reviews. Each script comments every case: what it tests, and
 whether the rule must alert.
 
 The expected files list only the alerts of the rules a capture tests, so
 `make check` ignores the alerts of the other rules on it.
+
+`97.98.http2_conn_table` runs with `MMT_SEC_HTTP2_SEED=1`, from
+`check/pcap/97.98.http2_conn_table.env` (`make check` reads the environment
+variables of a capture from `check/pcap/X.env`): with this seed, the
+connections of each of its cases fall in one set of the connection table of
+rules 97 and 98, so the capture tests the ways and the LRU replacement.
+`h2_set()` in `gen_review.py` computes the set of a connection.
 
 `check/h2_thread_leak.sh` (outside `make check`, it needs valgrind) runs rules
 97 and 98 with 2 verification threads (`-c`) and fails if their per-thread

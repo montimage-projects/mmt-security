@@ -115,6 +115,24 @@ class Conn:
         self._c("A")
 
 
+def h2_set(seed, sport, dport=8080, sets=32):
+    """The set of a connection CLI:sport - SRV:dport in the table of rules 97/98
+    when MMT_SEC_HTTP2_SEED=seed: seeded FNV-1a of the key (the lower endpoint
+    first), then the MurmurHash3 finaliser, modulo the number of sets."""
+    m = (1 << 64) - 1
+    a = bytes(map(int, CLI.split("."))) + struct.pack(">H", sport)
+    b = bytes(map(int, SRV.split("."))) + struct.pack(">H", dport)
+    h = 14695981039346656037 ^ seed
+    for x in min(a, b) + max(a, b):
+        h = ((h ^ x) * 1099511628211) & m
+    h ^= h >> 33
+    h = (h * 0xff51afd7ed558ccd) & m
+    h ^= h >> 33
+    h = (h * 0xc4ceb9fe1a85ec53) & m
+    h ^= h >> 33
+    return h % sets
+
+
 def bomb(conn, first=b"", between=None, blocks=50):
     """HPACK bomb: a 3000-byte header inserted in the dynamic table (index 62),
     then 50 blocks of 204 bytes that reference it 200 times each.
@@ -251,6 +269,75 @@ json_request(a, FUZZ)
 a.fin()
 c.write("98.http2_state_evasion")
 
+# ------------------------------------------------- 97, 98: connection table (review 2, F3)
+# Run with MMT_SEC_HTTP2_SEED=1 (check/pcap/97.98.http2_conn_table.env): the
+# connections of a case all fall in one set of the table (4 ways, LRU).
+SEED = 1
+c = Pcap(1700036000.0)
+ports = iter(range(30000, 65000))
+used_sets = []
+
+
+def same_set(n):
+    """n client ports whose connections fall in one set, a set no other case uses"""
+    while True:
+        p = next(ports)
+        s = h2_set(SEED, p)
+        if s in used_sets:
+            continue
+        used_sets.append(s)
+        found = [p]
+        while len(found) < n:
+            q = next(ports)
+            if h2_set(SEED, q) == s:
+                found.append(q)
+        return found
+
+
+def other(port):
+    o = Conn(c, port)
+    o.h2_setup()
+    o.fin()
+
+
+# 97: A primes its table, other connections of the set come, then A sends 5 bombs
+#   - B, C, D: A is one of the 4 connections of the set: 5 alerts
+#   - B, C, D, E: A is the least recently used one, E replaces it: no alert
+#   - B, C, A (PING), D, E: B is the least recently used one when E comes: 5 alerts
+for plan in ["BCD", "BCDE", "BCADE"]:
+    pa, *po = same_set(1 + len(set(plan) - {"A"}))
+    a = Conn(c, pa)
+    a.h2_setup()
+    a.cl(frame(1, 5, 1, REQ + b"\x40\x0bx-bomb-name\x7f" + bytes([((3000 - 127) & 0x7f) | 0x80, (3000 - 127) >> 7]) + b"A" * 3000))
+    a.sv(frame(1, 5, 1, RESP))
+    po = iter(po)
+    for step in plan:
+        if step == "A":
+            a.cl(frame(6, 0, 0, b"\0" * 8))
+        else:
+            other(next(po))
+    for sid in range(3, 13, 2):
+        a.cl(frame(1, 5, sid, REQ + b"\xbe" * 200))
+        a.sv(frame(1, 5, sid, RESP))
+    a.fin()
+# 98: A sends the HEADERS of a request, other connections come, then A sends
+# the fuzzed body: A's state (it is the client) must still be known
+#   - B, C, D: 1 alert;  B, C, D, E: no alert;  B, C, A (PING), D, E: 1 alert
+for plan in ["BCD", "BCDE", "BCADE"]:
+    pa, *po = same_set(1 + len(set(plan) - {"A"}))
+    a = Conn(c, pa)
+    a.h2_setup()
+    a.cl(frame(1, 4, 1, REQ))
+    po = iter(po)
+    for step in plan:
+        if step == "A":
+            a.cl(frame(6, 0, 0, b"\0" * 8))
+        else:
+            other(next(po))
+    a.cl(frame(0, 1, 1, FUZZ))
+    a.sv(frame(1, 5, 1, RESP))
+    a.fin()
+c.write("97.98.http2_conn_table")
 
 # ------------------------------------------------- 97: header table size 0 (finding 3)
 c = Pcap(1700032000.0)

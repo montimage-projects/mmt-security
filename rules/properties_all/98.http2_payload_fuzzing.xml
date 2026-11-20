@@ -34,7 +34,8 @@ So, by design, these attack bodies are not reported either:
 - "$(...)" followed by '.' when it starts with a quote, "this", "document" or
   "window": "$(document.cookie).x".
 
-Each mmt-security thread tracks 128 connections (the least recently used one is
+Each mmt-security thread tracks MMT_SEC_HTTP2_CONNECTIONS connections
+(environment variable, 128 by default; the least recently used one is
 replaced).
 -->
 
@@ -44,6 +45,7 @@ replaced).
 #include <stdlib.h>
 #include <ctype.h>
 #include "mmt_lib.h"
+#define H2_RULE_ID "98"
 /*
  * HTTP/2 frame reader over the TCP payload of each packet.
  *
@@ -63,10 +65,14 @@ replaced).
  * - a sequence number more than H2_MAX_BACKWARD bytes behind the expected one
  *   starts a new byte stream, e.g., a 4-tuple reused with a lower ISN.
  *
- * Both directions of a connection share one entry of a table of H2_SETS sets
- * of H2_WAYS entries, so they never evict each other. The set is a hash of
- * the 4-tuple with a random seed, so a sender cannot choose a 4-tuple that
- * collides with another connection. A new connection replaces the least
+ * Both directions of a connection share one entry of a table of sets of
+ * H2_WAYS entries, so they never evict each other. The table holds
+ * MMT_SEC_HTTP2_CONNECTIONS connections (environment variable, 128 by
+ * default, rounded up to a multiple of H2_WAYS). The set is a hash of the
+ * 4-tuple with a random seed, so a sender cannot choose a 4-tuple that
+ * collides with another connection. MMT_SEC_HTTP2_SEED (environment
+ * variable) fixes the seed: for tests only, as it makes the sets
+ * predictable. A new connection replaces the least
  * recently used entry of its set. Each mmt-security thread has its own
  * table (thread-local, never shared); every table is in a list, so that
  * on_unload frees the tables of every thread.
@@ -80,9 +86,12 @@ replaced).
 #include <pthread.h>
 #include <time.h>
 #include <sys/random.h>
+#include <errno.h>
+#include <inttypes.h>
 
-#define H2_SETS          32               //sets of the connection table of a thread
-#define H2_WAYS          4                //connections per set: H2_SETS * H2_WAYS connections per thread
+#define H2_WAYS          4                //connections per set of the connection table of a thread
+#define H2_CONNECTIONS   128              //default connections per thread (env. MMT_SEC_HTTP2_CONNECTIONS)
+#define H2_MAX_CONNECTIONS 65536
 #define H2_MAX_FRAME     16384            //default SETTINGS_MAX_FRAME_SIZE (RFC 9113, 6.5.2)
 #define H2_BUF_MAX       (H2_MAX_FRAME + 9)
 #define H2_MAX_BACKWARD  (1u << 20)       //a sequence number this far behind starts a new byte stream
@@ -126,7 +135,8 @@ typedef struct h2_conn_struct{
 typedef struct h2_table_struct{
 	struct h2_table_struct *next;   //list of the tables of every thread
 	uint64_t  seed, clock;
-	h2_conn_t conn[ H2_SETS * H2_WAYS ];
+	uint32_t  sets;
+	h2_conn_t conn[];               //sets * H2_WAYS connections
 }h2_table_t;
 
 //rule-specific: called for each complete frame
@@ -138,6 +148,46 @@ static void h2_on_reset( h2_dir_t *d );
 static __thread h2_table_t *h2_table = NULL;
 static h2_table_t *h2_tables = NULL;
 static pthread_mutex_t h2_tables_lock = PTHREAD_MUTEX_INITIALIZER;
+//set by on_load, before any packet is read
+static uint32_t h2_sets = H2_CONNECTIONS / H2_WAYS;
+static bool     h2_seed_fixed = false;
+static uint64_t h2_seed;
+
+/**
+ * Read the environment variable #name as a decimal integer in [#min, #max].
+ * Return false if it is not set, or, with a warning, if it is not valid.
+ */
+static inline bool h2_env_uint( const char *name, uint64_t min, uint64_t max, uint64_t *v ){
+	const char *str = getenv( name );
+	char *end;
+	unsigned long long x;
+	if( str == NULL )
+		return false;
+	errno = 0;
+	x = strtoull( str, &end, 10 );
+	if( !isdigit( (unsigned char)str[0] ) || *end != '\0' || errno != 0 || x < min || x > max ){
+		mmt_warn( "Rule %s: ignore %s=\"%s\": not an integer from %"PRIu64" to %"PRIu64", use the default",
+				H2_RULE_ID, name, str, min, max );
+		return false;
+	}
+	*v = x;
+	return true;
+}
+
+//the environment variables of the connection table; called by on_load
+static inline void h2_load_env( void ){
+	uint64_t v;
+	if( h2_env_uint( "MMT_SEC_HTTP2_CONNECTIONS", 1, H2_MAX_CONNECTIONS, &v )){
+		h2_sets = (uint32_t)((v + H2_WAYS - 1) / H2_WAYS);
+		mmt_info( "Rule %s: set MMT_SEC_HTTP2_CONNECTIONS=%"PRIu64": %u connections per thread",
+				H2_RULE_ID, v, h2_sets * H2_WAYS );
+	}
+	if( h2_env_uint( "MMT_SEC_HTTP2_SEED", 0, UINT64_MAX, &v )){
+		h2_seed_fixed = true;
+		h2_seed       = v;
+		mmt_warn( "Rule %s: MMT_SEC_HTTP2_SEED is set: the connection table is predictable (for tests only)", H2_RULE_ID );
+	}
+}
 
 static inline uint32_t h2_u24( const uint8_t *p ){
 	return ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | p[2];
@@ -166,6 +216,8 @@ static inline void h2_reset_conn( h2_conn_t *c ){
 static inline uint64_t h2_new_seed( const void *addr ){
 	uint64_t seed = 0;
 	struct timespec ts;
+	if( h2_seed_fixed )
+		return h2_seed;
 	if( getrandom( &seed, sizeof( seed ), GRND_NONBLOCK ) != (ssize_t)sizeof( seed )){
 		clock_gettime( CLOCK_REALTIME, &ts );
 		seed = ((uint64_t)ts.tv_sec << 32) ^ (uint64_t)ts.tv_nsec ^ (uint64_t)(uintptr_t)addr;
@@ -184,16 +236,17 @@ static inline uint32_t h2_set_of( const h2_table_t *t, const uint8_t *key ){
 	h ^= h >> 33;
 	h *= 0xc4ceb9fe1a85ec53ull;
 	h ^= h >> 33;
-	return (uint32_t)(h % H2_SETS);
+	return (uint32_t)(h % t->sets);
 }
 
 static inline h2_table_t *h2_get_table( void ){
 	h2_table_t *t = h2_table;
 	if( t != NULL )
 		return t;
-	t = calloc( 1, sizeof( h2_table_t ));
+	t = calloc( 1, sizeof( h2_table_t ) + (size_t)h2_sets * H2_WAYS * sizeof( h2_conn_t ));
 	if( t == NULL )
 		return NULL;
+	t->sets = h2_sets;
 	t->seed = h2_new_seed( t );
 	pthread_mutex_lock( &h2_tables_lock );
 	t->next   = h2_tables;
@@ -376,11 +429,11 @@ static inline int h2_segment( h2_dir_t *d, h2_dir_t *rev, uint32_t seq, const ui
 //free the connection tables of every thread
 static inline void h2_free_tables( void ){
 	h2_table_t *t, *next;
-	int i;
+	uint32_t i;
 	pthread_mutex_lock( &h2_tables_lock );
 	for( t = h2_tables; t != NULL; t = next ){
 		next = t->next;
-		for( i=0; i<H2_SETS * H2_WAYS; i++ )
+		for( i=0; i<t->sets * H2_WAYS; i++ )
 			h2_reset_conn( &t->conn[i] );
 		free( t );
 	}
@@ -787,6 +840,10 @@ static int em_check_fuzzing( const void *src, const void *dst, double sport, dou
 	if( d == NULL )
 		return 0;
 	return h2_segment( d, rev, (uint32_t)seq, (const uint8_t *)payload, mmt_mem_size( payload ));
+}
+
+void on_load(){
+	h2_load_env();
 }
 
 //called once, by the main thread: free the state of every thread
