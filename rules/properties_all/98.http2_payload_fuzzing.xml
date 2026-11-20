@@ -21,7 +21,18 @@ with '{' or '['. An alert is raised when the body
 Ordinary JSON text is not reported: a '#', '%', '$' or '\' alone ("#ff0000",
 "10%", "100%natural", "$5", "C:\\Users"), a URL escape ("%3d", "%2d"), a
 single "../" ("../images/logo.png"), markdown code ("Use `git status`"),
-jQuery ("$(document).ready"), printf documentation ("%s has %d items").
+jQuery ("$(document).ready", "$(this).hide()", "$('#id')"), printf
+documentation ("%s has %d items").
+
+So, by design, these attack bodies are not reported either:
+- a backtick that is not after a shell operator and does not span a whole
+  string value: "ping `id`", "x`id`";
+- conversions that are not next to each other: "%x, %x, %x";
+- a "%d" conversion with a width of 2 hex digits, read as a URL escape:
+  "%10d%10d" (but "%08x", "%20s" and "%10n" are conversions);
+- a single "../": "../etc/passwd", "../..";
+- "$(...)" followed by '.' when it starts with a quote, "this", "document" or
+  "window": "$(document.cookie).x".
 
 Each mmt-security thread tracks 128 connections (the least recently used one is
 replaced).
@@ -600,6 +611,12 @@ static inline bool mem_has( const uint8_t *p, uint32_t len, const char *s ){
 	return false;
 }
 
+//whether the #len bytes at #p start with #s
+static inline bool mem_starts( const uint8_t *p, uint32_t len, const char *s ){
+	size_t n = strlen( s );
+	return ( len >= n && memcmp( p, s, n ) == 0 );
+}
+
 //whether a closing backtick follows #i before the end of the JSON string; its index in #close
 static inline bool json_backtick_close( const uint8_t *p, uint32_t len, uint32_t i, uint32_t *close ){
 	uint32_t k;
@@ -623,18 +640,24 @@ static inline bool json_has_injection( const uint8_t *p, uint32_t len ){
 	for( i=0; i<len; i++ ){
 		switch( p[i] ){
 		case '%':
-			//URL escape "%XX": NUL "%00" and dots "%2e%2e" are reported, the others are text
-			if( i + 2 < len && isxdigit( p[i+1] ) && isxdigit( p[i+2] )){
-				if( p[i+1] == '0' && p[i+2] == '0' )
-					return true;
+			//conversion: flags, width, precision and length ("%08x", "%-10.2ld"), then the conversion letter p[j]
+			j = i + 1;
+			while( j < len && (isdigit( p[j] ) || p[j] == '.' || p[j] == '-' || p[j] == 'l' || p[j] == 'h' ))
+				j++;
+			//NUL "%00", also before a conversion letter ("%00x")
+			if( i + 2 < len && p[i+1] == '0' && p[i+2] == '0' )
+				return true;
+			//URL escape "%XX", unless it starts a "%s", "%x", "%X", "%p" or "%n" conversion with a width
+			// ("%08x", "%20s", "%10n"): dots "%2e%2e" are reported, the others are text
+			// ("%3d", "%2d": a "%d" conversion cannot be told from a URL escape)
+			if( i + 2 < len && isxdigit( p[i+1] ) && isxdigit( p[i+2] )
+					&& !( j < len && p[j] != '\0' && strchr( "sxXp", p[j] ) != NULL )
+					&& !( j < len && p[j] == 'n' && (j + 1 >= len || !isalpha( p[j+1] )) )){
 				if( i + 5 < len && strncasecmp( (const char *)p + i, "%2e%2e", 6 ) == 0 )
 					return true;
 				break;
 			}
 			//format string: "%n" (not "100%natural"), or 2 conversions next to each other ("%s%s", "%x.%x", "%p %p")
-			j = i + 1;
-			while( j < len && (isdigit( p[j] ) || p[j] == '.' || p[j] == '-' || p[j] == 'l' || p[j] == 'h' ))
-				j++;
 			if( j >= len )
 				break;
 			if( p[j] == 'n' && (j + 1 >= len || !isalpha( p[j+1] )) )
@@ -653,8 +676,12 @@ static inline bool json_has_injection( const uint8_t *p, uint32_t len ){
 				break;
 			for( k = i + 2; k < len && k < i + 256 && p[k] != ')' && p[k] != '"'; k++ )
 				;
-			if( k < len && p[k] == ')' && k + 1 < len && p[k+1] == '.' )
-				break; //a method call on the jQuery object
+			//a method call on the jQuery object of this, document or window ("$(document).ready"),
+			// not "$(whoami).log"
+			if( k < len && p[k] == ')' && k + 1 < len && p[k+1] == '.'
+					&& (mem_starts( p + i + 2, k - i - 2, "this" ) || mem_starts( p + i + 2, k - i - 2, "document" )
+						|| mem_starts( p + i + 2, k - i - 2, "window" )) )
+				break;
 			return true;
 		case '`': //command substitution "`cmd`": a whole value ("`reboot`") or after a shell operator ("x;`id`")
 			prev = ( i > 0 ) ? p[i-1] : '"';
