@@ -33,6 +33,10 @@ after a FIN or an RST of the client at its next sequence number, or a SYN-ACK
 of the server, but not after a SYN alone, an RST or a FIN at another sequence
 number, a FIN of the server, or a SYN-ACK for another sequence number.
 
+`check/check-csv-env.sh` (run by `make check`) checks that `make _csv.X`
+rewrites `check/expect/X.csv` with the variables of `check/pcap/X.env`, as
+`make _check.X` reads it.
+
 `check/h2_thread_leak.sh` runs rules 97 and 98 with 2 verification threads
 (`-c`) under valgrind and fails if their per-thread state leaks at exit. It is
 outside `make check`, as it needs valgrind: `make check-valgrind` runs it, and

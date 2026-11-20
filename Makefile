@@ -365,7 +365,9 @@ endif
 TEST_INDEX=1
 # options of mmt_sec_standalone for check/pcap/X.pcap, read from check/pcap/X.opt if it exists (e.g. -R)
 CHECK_OPT = $(shell cat check/pcap/$*.opt 2>/dev/null)
-# environment variables for check/pcap/X.pcap, read from check/pcap/X.env if it exists (e.g. MMT_SEC_HTTP2_SEED=1)
+# environment variables for check/pcap/X.pcap, read from check/pcap/X.env if it exists (e.g. MMT_SEC_HTTP2_SEED=1):
+# NAME=value pairs, separated by spaces or lines, with no '#' comment and no double quote
+# (the file is expanded inside the bash -c "..." of _check.% and _csv.%)
 CHECK_ENV = $(shell cat check/pcap/$*.env 2>/dev/null)
 _prepare: compile_rule standalone sample_rules
 	@echo "==============================="
@@ -406,7 +408,7 @@ _check_compile_rule: compile_rule
 	@echo "Testing compile_rule on malformed rules"
 	$(QUIET) bash check/rules_compile.sh ./$(MAIN_GEN_PLUGIN)
 
-check: check-properties-all check-rule-hooks _prepare _check_compile_rule $(patsubst %,_check.%,$(NAMES)) check-build-info
+check: check-properties-all check-rule-hooks check-csv-env _prepare _check_compile_rule $(patsubst %,_check.%,$(NAMES)) check-build-info
 	@echo "All test passed!"
 
 # rules 97 and 98 free the state of every verification thread (needs valgrind)
@@ -433,10 +435,14 @@ check-properties-all:
 # no rule may define on_load/on_unload as static: dlsym() would not find them
 check-rule-hooks:
 	@./check/check-rule-hooks.sh
+
+# make _csv.X uses check/pcap/X.env, as make _check.X does
+check-csv-env:
+	@./check/check-csv-env.sh
 	
 _csv.%: _prepare
 	$(QUIET) $(RM) /tmp/mmt-security*.csv
-	$(QUIET) ./$(MAIN_STAND_ALONE) -v $(CHECK_OPT) -t check/pcap/$*.pcap -f /tmp/ || exit 1
+	$(QUIET) bash -c "$(CHECK_ENV) ./$(MAIN_STAND_ALONE) -v $(CHECK_OPT) -t check/pcap/$*.pcap -f /tmp/" || exit 1
 	$(QUIET) find /tmp/mmt-security*.csv -exec mv {} check/expect/$*.csv \;
 	
 csv: $(patsubst %,_csv.%,$(NAMES))
