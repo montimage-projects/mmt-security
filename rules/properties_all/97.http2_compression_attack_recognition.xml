@@ -1,37 +1,563 @@
 <beginning>
-<!-- 
-Compression attack involve the use of the compression in order to put a great amount of data in a single packet, in order to use a huge amount of 
-computational resources by the server after the decompression. In this case the rule checks the length of the packet. 
-Since http2 tends to merge multiple packets, an upper limit is also set so as not to confuse the attack with the coalescing operated by the protocol
+<!--
+HPACK bomb (CVE-2016-6581): the attacker inserts one large header in the HPACK
+dynamic table, then sends small header blocks that reference it many times as
+1-byte indexed fields. Each small block decodes to a header list hundreds of
+times its size, and this decompression exhausts the memory of the decoder.
+
+The rule reads the HTTP/2 frames of each TCP segment (tcp.p_payload), keeps the
+HPACK dynamic table of each direction of a connection (only the lengths of the
+entries), and decodes the size of each header block (HEADERS, CONTINUATION,
+PUSH_PROMISE): the sum of the name and value lengths plus 32 bytes per field,
+as SETTINGS_MAX_HEADER_LIST_SIZE counts it (RFC 9113, section 6.5.2).
+Huffman-coded strings count their encoded length, i.e., the size is
+under-estimated. An entry inserted before the capture started, or in a lost
+segment, is unknown and counts 32 bytes.
+
+An alert is raised when a block decodes to MMT_SEC_HTTP2_HPACK_BOMB_SIZE bytes
+or more (environment variable, 65536 by default) and to at least 10 times its
+encoded size. A block that is large because of large literal values (e.g., a big
+cookie) is not reported: it is not compressed.
 -->
 <embedded_functions><![CDATA[
-
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <ctype.h>
 #include "mmt_lib.h"
-#include "tcpip/mmt_tcpip_protocols.h"
-#include "pre_embedded_functions.h"
+/*
+ * HTTP/2 frame reader over the TCP payload of each packet.
+ *
+ * mmt-dpi gives the packet's TCP segment, not HTTP/2 frames: a frame can
+ * span segments and a segment can hold several frames. The state of each
+ * direction of a connection (thread-local, so several mmt-security threads
+ * never share it) keeps the next TCP sequence number, and the bytes of an
+ * incomplete frame, so every frame is handled once and whole:
+ * - a retransmitted segment is ignored;
+ * - after a gap (lost segment), or when the capture starts in the middle of
+ *   a connection, the reader resynchronises on a segment that starts with a
+ *   plausible frame header.
+ */
+#include <stdint.h>
+#include <strings.h>
+
+#define H2_SLOTS      256              //connection directions tracked per thread
+#define H2_MAX_FRAME  16384            //default SETTINGS_MAX_FRAME_SIZE (RFC 9113, 6.5.2)
+#define H2_BUF_MAX    (H2_MAX_FRAME + 9)
+
+static const char H2_PREFACE[] = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+//fields of the state of one direction of a connection, shared by the rules
+#define H2_DIR_COMMON_FIELDS \
+	bool     used;                                               \
+	uint8_t  key[12];     /*src ip, dst ip, src port, dst port*/ \
+	bool     synced;      /*next_seq is known*/                  \
+	uint32_t next_seq;                                           \
+	bool     aligned;     /*the next byte starts a frame*/       \
+	uint32_t skip;        /*bytes left of a frame not buffered*/ \
+	uint8_t *buf;         /*incomplete frame*/                   \
+	uint32_t buf_len;                                            \
+	bool     is_client;   /*sent the preface or a request*/
 
 
-static int em_check(
-	double header_length,double packet_id){	
+#define HPACK_DEFAULT_TABLE_SIZE 4096
+#define HPACK_MAX_TABLE_SIZE     65536          //larger SETTINGS_HEADER_TABLE_SIZE values are capped
+#define HPACK_MAX_ENTRIES        (HPACK_MAX_TABLE_SIZE / 32)
+#define HPACK_MAX_BLOCK          (64 * 1024)    //header block (HEADERS + CONTINUATION) buffered
 
-	//printf( " Rule 97:Recognized suspect packet. Length %f , packet id %d\n",header_length,(int)packet_id);
-	return 0;
+typedef struct hpack_entry_struct{
+	uint32_t name_len, value_len;
+}hpack_entry_t;
+
+struct h2_dir_struct{
+	H2_DIR_COMMON_FIELDS
+	//HPACK dynamic table of the encoder of this direction: only the lengths are kept.
+	//entries[ (first + i) % HPACK_MAX_ENTRIES ] is the i-th newest entry (index 62 + i)
+	hpack_entry_t *entries;
+	uint32_t entries_count, first;
+	uint32_t table_size, table_max;  //current size, and maximum (RFC 7541, 4.1 and 4.2)
+	uint32_t settings_max;           //SETTINGS_HEADER_TABLE_SIZE sent by the peer
+	//header block being received in HEADERS and CONTINUATION frames
+	uint8_t *block;
+	uint32_t block_len;
+	bool     block_open, block_overflow;
+};
+
+typedef struct h2_dir_struct h2_dir_t;
+
+//rule-specific: called for each complete frame
+static int h2_on_frame( h2_dir_t *d, uint8_t type, uint8_t flags, uint32_t sid, const uint8_t *p, uint32_t len );
+//rule-specific: called when the byte stream of #d is lost (gap), or #d is reset
+static void h2_on_desync( h2_dir_t *d );
+static void h2_on_reset( h2_dir_t *d );
+
+static __thread h2_dir_t *h2_dirs = NULL;
+
+static inline uint32_t h2_u24( const uint8_t *p ){
+	return ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | p[2];
+}
+static inline uint32_t h2_u32( const uint8_t *p ){
+	return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
 }
 
+//whether #p (at least 9 bytes) looks like a frame header: used only to resynchronise
+static inline bool h2_plausible_header( const uint8_t *p ){
+	return h2_u24( p ) <= H2_MAX_FRAME && p[3] <= 0x09 && (p[5] & 0x80) == 0;
+}
 
+static inline void h2_reset( h2_dir_t *d ){
+	h2_on_reset( d );
+	free( d->buf );
+	memset( d, 0, sizeof( *d ));
+}
+
+//the state of the direction src:sport -> dst:dport
+static inline h2_dir_t *h2_get_dir( const void *src, const void *dst, double sport, double dport ){
+	uint8_t key[12];
+	uint32_t h = 2166136261u;
+	int i;
+	h2_dir_t *d;
+
+	if( h2_dirs == NULL ){
+		h2_dirs = calloc( H2_SLOTS, sizeof( h2_dir_t ));
+		if( h2_dirs == NULL )
+			return NULL;
+	}
+	memcpy( key, src, 4 );
+	memcpy( key + 4, dst, 4 );
+	key[8]  = ((uint32_t)sport) >> 8; key[9]  = ((uint32_t)sport) & 0xFF;
+	key[10] = ((uint32_t)dport) >> 8; key[11] = ((uint32_t)dport) & 0xFF;
+	for( i=0; i<12; i++ )
+		h = (h ^ key[i]) * 16777619u;
+	d = &h2_dirs[ h % H2_SLOTS ];
+	if( !d->used || memcmp( d->key, key, 12 ) != 0 ){
+		h2_reset( d ); //replace the least recent connection using this slot
+		memcpy( d->key, key, 12 );
+		d->used = true;
+	}
+	return d;
+}
+
+static inline void h2_desync( h2_dir_t *d ){
+	d->aligned = false;
+	d->skip    = 0;
+	d->buf_len = 0;
+	h2_on_desync( d );
+}
+
+//handle the complete frame at #p (9-byte header + payload); return its rule-specific result
+static inline int h2_frame( h2_dir_t *d, const uint8_t *p ){
+	return h2_on_frame( d, p[3], p[4], h2_u32( p + 5 ) & 0x7FFFFFFF, p + 9, h2_u24( p ));
+}
+
+//append #n bytes to the incomplete frame of #d
+static inline bool h2_buffer( h2_dir_t *d, const uint8_t *p, size_t n ){
+	if( d->buf == NULL ){
+		d->buf = malloc( H2_BUF_MAX );
+		if( d->buf == NULL )
+			return false;
+	}
+	memcpy( d->buf + d->buf_len, p, n );
+	d->buf_len += n;
+	return true;
+}
+
+/**
+ * Feed the TCP segment (#seq, #p, #len) of direction #d to the frame reader.
+ * Return 1 if a frame of the segment made #h2_on_frame return 1.
+ */
+static inline int h2_segment( h2_dir_t *d, uint32_t seq, const uint8_t *p, size_t len ){
+	int ret = 0;
+	uint32_t flen, n, total;
+
+	if( d->synced ){
+		int32_t diff = (int32_t)(seq - d->next_seq);
+		if( diff < 0 ){ //retransmission, possibly overlapping new data
+			if( (size_t)(-(int64_t)diff) >= len )
+				return 0;
+			p   += -diff;
+			len -= -diff;
+			seq  = d->next_seq;
+		}else if( diff > 0 ) //gap: bytes were lost
+			h2_desync( d );
+	}
+	d->synced   = true;
+	d->next_seq = seq + (uint32_t)len;
+
+	if( len >= 24 && memcmp( p, H2_PREFACE, 24 ) == 0 ){
+		p   += 24;
+		len -= 24;
+		d->is_client = true;
+		d->aligned   = true;
+		d->skip      = 0;
+		d->buf_len   = 0;
+	}
+
+	while( len > 0 ){
+		//rest of a frame too large to be buffered
+		if( d->skip > 0 ){
+			n = ( d->skip < len ) ? d->skip : (uint32_t)len;
+			d->skip -= n;
+			p   += n;
+			len -= n;
+			continue;
+		}
+		//incomplete frame from the previous segments
+		if( d->buf_len > 0 ){
+			if( d->buf_len < 9 ){
+				n = 9 - d->buf_len;
+				n = ( n < len ) ? n : (uint32_t)len;
+				h2_buffer( d, p, n );
+				p   += n;
+				len -= n;
+				if( d->buf_len < 9 )
+					return ret;
+			}
+			total = 9 + h2_u24( d->buf );
+			if( total > H2_BUF_MAX ){
+				d->skip    = total - d->buf_len;
+				d->buf_len = 0;
+				continue;
+			}
+			n = total - d->buf_len;
+			n = ( n < len ) ? n : (uint32_t)len;
+			h2_buffer( d, p, n );
+			p   += n;
+			len -= n;
+			if( d->buf_len < total )
+				return ret;
+			d->buf_len = 0;
+			ret |= h2_frame( d, d->buf );
+			continue;
+		}
+		//frame starting in this segment
+		if( !d->aligned ){
+			if( len < 9 || !h2_plausible_header( p ))
+				return ret; //wait for a segment starting with a frame
+			d->aligned = true;
+		}
+		if( len < 9 ){
+			if( !h2_buffer( d, p, len ))
+				h2_desync( d );
+			return ret;
+		}
+		flen = h2_u24( p );
+		if( 9 + (size_t)flen <= len ){
+			ret |= h2_frame( d, p );
+			p   += 9 + flen;
+			len -= 9 + flen;
+			continue;
+		}
+		if( 9 + flen > H2_BUF_MAX ){
+			d->skip = 9 + flen - (uint32_t)len;
+			return ret;
+		}
+		if( !h2_buffer( d, p, len ))
+			h2_desync( d );
+		return ret;
+	}
+	return ret;
+}
+
+//payload of a HEADERS (type 1) or PUSH_PROMISE (type 5) frame without padding, priority and promised stream id
+static inline bool h2_header_block( uint8_t type, uint8_t flags, const uint8_t **p, uint32_t *len ){
+	uint32_t pad = 0;
+	if( flags & 0x08 ){ //PADDED
+		if( *len < 1 ) return false;
+		pad = (*p)[0];
+		(*p) ++; (*len) --;
+	}
+	if( type == 1 && (flags & 0x20) ){ //PRIORITY
+		if( *len < 5 ) return false;
+		(*p) += 5; (*len) -= 5;
+	}
+	if( type == 5 ){ //promised stream id
+		if( *len < 4 ) return false;
+		(*p) += 4; (*len) -= 4;
+	}
+	if( pad > *len ) return false;
+	*len -= pad;
+	return true;
+}
+
+//HPACK integer with a #prefix-bit prefix (RFC 7541, 5.1); return false if malformed
+static inline bool hpack_int( const uint8_t **p, const uint8_t *end, int prefix, uint32_t *v ){
+	uint32_t m = (1u << prefix) - 1, shift = 0;
+	uint8_t b;
+	if( *p >= end ) return false;
+	*v = (*(*p)++) & m;
+	if( *v < m ) return true;
+	do{
+		if( *p >= end || shift > 21 ) return false;
+		b = *(*p)++;
+		*v += (uint32_t)(b & 0x7F) << shift;
+		shift += 7;
+	}while( b & 0x80 );
+	return true;
+}
+
+#include <inttypes.h>
+
+//HPACK static table (RFC 7541, Appendix A): name and value lengths
+static const uint8_t hpack_static[62][2] = {
+	{0,0},
+	{10,0},{7,3},{7,4},{5,1},{5,11},{7,4},{7,5},{7,3},{7,3},{7,3},{7,3},{7,3},{7,3},{7,3},
+	{14,0},{15,13},{15,0},{13,0},{6,0},{27,0},{3,0},{5,0},{13,0},{13,0},{19,0},{16,0},
+	{16,0},{14,0},{16,0},{13,0},{12,0},{6,0},{4,0},{4,0},{6,0},{7,0},{4,0},{4,0},{8,0},
+	{17,0},{13,0},{8,0},{19,0},{13,0},{4,0},{8,0},{12,0},{18,0},{19,0},{5,0},{7,0},{7,0},
+	{11,0},{6,0},{10,0},{25,0},{17,0},{10,0},{4,0},{3,0},{16,0}
+};
+
+//decoded header list size above which a header block is reported (env. MMT_SEC_HTTP2_HPACK_BOMB_SIZE)
+static uint64_t hpack_bomb_size  = 65536;
+//minimal ratio decoded size / encoded size of a reported header block
+#define HPACK_BOMB_RATIO 10
+
+void on_load(){
+	const char *str = getenv( "MMT_SEC_HTTP2_HPACK_BOMB_SIZE" );
+	if( str != NULL && strtoull( str, NULL, 0 ) > 0 ){
+		hpack_bomb_size = strtoull( str, NULL, 0 );
+		mmt_info( "Rule 97: set MMT_SEC_HTTP2_HPACK_BOMB_SIZE=%"PRIu64, hpack_bomb_size );
+	}
+}
+
+static void h2_on_reset( h2_dir_t *d ){
+	free( d->entries );
+	free( d->block );
+}
+
+static inline void hpack_clear( h2_dir_t *d ){
+	d->entries_count = d->first = d->table_size = 0;
+}
+
+//the byte stream was lost: the dynamic table restarts empty, entries inserted
+// before are unknown (they count 32 bytes, the minimum, when they are referenced)
+static void h2_on_desync( h2_dir_t *d ){
+	hpack_clear( d );
+	d->block_len  = 0;
+	d->block_open = d->block_overflow = false;
+}
+
+static inline void hpack_evict( h2_dir_t *d, uint32_t max ){
+	hpack_entry_t *e;
+	while( d->entries_count > 0 && d->table_size > max ){
+		e = &d->entries[ (d->first + d->entries_count - 1) % HPACK_MAX_ENTRIES ];
+		d->table_size -= e->name_len + e->value_len + 32;
+		d->entries_count --;
+	}
+}
+
+static inline void hpack_insert( h2_dir_t *d, uint32_t name_len, uint32_t value_len ){
+	uint32_t size = name_len + value_len + 32;
+	if( d->entries == NULL ){
+		d->entries = malloc( HPACK_MAX_ENTRIES * sizeof( hpack_entry_t ));
+		if( d->entries == NULL )
+			return;
+	}
+	if( d->table_max == 0 )
+		d->table_max = HPACK_DEFAULT_TABLE_SIZE;
+	if( size > d->table_max ){ //RFC 7541, 4.4: the table is emptied
+		hpack_clear( d );
+		return;
+	}
+	hpack_evict( d, d->table_max - size );
+	if( d->entries_count == HPACK_MAX_ENTRIES ){
+		hpack_entry_t *e = &d->entries[ (d->first + d->entries_count - 1) % HPACK_MAX_ENTRIES ];
+		d->table_size -= e->name_len + e->value_len + 32;
+		d->entries_count --;
+	}
+	d->first = (d->first + HPACK_MAX_ENTRIES - 1) % HPACK_MAX_ENTRIES;
+	d->entries[ d->first ].name_len  = name_len;
+	d->entries[ d->first ].value_len = value_len;
+	d->entries_count ++;
+	d->table_size += size;
+}
+
+//lengths of the entry #index; false if the entry is unknown
+static inline bool hpack_lookup( const h2_dir_t *d, uint32_t index, uint32_t *name_len, uint32_t *value_len ){
+	if( index >= 1 && index <= 61 ){
+		*name_len  = hpack_static[ index ][0];
+		*value_len = hpack_static[ index ][1];
+		return true;
+	}
+	if( index >= 62 && index - 62 < d->entries_count ){
+		const hpack_entry_t *e = &d->entries[ (d->first + index - 62) % HPACK_MAX_ENTRIES ];
+		*name_len  = e->name_len;
+		*value_len = e->value_len;
+		return true;
+	}
+	*name_len = *value_len = 0;
+	return false;
+}
+
+//length of an HPACK string literal (Huffman-coded strings count their encoded length)
+static inline bool hpack_string( const uint8_t **p, const uint8_t *end, uint32_t *len ){
+	if( !hpack_int( p, end, 7, len ) || *len > (uint32_t)(end - *p) )
+		return false;
+	*p += *len;
+	return true;
+}
+
+/**
+ * Decode the header block #p of #len bytes, updating the dynamic table, and
+ * return the size of the decoded header list: the sum of the name and value
+ * lengths plus 32 bytes per field (RFC 9113, section 6.5.2).
+ */
+static inline uint64_t hpack_decoded_size( h2_dir_t *d, const uint8_t *p, uint32_t len ){
+	const uint8_t *end = p + len;
+	uint64_t size = 0;
+	uint32_t index, name_len, value_len;
+	uint8_t b;
+
+	if( d->table_max == 0 )
+		d->table_max = ( d->settings_max != 0 ) ? d->settings_max : HPACK_DEFAULT_TABLE_SIZE;
+
+	while( p < end ){
+		b = *p;
+		if( b & 0x80 ){                   //indexed header field
+			if( !hpack_int( &p, end, 7, &index ) || index == 0 )
+				goto error;
+			hpack_lookup( d, index, &name_len, &value_len );
+			size += (uint64_t)name_len + value_len + 32;
+		}else if( (b & 0xE0) == 0x20 ){   //dynamic table size update
+			if( !hpack_int( &p, end, 5, &index ))
+				goto error;
+			d->table_max = ( index > HPACK_MAX_TABLE_SIZE ) ? HPACK_MAX_TABLE_SIZE : index;
+			hpack_evict( d, d->table_max );
+		}else{                            //literal header field
+			bool indexing = ( (b & 0xC0) == 0x40 );
+			if( !hpack_int( &p, end, indexing ? 6 : 4, &index ))
+				goto error;
+			if( index == 0 ){
+				if( !hpack_string( &p, end, &name_len ))
+					goto error;
+			}else
+				hpack_lookup( d, index, &name_len, &value_len );
+			if( !hpack_string( &p, end, &value_len ))
+				goto error;
+			size += (uint64_t)name_len + value_len + 32;
+			if( indexing )
+				hpack_insert( d, name_len, value_len );
+		}
+	}
+	return size;
+
+	error:
+	//malformed block: the decoder would close the connection; forget the table
+	hpack_clear( d );
+	return size;
+}
+
+static inline int hpack_check_block( h2_dir_t *d, const uint8_t *p, uint32_t len ){
+	uint64_t size = hpack_decoded_size( d, p, len );
+	return ( size >= hpack_bomb_size && size >= (uint64_t)HPACK_BOMB_RATIO * len );
+}
+
+static inline int h2_block_fragment( h2_dir_t *d, uint8_t flags, const uint8_t *p, uint32_t len ){
+	int ret = 0;
+	//whole block in one frame: decode it in place
+	if( !d->block_open && (flags & 0x04) )
+		return hpack_check_block( d, p, len );
+
+	if( !d->block_open ){
+		d->block_open = true;
+		d->block_len  = 0;
+		d->block_overflow = false;
+	}
+	if( !d->block_overflow ){
+		if( d->block == NULL )
+			d->block = malloc( HPACK_MAX_BLOCK );
+		if( d->block == NULL || d->block_len + len > HPACK_MAX_BLOCK )
+			d->block_overflow = true;
+		else{
+			memcpy( d->block + d->block_len, p, len );
+			d->block_len += len;
+		}
+	}
+	if( flags & 0x04 ){ //END_HEADERS
+		if( d->block_overflow )
+			hpack_clear( d ); //the block was not decoded: the table is unknown
+		else
+			ret = hpack_check_block( d, d->block, d->block_len );
+		d->block_open = false;
+		d->block_len  = 0;
+	}
+	return ret;
+}
+
+//state of the reverse direction of the segment being read, NULL if unknown
+static __thread h2_dir_t *h2_reverse = NULL;
+
+static int h2_on_frame( h2_dir_t *d, uint8_t type, uint8_t flags, uint32_t sid, const uint8_t *p, uint32_t len ){
+	uint32_t i, id, value;
+	switch( type ){
+	case 1: //HEADERS
+	case 5: //PUSH_PROMISE
+		if( !h2_header_block( type, flags, &p, &len ))
+			return 0;
+		return h2_block_fragment( d, flags, p, len );
+	case 9: //CONTINUATION
+		if( !d->block_open )
+			return 0;
+		return h2_block_fragment( d, flags, p, len );
+	case 4: //SETTINGS: SETTINGS_HEADER_TABLE_SIZE limits the peer's encoder
+		if( (flags & 0x01) || h2_reverse == NULL )
+			return 0;
+		for( i=0; i+6 <= len; i+=6 ){
+			id    = ((uint32_t)p[i] << 8) | p[i+1];
+			value = h2_u32( p + i + 2 );
+			if( id == 1 ){
+				value = ( value > HPACK_MAX_TABLE_SIZE ) ? HPACK_MAX_TABLE_SIZE : value;
+				h2_reverse->settings_max = value;
+				//without a size update, the encoder uses the new limit
+				h2_reverse->table_max = value;
+				hpack_evict( h2_reverse, value );
+			}
+		}
+		return 0;
+	default:
+		return 0;
+	}
+}
+
+/**
+ * Return 1 if the TCP segment completes an HTTP/2 header block whose decoded
+ * header list is at least MMT_SEC_HTTP2_HPACK_BOMB_SIZE bytes (64 KiB by
+ * default) and at least 10 times larger than the block: an HPACK bomb.
+ */
+static int em_check_hpack_bomb( const void *src, const void *dst, double sport, double dport, double seq, const char *payload ){
+	h2_dir_t *d;
+	if( src == NULL || dst == NULL || payload == NULL )
+		return 0;
+	//state of the reverse direction, for the SETTINGS sent in this direction
+	h2_reverse = h2_get_dir( dst, src, dport, sport );
+	d = h2_get_dir( src, dst, sport, dport );
+	if( d == NULL )
+		return 0;
+	if( d == h2_reverse ) //both directions use the same slot: #d replaced the reverse one
+		h2_reverse = NULL;
+	return h2_segment( d, (uint32_t)seq, (const uint8_t *)payload, mmt_mem_size( payload ));
+}
+
+void on_unload(){
+	int i;
+	if( h2_dirs == NULL )
+		return;
+	for( i=0; i<H2_SLOTS; i++ )
+		h2_reset( &h2_dirs[i] );
+	free( h2_dirs );
+	h2_dirs = NULL;
+}
 ]]></embedded_functions>
 
 <property value="THEN"  property_id="97" type_property="ATTACK" 
     description="5G Http2 Compression Attack" if_satisfied="">
     <event value="COMPUTE" event_id="1" 
-        description="Rule checks the dimension of the header length. If it is greater then a threshold an alert is launched"
-        boolean_expression="( ((http2.header_length>350) &amp;&amp; (16384>http2.header_length ) &amp;&amp; ( http2.header_method == 131)) &amp;&amp; ( ip.src != ip.dst ) )"/>
+        description="HTTP/2 header block that decodes to 64 KiB or more and to 10 times its size or more (HPACK bomb)"
+        boolean_expression="( (256 &gt; http2.type) &amp;&amp; (#em_check_hpack_bomb( ip.src, ip.dst, tcp.src_port, tcp.dest_port, tcp.seq_nb, tcp.p_payload ) == 1) )"/>
 
  <event value="COMPUTE" event_id="2" 
-        description="Nothing"
-        boolean_expression="( http2.header_method != 0)"/>  
+        description="Print IP source and destination addresses"
+        boolean_expression="( ip.src != ip.dst )"/>  
 </property>
 </beginning>
