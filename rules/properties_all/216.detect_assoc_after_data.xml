@@ -5,7 +5,8 @@
      P-DATA-TF sent in either direction): a new association opened on another
      connection after data on this one is normal. A TCP connection carries one
      association (PS3.8 section 9.1), so an A-ASSOCIATE-RQ after a P-DATA-TF is
-     anomalous at any time, not only within some seconds. One event: the PDU
+     anomalous at any time, not only within some seconds, until an A-RELEASE-RP or
+     an A-ABORT ends the association (the connection is then closed). One event: the PDU
      boundary tracker keeps the PDU types seen in each direction of the connection
      (PDU_TRACK_BOTH_WAYS), so the rule keeps no instance per P-DATA-TF. -->
 <!-- PDU boundaries: mmt-dpi reads a PDU header at the start of every TCP segment,
@@ -34,7 +35,12 @@ static int em_is_dicom(const void *data) {
 #define PDU_TRACK_BOTH_WAYS 1
 static inline int pdu_track_bad(uint8_t type, uint32_t len, uint32_t seen) {
     (void) type; (void) len; (void) seen;
-    return type == 1 && (seen & (1u << 4)) != 0; /* an A-ASSOCIATE-RQ after a P-DATA-TF */
+    /* an A-ASSOCIATE-RQ after a P-DATA-TF, unless an A-RELEASE-RP or an A-ABORT
+     * ended the association before it: the TCP connection is then closed, and the
+     * RQ is that of a new connection reusing the addresses and ports, with sequence
+     * numbers too near the old ones for the tracker to see a new stream (Linux
+     * starts a reuse of a TIME_WAIT connection 65537 bytes after the old one) */
+    return type == 1 && (seen & (1u << 4)) != 0 && (seen & ((1u << 6) | (1u << 7))) == 0;
 }
 
 /* ---- PDU boundary tracker ---- */
