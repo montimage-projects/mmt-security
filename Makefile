@@ -404,7 +404,7 @@ _check_compile_rule: compile_rule
 	@echo "Testing compile_rule on malformed rules"
 	$(QUIET) bash check/rules_compile.sh ./$(MAIN_GEN_PLUGIN)
 
-check: check-properties-all check-rule-hooks _prepare _check_compile_rule $(patsubst %,_check.%,$(NAMES)) check-build-info
+check: check-properties-all check-rule-hooks check-dicom-blocks _prepare _check_compile_rule $(patsubst %,_check.%,$(NAMES)) check-build-info
 	@echo "All test passed!"
 
 # build info embedded in every rule .so (doc/rule.md)
@@ -421,6 +421,10 @@ check-properties-all:
 	done; \
 	[ $$missing -eq 0 ] || exit 1
 	@echo "All rules/*.xml have a copy in rules/properties_all/"
+
+# the DICOM rules' shared C blocks match check/gen/dicom/blocks/ and compile on their own
+check-dicom-blocks:
+	@./check/dicom-blocks.sh -I $(MMT_DPI_DIR)/include
 
 # no rule may define on_load/on_unload as static: dlsym() would not find them
 check-rule-hooks:
