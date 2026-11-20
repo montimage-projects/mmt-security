@@ -1,16 +1,31 @@
 <beginning>
 
+<!--
+Property 79 checks each DTLS ClientHello:
+- version: the client_version of the ClientHello body must be DTLS 1.2 (0xfefd).
+  The record-layer version (dtls.version) cannot be used: RFC 6347 section 4.2.1
+  lets a DTLS 1.2 client send its first ClientHello in a DTLS 1.0 (0xfeff)
+  record, and OpenSSL does. mmt-dpi does not give client_version as an
+  attribute, so it is read from the raw record (dtls.p_data). A DTLS 1.3
+  ClientHello also carries 0xfefd there (legacy_version); 0xfefc is accepted too.
+- ciphersuites: when MMT_SEC_DTLS_CIPHER_ALLOWLIST is set, every cipher suite
+  offered by the client must be in that list. The signalling values that are
+  not cipher suites are ignored: TLS_EMPTY_RENEGOTIATION_INFO_SCSV (0x00ff),
+  TLS_FALLBACK_SCSV (0x5600) and the GREASE values of RFC 8701 (0x0a0a, 0x1a1a,
+  ..., 0xfafa). When the variable is unset or empty, only the version is checked.
+A ClientHello fragment that does not start the message (fragment_offset != 0)
+is not checked, as its cipher suites are not in it.
+-->
 <property value="THEN" delay_units="ms" delay_min="0" delay_max="0" property_id="79" type_property="SECURITY" 
-    description="Ensure DTLS traffic is using v1.2 and strong ciphersuite which is set via 
-    MMT_SEC_DTLS_CIPHER_ALLOWLIST environment variable which contains a comma-separated list of cipher numbers.
-    Example MMT_SEC_DTLS_CIPHER_ALLOWLIST='0xc0a4,0xc0a5' will allow TLS_PSK_WITH_AES_128_CCM and TLS_PSK_WITH_AES_256_CCM ciphers">
+    description="Ensure DTLS traffic is using v1.2 (version offered in the ClientHello body) and strong ciphersuites. The allowed ciphersuites are set via the 
+    MMT_SEC_DTLS_CIPHER_ALLOWLIST environment variable which contains a comma-separated list of cipher numbers; when it is unset, only the version is checked.
+    Example MMT_SEC_DTLS_CIPHER_ALLOWLIST='0xc0a4,0xc0a5' will allow TLS_PSK_WITH_AES_128_CCM and TLS_PSK_WITH_AES_256_CCM ciphers (SCSV and GREASE values are ignored)">
       <event value="COMPUTE" event_id="1" 
              description="DTLS packet"
              boolean_expression="( ( dtls.packet_count > 0 ) &amp;&amp; #em_print(ip.client_addr, ip.server_addr, ip.client_port, ip.server_port))"/>
       <event value="COMPUTE" event_id="2" 
              description="DTLS version and ciphersuites in client hello handshake messages"
-             boolean_expression="(( #em_is_strong_version( dtls.version )  
-                         &amp;&amp; #em_is_strong_ciphers( dtls.client_hello_cipher_suite ) )"/>
+             boolean_expression="(#em_dtls_is_strong_client_hello( dtls.p_data, dtls.client_hello_cipher_suite ) == true)"/>
 </property>
 
 <embedded_functions><![CDATA[
@@ -22,18 +37,17 @@ static inline bool em_print( const void * data, ...){
 	return true;
 }
 
-static inline bool em_is_strong_version( double version ){
+static inline bool em_is_strong_version( uint16_t version ){
 	return (version == DTLS_VERSION_1_2 ) || (version == DTLS_VERSION_1_3 );
 }
-
 
 static size_t    allow_ciphers_size = 0;
 static uint16_t *allow_ciphers_list = NULL;
 
 void on_load(){
 	const char *str = getenv("MMT_SEC_DTLS_CIPHER_ALLOWLIST");
-	if( str == NULL ){
-		mmt_info("Rule 79.dtls_v12_ciphersuites: no value of MMT_SEC_DTLS_CIPHER_ALLOWLIST" );
+	if( str == NULL || str[0] == '\0' ){
+		mmt_info("Rule 79.dtls_v12_ciphersuites: no value of MMT_SEC_DTLS_CIPHER_ALLOWLIST: ciphersuites are not checked" );
 		return;
 	}
 	char **str_ciphers = NULL;
@@ -59,10 +73,23 @@ void on_unload(){
 		mmt_mem_force_free( allow_ciphers_list );
 }
 
-static inline bool em_is_strong_ciphers( const void *data ){
-	const mmt_u16_array_t *ciphers = (mmt_u16_array_t *) data;
+//signalling cipher suite values that are not cipher suites
+static inline bool _is_signalling_cipher_value( uint16_t cipher ){
+	//TLS_EMPTY_RENEGOTIATION_INFO_SCSV (RFC 5746), TLS_FALLBACK_SCSV (RFC 7507)
+	if( cipher == 0x00ff || cipher == 0x5600 )
+		return true;
+	//GREASE (RFC 8701): 0x0a0a, 0x1a1a, ..., 0xfafa
+	return (cipher & 0x0f0f) == 0x0a0a && (cipher >> 8) == (cipher & 0xff);
+}
+
+static inline bool em_is_strong_ciphers( const mmt_u16_array_t *ciphers ){
 	size_t i, j;
+	//no allowlist: ciphersuites are not checked
+	if( allow_ciphers_size == 0 )
+		return true;
 	for( i=0; i<ciphers->len; i++ ){
+		if( _is_signalling_cipher_value( ciphers->data[i] ) )
+			continue;
 		for( j=0; j<allow_ciphers_size; j++ )
 			if( allow_ciphers_list[j] == ciphers->data[i] )
 				break;
@@ -72,6 +99,27 @@ static inline bool em_is_strong_ciphers( const void *data ){
 			return false;
 	}
 	return true;
+}
+
+/**
+ * record   : dtls.p_data, the DTLS record starting by its 13-byte header
+ * ciphers  : dtls.client_hello_cipher_suite
+ */
+static inline bool em_dtls_is_strong_client_hello( const void *record, const void *ciphers ){
+	//record header (13) + handshake header (12) + client_version (2)
+	const size_t min_len = 13 + 12 + 2;
+	const uint8_t *p = (const uint8_t *) record;
+	if( p == NULL || ciphers == NULL || mmt_mem_size( p ) < min_len )
+		return true; //cannot check
+	//a handshake record holding a ClientHello
+	if( p[0] != 22 || p[13] != 1 )
+		return true;
+	//fragment_offset: only the first fragment holds client_version and the cipher suites
+	if( p[19] != 0 || p[20] != 0 || p[21] != 0 )
+		return true;
+	uint16_t client_version = ((uint16_t) p[25] << 8) | p[26];
+	return em_is_strong_version( client_version )
+			&& em_is_strong_ciphers( (const mmt_u16_array_t *) ciphers );
 }
 ]]></embedded_functions>
 </beginning>
