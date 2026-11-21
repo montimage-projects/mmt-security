@@ -738,6 +738,13 @@ static inline bool _is_string_variable( const operation_t *opt ){
 	return YES;
 }
 
+/**
+ * Whether a comparison compares strings: no parameter is numeric.
+ * A parameter is numeric when it is a numeric variable or constant, or an
+ * operation other than a function: an arithmetic (+ - * /), comparison or
+ * boolean operation gives a number. The return type of an embedded function
+ * is not known here, so a function does not decide.
+ */
 static inline bool _is_string_param( const operation_t *opt ){
 	link_node_t *ptr;
 	expression_t *expr;
@@ -746,11 +753,30 @@ static inline bool _is_string_param( const operation_t *opt ){
 		expr = (expression_t *) ptr->data;
 		if( expr->type == VARIABLE && expr->variable->data_type != MMT_SEC_MSG_DATA_TYPE_STRING )
 			return NO;
-		if( expr->type == CONSTANT && expr->variable->data_type != MMT_SEC_MSG_DATA_TYPE_STRING )
+		if( expr->type == CONSTANT && expr->constant->data_type != MMT_SEC_MSG_DATA_TYPE_STRING )
+			return NO;
+		if( expr->type == OPERATION && expr->operation->operator != FUNCTION )
 			return NO;
 		ptr = ptr->next;
 	}
 	return YES;
+}
+
+/**
+ * The operator that gives the same result with its two operands swapped:
+ * "a < b" is "b > a". A string comparison is written "0 OP cmp(a, b)", that is
+ * "cmp(a, b) OP' 0", and "a < b" means "cmp(a, b) < 0", i.e. "0 > cmp(a, b)".
+ */
+static inline const char *_swapped_comparison_operator( int op ){
+	switch( op ){
+	case GT:  return "<";
+	case GTE: return "<=";
+	case LT:  return ">";
+	case LTE: return ">=";
+	case EQ:  return "==";
+	case NEQ: return "!=";
+	default:  return "?"; //not a comparison operator: not called
+	}
 }
 /**
  * Public API
@@ -763,11 +789,12 @@ size_t expr_stringify_operation( char **string, operation_t *opt ){
 	expression_t *expr;
 
 	char str[ MAX_STR_SIZE ];
-	//change comparison of string to function: "a" == "b" ==> 0 == strcmp("a", "b")
+	//change comparison of string to function: "a" == "b" ==> 0 == strcmp("a", "b"),
+	// "a" < "b" ==> 0 > strcmp("a", "b")
 	if( _is_comparison_operator( opt->operator ) && _is_string_param ( opt ) ){
 		//delimiter
 		delim = ",";
-		index += snprintf( &str[ index ], MAX_STR_SIZE, "0 %s %s(", opt->name,
+		index += snprintf( &str[ index ], MAX_STR_SIZE, "0 %s %s(", _swapped_comparison_operator( opt->operator ),
 				_is_string_variable( opt) ? "mmt_mem_cmp" : "strcmp" );
 	}else if( opt->operator == FUNCTION ){
 		delim = ",";
