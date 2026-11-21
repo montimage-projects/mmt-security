@@ -110,8 +110,9 @@ class Conn:
 
     def flags(self, flags, seq, server=False, ack=None):
         """one segment without data, with #flags, at sequence number #seq,
-        from the client (or the server, acknowledging #ack); the next sequence
-        numbers do not change"""
+        from the client (or the server), acknowledging #ack (by default the
+        next sequence number of the peer); the next sequence numbers do not
+        change"""
         if server:
             s, c, self.s = self.s, self.c, seq & 0xffffffff
             if ack is not None:
@@ -119,9 +120,11 @@ class Conn:
             self._s(flags)
             self.s, self.c = s, c
         else:
-            c, self.c = self.c, seq & 0xffffffff
+            c, s, self.c = self.c, self.s, seq & 0xffffffff
+            if ack is not None:
+                self.s = ack & 0xffffffff
             self._c(flags)
-            self.c = c
+            self.c, self.s = c, s
 
     def fin(self):
         self._c("FA")
@@ -508,6 +511,34 @@ for attack in (attack97, attack98):
         attack(a)
         a.fin()
     for between in running:
+        a = Conn(c, next(ports))
+        a.h2_setup()
+        attack(a, between)
+        a.fin()
+# review 4 (R1), after the others: a FIN ends the connection only if the
+# server accepts it
+#   - the 4-tuple is reused: the server closed first (FIN), and the FIN of the
+#     client acknowledges it (its ack is 1 past the last byte of the server)
+reuse4 = [
+    (lambda a: (a.flags("FA", a.s, server=True), a.flags("FA", a.c, ack=a.s + 1)), False),
+]
+#   - the connection goes on: the server drops a FIN of the client at its next
+#     sequence number (RFC 9293, 3.10.7.4; RFC 5961, 4.2), then the preface
+#     1000 bytes behind
+running4 = [
+    lambda a: (a.flags("F", a.c), a.seg(PREFACE, a.c - 1000)),                       # without ACK
+    lambda a: (a.flags("SFA", a.c - 1), a.seg(PREFACE, a.c - 1000)),                 # with SYN
+    lambda a: (a.flags("FA", a.c, ack=a.s + (1 << 20)), a.seg(PREFACE, a.c - 1000)),  # acks 1 MiB never sent
+]
+for attack in (attack97, attack98):
+    for end, handshake in reuse4:
+        port = next(ports)
+        end(old_conn(port))
+        a = Conn(c, port, isn_c=1000, isn_s=7000)
+        a.h2_setup(handshake=handshake)
+        attack(a)
+        a.fin()
+    for between in running4:
         a = Conn(c, next(ports))
         a.h2_setup()
         attack(a, between)

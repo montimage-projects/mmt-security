@@ -29,9 +29,12 @@ rules 97 and 98, so the capture tests the ways and the LRU replacement.
 
 `97.98.http2_tcp_flags` tests when rules 97 and 98 take a segment that
 starts with the connection preface for a new connection on the same 4-tuple:
-after a FIN or an RST of the client at its next sequence number, or a SYN-ACK
+after a FIN (with ACK, without SYN, acknowledging only data that the server
+sent) or an RST of the client at its next sequence number, or a SYN-ACK
 of the server, but not after a SYN alone, an RST or a FIN at another sequence
-number, a FIN of the server, or a SYN-ACK for another sequence number.
+number, a FIN of the server, a SYN-ACK for another sequence number, or a FIN
+that the server drops (without ACK, with SYN, or acknowledging data that the
+server never sent).
 
 `check/check-csv-env.sh` (run by `make check`) checks that `make _csv.X`
 rewrites `check/expect/X.csv` with the variables of `check/pcap/X.env`, as

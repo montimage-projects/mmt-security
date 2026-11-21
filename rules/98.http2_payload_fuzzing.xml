@@ -69,16 +69,35 @@ about 200 KB each: about 13 GB per thread at the maximum.
  * - a segment that starts with the connection preface starts a new
  *   connection on the same 4-tuple (it has a new ISN), and the state of both
  *   directions restarts, only once the old connection is over: its sender
- *   ended it (a FIN after its last byte, or an RST at the expected sequence
- *   number), or the peer accepted a new connection (a SYN-ACK), whose first
- *   byte is the preface. Any other preface is read as a segment of the
- *   current connection: data at the expected sequence number (e.g., the end
- *   of a DATA frame), or a segment the receiver drops (a retransmission, a
- *   segment out of its window), which a sender could otherwise use to wipe
- *   the state. A SYN alone does not end a connection: the receiver of a SYN
- *   on an established connection answers with an ACK (RFC 5961, 4.2). So
- *   the rule reads the TCP flags of every TCP packet, also without data, of
- *   the connections it tracks;
+ *   ended it, or the peer accepted a new connection (a SYN-ACK), whose first
+ *   byte is the preface. The sender ends it with:
+ *   - a FIN after its last byte that the receiver accepts: with the ACK bit
+ *     (RFC 9293, 3.10.7.4: a segment without ACK is dropped), without SYN
+ *     (RFC 5961, 4.2: a SYN is answered with a challenge ACK and dropped),
+ *     and acknowledging only data that the peer sent (RFC 9293, 3.10.7.4:
+ *     SEG.ACK > SND.NXT is dropped; the FIN of the peer counts 1);
+ *   - or an RST at the expected sequence number (RFC 5961, 3.2), with or
+ *     without ACK or SYN: the receiver checks the RST bit before the SYN and
+ *     ACK bits (RFC 9293, 3.10.7.4), and an RST needs no ACK.
+ *   Any other preface is read as a segment of the current connection: data
+ *   at the expected sequence number (e.g., the end of a DATA frame), or a
+ *   segment the receiver drops (a retransmission, a segment out of its
+ *   window). A SYN alone does not end a connection: the receiver of a SYN on
+ *   an established connection answers with an ACK (RFC 5961, 4.2). So the
+ *   rule reads the TCP flags of every TCP packet, also without data, of the
+ *   connections it tracks;
+ * - limit (insertion): the rule does not do every check of the receiver. A
+ *   FIN or an RST that the receiver drops for a reason the rule does not
+ *   check still ends the connection for the rule: a bad TCP checksum (mmt-dpi
+ *   does not verify it), a sequence number out of the receiver's window
+ *   (when the rule's expected sequence number is not the receiver's, e.g.,
+ *   after a dropped segment far ahead), an ack too old (RFC 5961, 5.2), or
+ *   an ack of unsent data when the rule has seen no data of the peer. Then
+ *   one preface that the receiver also drops restarts the state. The sender
+ *   can do it with its own packets: a packet forged with the peer's address
+ *   is needed only for the SYN-ACK path. It is the same class as a data
+ *   segment that the receiver drops and the rule reads, which can already
+ *   blind the rule; closing it needs the checks of the receiver;
  * - a sequence number more than H2_MAX_BACKWARD bytes behind the expected one
  *   starts a new byte stream (the frame reader resynchronises).
  *
@@ -134,6 +153,7 @@ static const char H2_PREFACE[] = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 	bool     preface_seen;                                       \
 	uint32_t preface_seq; /*sequence number of the preface*/     \
 	bool     ended;       /*FIN or RST of the sender at next_seq*/ \
+	bool     fin;         /*a FIN of the sender ended it*/       \
 	bool     syn_acked;   /*a SYN-ACK accepted a new connection*/ \
 	uint32_t syn_next;    /*its first sequence number*/
 
@@ -468,6 +488,17 @@ static inline int h2_segment( h2_dir_t *d, h2_dir_t *rev, uint32_t seq, const ui
 }
 
 /**
+ * Whether #ack, in a packet of direction #d, acknowledges only data that the
+ * opposite direction #rev sent (and its FIN): the receiver drops a segment
+ * that acknowledges more (RFC 9293, 3.10.7.4). Unknown if #rev sent no data.
+ */
+static inline bool h2_ack_sent( const h2_dir_t *d, const h2_dir_t *rev, uint32_t ack ){
+	if( rev == NULL || rev == d || !rev->synced )
+		return true;
+	return (int32_t)(ack - (rev->next_seq + (rev->fin ? 1 : 0))) <= 0;
+}
+
+/**
  * Feed the TCP packet (#seq, #ack, #flags, and #len bytes of data at #p,
  * #len can be 0) of direction #d; #rev is the opposite direction (or NULL).
  * The flags tell when a connection is over (h2_new_connection).
@@ -492,9 +523,13 @@ static inline int h2_packet( h2_dir_t *d, h2_dir_t *rev, uint32_t seq, uint32_t 
 	}
 	if( len > 0 )
 		ret = h2_segment( d, rev, seq, p, len );
-	//FIN after the last byte of the stream (not of a retransmission behind it, not out of the window)
-	if( (flags & H2_TCP_FIN) && d->synced && seq + (uint32_t)len == d->next_seq )
+	//FIN after the last byte of the stream (not of a retransmission behind it, not out of the window),
+	// that the receiver accepts: with ACK, without SYN, acknowledging only data of the peer
+	if( (flags & H2_TCP_FIN) && (flags & H2_TCP_ACK) && !(flags & H2_TCP_SYN)
+			&& d->synced && seq + (uint32_t)len == d->next_seq && h2_ack_sent( d, rev, ack )){
 		d->ended = true;
+		d->fin   = true;
+	}
 	return ret;
 }
 
