@@ -1,0 +1,13 @@
+<beginning>
+<!-- Test rule of check/check-expressions.sh: http.method == udp.src_port -->
+<!-- expect-error: cannot compare a string with a number: (http.method == udp.src_port) -->
+<property value="THEN" delay_units="s" delay_min="0" delay_max="0" property_id="9025" type_property="TEST"
+    description="http.method == udp.src_port">
+    <event value="COMPUTE" event_id="1"
+           description="http.method == udp.src_port"
+           boolean_expression="(http.method == udp.src_port)"/>
+    <event value="COMPUTE" event_id="2"
+           description="Same packet"
+           boolean_expression="(ip.src != ip.dst)"/>
+</property>
+</beginning>

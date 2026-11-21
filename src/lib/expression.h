@@ -146,6 +146,14 @@ size_t expr_stringify_constant( char **string, const constant_t *expr);
 size_t expr_stringify_variable( char **string, const variable_t *var);
 size_t expr_stringify_expression( char **string, const expression_t *expr);
 
+/**
+ * Refuse a rule whose expression compares a provably string operand with a
+ * provably numeric one: it compiles to garbage C. rule_id and event_id name
+ * the rule and the event in the error. Called when the code of a rule is
+ * generated (gen_code.c).
+ */
+void expr_assert_comparison_types( const expression_t *expr, uint32_t rule_id, uint16_t event_id );
+
 
 constant_t *expr_create_a_constant( enum data_type type, size_t data_size, void *data );
 variable_t *expr_create_a_variable( char *proto, char *attr, uint16_t ref_index );
