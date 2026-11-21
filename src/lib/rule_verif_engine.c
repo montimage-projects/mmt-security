@@ -469,8 +469,8 @@ enum verdict_type _process_multi_packets( rule_engine_t *engine, message_t *mess
 
 	//verify timeout event for each 10 messages or an interval of 100000 usec (0.1s)
 
-	if( engine->last_msg_counter_timeout < message->counter + 10
-			&& engine->last_msg_timestamp_timeout < message->timestamp + 100000 )
+	if( message->counter < engine->last_msg_counter_timeout + 10
+			&& message->timestamp < engine->last_msg_timestamp_timeout + 100000 )
 		return VERDICT_UNKNOWN;
 
 	engine->last_msg_counter_timeout   = message->counter;
