@@ -1,0 +1,14 @@
+<beginning>
+<!-- Test rule of check/check-timeout.sh: 'a NOT b', the verdict comes from the
+     timeout transition, carried by event_0 on a message that matches none of
+     the rule's events (via the per-message event-0 walk, not the bottom scan). -->
+<property value="NOT" delay_units="s" delay_min="0" delay_max="1" property_id="9101" type_property="ATTACK"
+          description="A UDP datagram to port 2000 that is not followed within 1 second by one to port 2001">
+    <event value="COMPUTE" event_id="1"
+           description="a: datagram to port 2000"
+           boolean_expression="(udp.dest_port == 2000)"/>
+    <event value="COMPUTE" event_id="2"
+           description="b: datagram to port 2001"
+           boolean_expression="(udp.dest_port == 2001)"/>
+</property>
+</beginning>

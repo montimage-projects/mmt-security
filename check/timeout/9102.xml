@@ -1,0 +1,12 @@
+<beginning>
+<!-- Test rule of check/check-timeout.sh: 'a THEN b', b reports only in time. -->
+<property value="THEN" delay_units="s" delay_min="0" delay_max="1" property_id="9102" type_property="ATTACK"
+          description="A UDP datagram to port 2100 followed within 1 second by one to port 2101">
+    <event value="COMPUTE" event_id="1"
+           description="a: datagram to port 2100"
+           boolean_expression="(udp.dest_port == 2100)"/>
+    <event value="COMPUTE" event_id="2"
+           description="b: datagram to port 2101"
+           boolean_expression="(udp.dest_port == 2101)"/>
+</property>
+</beginning>

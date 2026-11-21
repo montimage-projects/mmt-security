@@ -1,7 +1,20 @@
 <beginning>
-<!-- Detection Rule 206: Detect invalid DICOM data set type (not 0x0001 or 0x0101) -->
+<!-- Detection Rule 206: Detect invalid DICOM data set type (not 0x0001 or 0x0101)
+
+     DISABLED: kept in rules/properties_all only, not in rules/ (the official rules),
+     because it alerts on normal traffic (fork issue #27). Its premise is wrong: in
+     Command Data Set Type (0000,0800), 0x0101 means that no data set follows and any
+     other value means that one does (PS3.7 E.1); 0x0001 has no special meaning. So
+     every C-STORE, C-FIND, C-GET and C-MOVE request, and every pending C-FIND
+     response, matches. It also reads dicom.data_set_type, which mmt-dpi finds by
+     searching the packet bytes for the tag, not by walking the command set.
+
+     A meaningful check would be a data set type that contradicts the command field
+     (e.g., a C-ECHO-RQ or a C-CANCEL-RQ that announces a data set, or a C-STORE-RQ
+     that announces none). That needs the DIMSE command set walker to read (0000,0800)
+     and is left to a follow-up. -->
 <property property_id="206" type_property="ATTACK"
-     description="Detect invalid DICOM data set type">
+     description="Disabled (in rules/properties_all only): detect invalid DICOM data set type. Its premise is wrong: any Command Data Set Type other than 0x0101 means a data set is present (PS3.7 E.1), so it alerts on every C-STORE and C-FIND request (fork issue #27)">
     <event description="DICOM command PDV with invalid data_set_type"
         boolean_expression="((ip.src != 0) &amp;&amp; (dicom.pdu_type == 4) &amp;&amp; (dicom.data_set_type != 1) &amp;&amp; (dicom.data_set_type != 257))"/>
 </property>
