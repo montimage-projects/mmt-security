@@ -94,15 +94,19 @@ size_t free_message_ts( message_t *msg, uint16_t size ){
 
 	mmt_memory_t *mem = mmt_mem_revert( msg );
 
-	//free message only when there is no more reference to it
-	if( mem->ref_count <= size ){
-		mmt_mem_force_free( msg );
+	//free message only when there is no more reference to it:
+	//read ref_count and decrement atomically, so two threads dropping the
+	//last references cannot both see "ref_count <= size" and both free
+	ret = __sync_fetch_and_sub( &mem->ref_count, size );
+
+	if( ret <= size ){
+		//ref_count was not yet 0: we dropped the last references => free once
+		if( ret != 0 )
+			mmt_mem_force_free( msg );
 		return 0;
 	}
 
-	ret = __sync_sub_and_fetch( &mem->ref_count, size );
-
-	return ret;
+	return ret - size;
 }
 
 

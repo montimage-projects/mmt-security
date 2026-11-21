@@ -58,9 +58,11 @@ typedef struct lock_free_spsc_ring_struct
 #undef atomic_store_explicit
 #endif
 
-#define atomic_load_explicit( x, y )    __sync_fetch_and_add( x, 0 )
-#define atomic_store_explicit( x, y, z) __sync_lock_test_and_set( x, y)
-//#define atomic_store_explicit( x, y, z) __sync_synchronize( *x = y )
+//real atomic load/store honouring the memory order: __sync_lock_test_and_set
+//compiles to an acquire-only swap on aarch64, so a release store via it could
+//be reordered after q->_data[] writes and the consumer could pop a stale slot
+#define atomic_load_explicit( x, y )    __atomic_load_n( x, y )
+#define atomic_store_explicit( x, y, z) __atomic_store_n( x, y, z )
 /**
  * Create a circular buffer. This is thread-safe only in when there is one
  * producer and one consumer that are 2 different threads.
@@ -128,7 +130,7 @@ static inline int  ring_push_burst( lock_free_spsc_ring_t *q, size_t count, void
 
 	//not full
 	for( i = 0; i<count && ((h + i + 1) % q->_size != q->_cached_tail); i++ )
-		q->_data[ h + i ] = array[ i ];
+		q->_data[ (h + i) % q->_size ] = array[ i ];
 
 	atomic_store_explicit( &q->_head, (h + i) % q->_size, memory_order_release );
 

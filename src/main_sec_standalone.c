@@ -549,6 +549,14 @@ void signal_handler_seg(int signal_type) {
 	exit( signal_type );
 }
 
+//set by the signal handler: the main loop checks it and then calls
+//termination() on the main thread. Doing the whole termination in the
+//handler is not safe: when the signal lands on a worker thread (7 chances
+//out of 8 with -c 1-8), the handler would run mmt_smp_sec_process( NULL )
+//to insert the NULL markers itself, spinning on the ring of the very
+//thread that is suspended inside the handler - the consumer of that ring.
+static volatile sig_atomic_t is_interrupted = 0;
+
 void signal_handler(int signal_type) {
 	static volatile int times_counter = 0;
 
@@ -561,8 +569,10 @@ void signal_handler(int signal_type) {
 		mmt_error("Releasing resource ... (press Ctrl+c again to exit immediately)");
 		signal(SIGINT, signal_handler);
 	}
-	termination();
-	exit( signal_type );
+
+	is_interrupted = 1;
+	if( pcap != NULL )
+		pcap_breakloop( pcap );
 }
 
 
@@ -650,7 +660,7 @@ int main(int argc, char** argv) {
 			mmt_halt("pcap_open failed for the following reason: %s\n", errbuf);
 		}
 
-		while ((data = pcap_next(pcap, &p_pkthdr)) ) {
+		while ((data = pcap_next(pcap, &p_pkthdr)) && !is_interrupted ) {
 			//allow user to add/rm rules
 			_add_or_remove_rules_if_need();
 

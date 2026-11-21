@@ -454,6 +454,17 @@ check-rule-hooks:
 check: check-syn-flood-rules
 check-syn-flood-rules: _prepare
 	@./check/check-syn-flood-rules.sh ./$(MAIN_STAND_ALONE)
+
+# SMP mode of mmt_sec_standalone: bounded -c runs, SIGTERM stops a run (fork #31)
+check: check-smp
+check-smp: _prepare
+	@./check/check-smp.sh ./$(MAIN_STAND_ALONE)
+
+# SMP workers of mmt_sec_server: SIGTERM must stop the parent and a forked
+# child mid-stream, not deadlock in the signal handler (fork #31)
+check: check-smp-server
+check-smp-server: _prepare sec_server rule_info
+	@./check/check-smp-server.sh ./$(MAIN_SEC_SERVER)
 	
 _csv.%: _prepare
 	$(QUIET) $(RM) /tmp/mmt-security*.csv
