@@ -454,6 +454,11 @@ check-rule-hooks:
 check: check-syn-flood-rules
 check-syn-flood-rules: _prepare
 	@./check/check-syn-flood-rules.sh ./$(MAIN_STAND_ALONE)
+
+# NOT/THEN timeout verdict path of the rule verification engine (fork #31)
+check: check-timeout
+check-timeout: _prepare
+	@./check/check-timeout.sh ./$(MAIN_GEN_PLUGIN) ./$(MAIN_STAND_ALONE)
 	
 _csv.%: _prepare
 	$(QUIET) $(RM) /tmp/mmt-security*.csv
