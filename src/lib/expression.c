@@ -738,19 +738,159 @@ static inline bool _is_string_variable( const operation_t *opt ){
 	return YES;
 }
 
+/**
+ * Whether an operand of a comparison is provably a number: a numeric variable
+ * or constant, or an operation other than a function — an arithmetic (+ - * /),
+ * comparison or boolean operation gives a number. The return type of an
+ * embedded function is not known here, so a function does not decide.
+ */
+static inline bool _is_numeric_operand( const expression_t *expr ){
+	switch( expr->type ){
+	case VARIABLE: return expr->variable->data_type != MMT_SEC_MSG_DATA_TYPE_STRING;
+	case CONSTANT: return expr->constant->data_type != MMT_SEC_MSG_DATA_TYPE_STRING;
+	case OPERATION: return expr->operation->operator != FUNCTION;
+	}
+	return NO;
+}
+
+/**
+ * Whether an operand of a comparison is provably a string.
+ */
+static inline bool _is_string_operand( const expression_t *expr ){
+	return ( expr->type == VARIABLE && expr->variable->data_type == MMT_SEC_MSG_DATA_TYPE_STRING )
+		|| ( expr->type == CONSTANT && expr->constant->data_type == MMT_SEC_MSG_DATA_TYPE_STRING );
+}
+
+/**
+ * Whether a comparison compares strings: no parameter is numeric.
+ * A parameter is numeric when it is a numeric variable or constant, or an
+ * operation other than a function: an arithmetic (+ - * /), comparison or
+ * boolean operation gives a number. The return type of an embedded function
+ * is not known here, so a function does not decide.
+ */
 static inline bool _is_string_param( const operation_t *opt ){
 	link_node_t *ptr;
-	expression_t *expr;
 	ptr = opt->params_list;
 	while( ptr != NULL ){
-		expr = (expression_t *) ptr->data;
-		if( expr->type == VARIABLE && expr->variable->data_type != MMT_SEC_MSG_DATA_TYPE_STRING )
-			return NO;
-		if( expr->type == CONSTANT && expr->variable->data_type != MMT_SEC_MSG_DATA_TYPE_STRING )
+		if( _is_numeric_operand( (expression_t *) ptr->data ) )
 			return NO;
 		ptr = ptr->next;
 	}
 	return YES;
+}
+
+/**
+ * Write an expression as it is written in a rule (proto.att, 'string', a
+ * number, (a < b), #fn(a, b)) into str: for the error of _check_a_comparison.
+ * - Return: the size of the result
+ */
+static size_t _expr_to_rule_string( char *str, size_t str_size, const expression_t *expr ){
+	size_t index = 0;
+	link_node_t *node;
+	if( expr == NULL ) return 0;
+	switch( expr->type ){
+	case VARIABLE:
+		if( expr->variable->ref_index == (uint16_t) UNKNOWN )
+			index = snprintf( str, str_size, "%s.%s", expr->variable->proto, expr->variable->att );
+		else
+			index = snprintf( str, str_size, "%s.%s.%d", expr->variable->proto, expr->variable->att, expr->variable->ref_index );
+		break;
+	case CONSTANT:
+		if( expr->constant->data_type == MMT_SEC_MSG_DATA_TYPE_NUMERIC )
+			index = snprintf( str, str_size, "%g", *(double *) expr->constant->data );
+		else
+			index = snprintf( str, str_size, "'%s'", (char *) expr->constant->data );
+		break;
+	case OPERATION:
+		if( expr->operation->operator == FUNCTION ){
+			index += snprintf( str + index, str_size - (index < str_size ? index : str_size), "#%s(", expr->operation->name );
+			for( node = expr->operation->params_list; node != NULL; node = node->next ){
+				index += _expr_to_rule_string( str + index, str_size - (index < str_size ? index : str_size), (expression_t *) node->data );
+				index += snprintf( str + index, str_size - (index < str_size ? index : str_size), node->next == NULL ? ")" : ", " );
+			}
+		}else{
+			index += snprintf( str + index, str_size - (index < str_size ? index : str_size), "(" );
+			for( node = expr->operation->params_list; node != NULL; node = node->next ){
+				index += _expr_to_rule_string( str + index, str_size - (index < str_size ? index : str_size), (expression_t *) node->data );
+				index += snprintf( str + index, str_size - (index < str_size ? index : str_size), node->next == NULL ? ")" : " %s ", expr->operation->name );
+			}
+		}
+		break;
+	}
+	return index;
+}
+
+/**
+ * A comparison may not compare a provably string operand with a provably
+ * numeric one (see _is_string_operand and _is_numeric_operand): it used to
+ * compile to C code that compares a pointer with a number, with a garbage
+ * result, so the rule is refused instead. An embedded function stays
+ * undecided and never triggers this error.
+ * The one exception is "proto.att == 0" and "proto.att != 0" against a
+ * string attribute: the presence test of the attribute, e.g., "(ip.src != 0)"
+ * of the DICOM rules.
+ */
+static void _check_a_comparison( const expression_t *expr, uint32_t rule_id, uint16_t event_id ){
+	link_node_t *node;
+	const expression_t *param;
+	bool has_string = NO, has_number = NO, number_is_zero = YES;
+	char str[ MAX_STR_SIZE ];
+
+	for( node = expr->operation->params_list; node != NULL; node = node->next ){
+		param = (expression_t *) node->data;
+		if( _is_string_operand( param ) )
+			has_string = YES;
+		else if( _is_numeric_operand( param ) ){
+			has_number = YES;
+			if( param->type != CONSTANT || *(double *) param->constant->data != 0 )
+				number_is_zero = NO;
+		}
+	}
+	if( ! has_string || ! has_number )
+		return;
+	if( ( expr->operation->operator == EQ || expr->operation->operator == NEQ ) && number_is_zero )
+		return;
+	_expr_to_rule_string( str, sizeof( str ), expr );
+	mmt_halt( "Error in rule %d, event %d: cannot compare a string with a number: %s",
+			rule_id, event_id, str );
+}
+
+static void _check_comparisons_types( const expression_t *expr, uint32_t rule_id, uint16_t event_id ){
+	link_node_t *node;
+	if( expr == NULL || expr->type != OPERATION )
+		return;
+	if( _is_comparison_operator( expr->operation->operator ) )
+		_check_a_comparison( expr, rule_id, event_id );
+	//a comparison may be nested, e.g., inside && or a function
+	for( node = expr->operation->params_list; node != NULL; node = node->next )
+		_check_comparisons_types( (expression_t *) node->data, rule_id, event_id );
+}
+
+/**
+ * Public API
+ */
+void expr_assert_comparison_types( const expression_t *expr, uint32_t rule_id, uint16_t event_id ){
+	_check_comparisons_types( expr, rule_id, event_id );
+}
+
+/**
+ * The operator that gives the same result with its two operands swapped:
+ * "a < b" is "b > a". A string comparison is written "0 OP cmp(a, b)", that is
+ * "cmp(a, b) OP' 0", and "a < b" means "cmp(a, b) < 0", i.e. "0 > cmp(a, b)".
+ */
+static inline const char *_swapped_comparison_operator( int op ){
+	switch( op ){
+	case GT:  return "<";
+	case GTE: return "<=";
+	case LT:  return ">";
+	case LTE: return ">=";
+	case EQ:  return "==";
+	case NEQ: return "!=";
+	default:
+		//guarded by _is_comparison_operator: abort rather than emit a "?" that would silently compile
+		mmt_halt( "Error: %d is not a comparison operator", op );
+		return "?"; //not reached
+	}
 }
 /**
  * Public API
@@ -763,11 +903,12 @@ size_t expr_stringify_operation( char **string, operation_t *opt ){
 	expression_t *expr;
 
 	char str[ MAX_STR_SIZE ];
-	//change comparison of string to function: "a" == "b" ==> 0 == strcmp("a", "b")
+	//change comparison of string to function: "a" == "b" ==> 0 == strcmp("a", "b"),
+	// "a" < "b" ==> 0 > strcmp("a", "b")
 	if( _is_comparison_operator( opt->operator ) && _is_string_param ( opt ) ){
 		//delimiter
 		delim = ",";
-		index += snprintf( &str[ index ], MAX_STR_SIZE, "0 %s %s(", opt->name,
+		index += snprintf( &str[ index ], MAX_STR_SIZE, "0 %s %s(", _swapped_comparison_operator( opt->operator ),
 				_is_string_variable( opt) ? "mmt_mem_cmp" : "strcmp" );
 	}else if( opt->operator == FUNCTION ){
 		delim = ",";

@@ -1,0 +1,13 @@
+<beginning>
+<!-- Test rule of check/check-expressions.sh: http.method &lt; (udp.len - 8) -->
+<!-- expect-error: cannot compare a string with a number: (http.method < (udp.len - 8)) -->
+<property value="THEN" delay_units="s" delay_min="0" delay_max="0" property_id="9022" type_property="TEST"
+    description="http.method &lt; (udp.len - 8)">
+    <event value="COMPUTE" event_id="1"
+           description="http.method &lt; (udp.len - 8)"
+           boolean_expression="(http.method &lt; (udp.len - 8))"/>
+    <event value="COMPUTE" event_id="2"
+           description="Same packet"
+           boolean_expression="(ip.src != ip.dst)"/>
+</property>
+</beginning>

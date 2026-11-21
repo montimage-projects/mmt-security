@@ -450,6 +450,11 @@ check-dicom-blocks:
 check-rule-hooks:
 	@./check/check-rule-hooks.sh
 
+# the comparisons that compile_rule generates: numeric operations, strings (fork #31)
+check: check-expressions
+check-expressions: _prepare
+	@./check/check-expressions.sh ./$(MAIN_GEN_PLUGIN) ./$(MAIN_STAND_ALONE)
+
 # rules 56 and 57: environment variables, cost of a fast flood, threads
 check: check-syn-flood-rules
 check-syn-flood-rules: _prepare

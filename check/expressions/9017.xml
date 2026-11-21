@@ -1,0 +1,17 @@
+<beginning>
+<!-- Test rule of check/check-expressions.sh: string: http.method < http.user_agent -->
+<!-- var OP var compares with mmt_mem_cmp: the data size first, then memcmp
+     (src/lib/mmt_alloc.h). The pcap pins that order against strcmp's: PUT (3)
+     < "AAAA" (4) alerts though strcmp("PUT", "AAAA") > 0, DELETE (6) > "a" (1)
+     does not alert though strcmp("DELETE", "a") < 0, and OPTIONS alerts on
+     the memcmp of "OPTIONS" and "zzzzzzz", two 7-byte strings. -->
+<property value="THEN" delay_units="s" delay_min="0" delay_max="0" property_id="9017" type_property="TEST"
+    description="string: http.method &lt; http.user_agent">
+    <event value="COMPUTE" event_id="1"
+           description="string: http.method &lt; http.user_agent"
+           boolean_expression="(http.method &lt; http.user_agent)"/>
+    <event value="COMPUTE" event_id="2"
+           description="Same packet"
+           boolean_expression="(ip.src != ip.dst)"/>
+</property>
+</beginning>

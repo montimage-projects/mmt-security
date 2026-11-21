@@ -331,6 +331,27 @@ about 9,900 bytes with an error, instead of truncating it.
 installed mmt-dpi (`dpi.installed`, `ids_match_installed` and `plugins` are then
 `null`).
 
+## 4.4 Comparisons in a boolean expression
+
+A comparison (`==`, `!=`, `<`, `<=`, `>`, `>=`) compares two numbers or two
+strings:
+
+- two numbers compare as numbers, including arithmetic, e.g.,
+  `(udp.dest_port - udp.src_port) < (udp.len - 8)`;
+- two strings: when every operand is a string attribute, e.g.,
+  `http.method < http.user_agent`, the order is the one of `mmt_mem_cmp` —
+  **the data size first, then `memcmp`** — so `DELETE` (6) `> a` (1) here
+  though `strcmp` would say `<`. Otherwise — a string constant or an
+  embedded function — the order is the lexicographic one of `strcmp`, e.g.,
+  `http.method < 'HEAD'`;
+- a string with a number is an error: `compile_rule` refuses the rule, e.g.,
+  `(http.method < 5)` or `(http.method < (udp.len - 8))`. The one exception is
+  `proto.att == 0` and `proto.att != 0` on a string attribute: the presence
+  test of the attribute, e.g., `(ip.src != 0)`;
+- the return type of an embedded `#function` is not known to `compile_rule`:
+  it decides nothing, so a function call is compared as a string unless
+  another operand is a number, e.g., `(#is_exist(dicom.pdu_type) >= 0)`.
+
 # 5. Default values
 
 In the XML file of a rule, if an attribute is absent then its value is set by default:
