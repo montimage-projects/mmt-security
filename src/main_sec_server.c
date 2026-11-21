@@ -48,10 +48,13 @@ static bool verbose                     = NO;
 static mmt_sec_handler_t *sec_handler   = NULL;
 static size_t proto_atts_count          = 0;
 const proto_attribute_t *const *proto_atts    = NULL;
-//id of socket
-static int socket_server                = 0;
-
-static pid_t parent_pid = 0;
+//id of the listening socket of the parent
+static int socket_server                = -1;
+//id of the connected socket of the child serving it (-1 in the parent)
+static int socket_client                = -1;
+//set by the signal handler: the accept loop of the parent and the read loop
+//of each child then stop and run termination() on their own thread
+static volatile sig_atomic_t is_interrupted = 0;
 
 static char output_file_string[MAX_FILENAME_SIZE + 1]  = {0};
 static char output_redis_string[MAX_FILENAME_SIZE + 1] = {0};
@@ -170,7 +173,8 @@ static inline int _get_dpi_data_type( uint32_t proto_id, uint32_t att_id ){
  *  then passes it to #mmt_security
  */
 static inline size_t receiving_reports( int sock ) {
-	size_t index, n;
+	size_t index;
+	ssize_t n;
 	uint8_t buffer[ REPORT_SIZE ], *buf_ptr; //utf-8
 
 	uint32_t length_of_report = 0;
@@ -182,13 +186,13 @@ static inline size_t receiving_reports( int sock ) {
 	size_t elements_count;
 
 	reports_count = 0;
-	while( 1 ){
+	while( ! is_interrupted ){
 
 		//Read 4 bytes first to know the length of the report
 		n = recv( sock, &length_of_report, 4, MSG_WAITALL );
 
-		//end of socket flow
-		if ( unlikely( n == 0 ))	break;
+		//end of socket flow, or the socket was shut down by the signal handler
+		if ( unlikely( n <= 0 ))	break;
 
 		if( unlikely( length_of_report > REPORT_SIZE )){
 			mmt_warn("Overflow: length_of_report = %d", length_of_report );
@@ -197,8 +201,11 @@ static inline size_t receiving_reports( int sock ) {
 
 		n = recv( sock, buffer, length_of_report-4, MSG_WAITALL );
 
-		if( unlikely( n == 0 ))
-			mmt_halt( "Error: Cannot read data of report having size = %d", length_of_report );
+		if( unlikely( n <= 0 )){
+			if( ! is_interrupted )
+				mmt_halt( "Error: Cannot read data of report having size = %d", length_of_report );
+			break;
+		}
 
 		index = 0;
 
@@ -288,53 +295,44 @@ void signal_handler_seg(int signal_type) {
 	exit( signal_type );
 }
 
+//The handler only sets is_interrupted and wakes the accept/recv loops: the
+//whole termination - mmt_smp_sec_process( NULL ) to insert the NULL markers
+//then pthread_join of the workers - used to run inside it, which is not
+//async-signal-safe and deadlocked when the signal landed on a worker thread
+//of a child (the handler spins on the ring whose consumer is suspended in
+//the handler, or joins itself). termination() now runs on the main thread of
+//the parent and of each child, which notice is_interrupted in their loops
+//(Montimage fork #31, E3).
 void signal_handler(int signal_type) {
 	static volatile int times_counter = 0;
-	size_t alerts_count;
-	pid_t pid = getpid();
-	int status;
 
-	close( socket_server );
-
+	//a second signal exits immediately (e.g. Ctrl+c twice)
 	if( times_counter >= 1 ) exit( signal_type );
 	times_counter ++;
 
-	if( pid == parent_pid )
-		mmt_error( "Interrupted proc %d by signal %d", pid, signal_type );
-
-	if( signal_type == SIGINT ){
-		if( pid == parent_pid )
-			mmt_error("Releasing resource ... (press Ctrl+c again to exit immediately)");
-
-		signal(SIGINT, signal_handler);
-	}
-	sleep( 1 );//waiting for everything finish
-	alerts_count = termination();
-
-	//print only for child process
-	if( verbose && parent_pid != pid ){
-		gettimeofday( &end_time, NULL );
-		mmt_info( "%3zuth connection sent %9zu reports, in %7.2fs, generated %9zu alerts",
-				clients_count, reports_count, time_diff( start_time, end_time ), alerts_count
-		);
-
-		//mmt_info("Process %d generated %zu alerts", pid, alerts_count );
-	}
-
-	//parent waits for all children
-	if( parent_pid == pid ) wait( &status );
-
-	exit( signal_type );
+	is_interrupted = 1;
+	//async-signal-safe wakeups: shutdown() unblocks a recv() blocked in
+	//another thread; on the thread that ran the handler, accept() and recv()
+	//also return EINTR as register_signals() does not set SA_RESTART
+	if( socket_server >= 0 )
+		shutdown( socket_server, SHUT_RDWR );
+	if( socket_client >= 0 )
+		shutdown( socket_client, SHUT_RDWR );
 }
 
 
 void register_signals(){
+	struct sigaction sa;
 #ifndef DEBUG_MODE
 	signal(SIGSEGV, signal_handler_seg );
 #endif
-	signal(SIGINT,  signal_handler);
-	signal(SIGTERM, signal_handler);
-	signal(SIGABRT, signal_handler);
+	//no SA_RESTART: a signal interrupts the accept() of the parent and the
+	//recv() of a child, so each notices is_interrupted on its main thread
+	memset( &sa, 0, sizeof( sa ));
+	sa.sa_handler = signal_handler;
+	sigaction( SIGINT,  &sa, NULL );
+	sigaction( SIGTERM, &sa, NULL );
+	sigaction( SIGABRT, &sa, NULL );
 }
 
 
@@ -360,8 +358,6 @@ int main( int argc, char** argv ) {
 	mmt_sec_callback _print_output;
 
 	char rule_mask[ MAX_RULE_MASK_SIZE ], excluded_rules_mask[ MAX_RULE_MASK_SIZE ];
-
-	parent_pid = getpid();
 
 	parse_options(argc, argv, &port_number, un_domain_name, &threads_count,
 			&cores_count, &core_mask, excluded_rules_mask, rule_mask, &verbose );
@@ -440,15 +436,19 @@ int main( int argc, char** argv ) {
 	//ignore child fate, don't let it become zombie
 	signal( SIGCHLD, SIG_IGN );
 
-	//this loop will be broken by Ctrl+c
-	while( 1 ) {
+	//this loop is broken by is_interrupted (Ctrl+c)
+	while( ! is_interrupted ) {
 			//accept: wait for a connection request
 		if( is_unix_socket == NO )
 			client_socket = accept( socket_server, (struct sockaddr *) &in_cli_addr, &socklen );
 		else //unix socket
 			client_socket = accept( socket_server, (struct sockaddr *) &un_cli_addr, &socklen );
 
-		if( client_socket < 0 ) mmt_halt("Error on accept");
+		if( client_socket < 0 ){
+			if( is_interrupted )
+				break;
+			mmt_halt("Error on accept");
+		}
 
 		if( core_mask )
 			core_mask_ptr = &core_mask[ clients_count * threads_count % cores_count ];
@@ -469,6 +469,8 @@ int main( int argc, char** argv ) {
 
 			// child doesn't need the listener
 			close( socket_server );
+			socket_server = -1;
+			socket_client = client_socket;
 
 			if( verbose ){
 				//convert client's IP to readable text
@@ -513,6 +515,7 @@ int main( int argc, char** argv ) {
 			size = receiving_reports( client_socket );
 
 			close( client_socket );
+			socket_client = -1;
 
 			//finish
 			alerts_count = termination();
@@ -542,6 +545,9 @@ int main( int argc, char** argv ) {
 			close( client_socket );
 		}
 	}
+
+	if( is_interrupted )
+		mmt_error( "Interrupted proc %d - releasing resource ... (press Ctrl+c again to exit immediately)", (int) getpid() );
 
 	termination();
 
