@@ -7,6 +7,7 @@
 - CI builds and checks against MMT-DPI v1.10.3 (was 6b1c9f5, v1.7.10 plus 36 commits); v1.10.0 to v1.10.2 lose the TCP payload of reassembled IPv4 fragments, so `make check` 19.SQLI fails with them (Montimage/mmt-security#18)
 - rules 230 and 231 (in rules/properties_all) for OCPP 1.6-J: Heartbeat flooding and SetChargingProfile limit above the site maximum; they need the OCPP 1.6-J protocol plugin of mmt-plugin-generator (doc/rule.md, section 7); their alerts carry ip.src, ip.dst, tcp.src_port and tcp.dest_port
 - packaging: the deb (`make deb`) now depends on `mmt-dpi (>= 1.10.3)`, which it did not before, and the rpm (`make rpm`) requires `mmt-dpi >= 1.10.3` (was 1.6.9). The DICOM rules need MMT-DPI 1.9.0 or later, which bounds `tcp.payload_len` by the captured bytes; 1.10.3 is the release CI tests. The version is `MIN_DPI_VERSION` in the Makefile
+- rules 206 (invalid DICOM data set type) and 212 (unexpected DICOM C-CANCEL) are disabled: they are moved out of rules/ and kept in rules/properties_all, because they alert on normal traffic. Any Command Data Set Type other than 0x0101 means a data set is present (PS3.7 E.1), so 206 alerted on every C-STORE and C-FIND request; C-CANCEL is a standard DIMSE operation, so 212 alerted on every cancelled query. They are no longer in the deb and rpm packages (fork issue #27)
 
 # Version 1.2.20 (05 Nov 2026)
 - fixed bugs

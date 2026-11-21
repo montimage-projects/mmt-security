@@ -1,7 +1,17 @@
 <beginning>
-<!-- Detection Rule 212: Detect unexpected C-CANCEL command (0x0FFF = 4095) -->
+<!-- Detection Rule 212: Detect unexpected C-CANCEL command (0x0FFF = 4095)
+
+     DISABLED: kept in rules/properties_all only, not in rules/ (the official rules),
+     because it alerts on normal traffic (fork issue #27). C-CANCEL-RQ is a standard
+     DIMSE operation (PS3.7 9.3.2.3, 9.3.3.3, 9.3.4.3): an SCU sends it to stop a
+     C-FIND, C-GET or C-MOVE it started, so the rule alerts once per cancelled query.
+
+     A C-CANCEL would be unexpected only when no request with its Message ID Being
+     Responded To (0000,0120) is outstanding on that association. The rule matches a
+     single packet and the DIMSE walker keeps no per-association state, so it cannot
+     tell; that is left to a follow-up. -->
 <property property_id="212" type_property="ATTACK"
-     description="Detect unexpected DICOM C-CANCEL command">
+     description="Disabled (in rules/properties_all only): detect unexpected DICOM C-CANCEL command. C-CANCEL is a standard DIMSE operation that cancels a C-FIND, C-GET or C-MOVE (PS3.7), so it alerts once per cancelled query (fork issue #27)">
     <event description="DICOM command PDV with C-CANCEL (0x0FFF)"
         boolean_expression="((ip.src != 0) &amp;&amp; (dicom.pdu_type == 4) &amp;&amp; (dicom.command_field == 4095))"/>
 </property>

@@ -22,9 +22,9 @@ of these rules share (`blocks/`).
 
 The expected files list only the alerts of the DICOM rules each capture tests
 (200, 201, 202, 208, 209, 213, 216, 219, 220, 221, 223, 224, 226, 227, 228), so
-`make check` also fails when one of them alerts on the benign sessions. The
-benign sessions still raise alerts of other DICOM rules (206, 212), which the
-expected files leave out.
+`make check` also fails when one of them alerts on the benign sessions. Rules
+206 and 212, which alerted on these benign sessions, are disabled: they are in
+`rules/properties_all` only (fork issue #27).
 
 3. The PDU boundary tracker and the rate rules, crafted with scapy (fork PR #15
    follow-up):

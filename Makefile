@@ -455,6 +455,11 @@ check: check-syn-flood-rules
 check-syn-flood-rules: _prepare
 	@./check/check-syn-flood-rules.sh ./$(MAIN_STAND_ALONE)
 
+# NOT/THEN timeout verdict path of the rule verification engine (fork #31)
+check: check-timeout
+check-timeout: _prepare
+	@./check/check-timeout.sh ./$(MAIN_GEN_PLUGIN) ./$(MAIN_STAND_ALONE)
+
 # SMP mode of mmt_sec_standalone: bounded -c runs, SIGTERM stops a run (fork #31)
 check: check-smp
 check-smp: _prepare
