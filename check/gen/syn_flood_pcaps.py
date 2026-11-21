@@ -32,10 +32,13 @@ under 100 KB, so the packets are minimal Ethernet + IPv4 + TCP headers.
 - 56.crafted_servers_attack.pcap: the same flood, plus an attack on rule 56's
   server table with servers crafted for the unseeded hash (seed 0) to share the
   victim's 8 probed slots: 8 of them get 3 spoofed SYN-ACKs each at t=0 (their
-  alerts then wait for ever, nothing is sent to them), and after each half-open
+  alerts then wait; nothing is sent to them), and after each half-open
   handshake of the victim, a new one sends a SYN-ACK that its client resets.
-  With the unseeded hash, each new server evicts the victim, which never
-  reaches 3 half-open handshakes: 0 alerts. With any other seed
+  With the unseeded hash, each new server used to evict the victim, which never
+  reached 3 half-open handshakes; now the pending alerts of the crafted
+  servers expire 2 s after they are raised, their slots become evictable, and
+  the victim is reported (check-syn-flood-rules.sh verifies this with
+  MMT_SEC_SYN_FLOOD_HASH_SEED=0). With any other seed
   (check/pcap/56.crafted_servers_attack.env), rule 56 must report the victim 3
   times, as in the control.
 - 57.syn_flood_flush_lowcount.pcap: 120 SYN/s for 1 s to 192.168.1.10:80, and
