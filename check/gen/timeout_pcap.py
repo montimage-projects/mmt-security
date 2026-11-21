@@ -8,21 +8,21 @@ UDP datagrams only (the test rules match on udp.dest_port):
 
 - t=0.0    port 2000: event a of rule 9101 (a NOT b within 1 s). The instance
            waits for b; its deadline is t=1.0.
-- t=0.5    port 3000: unrelated traffic. A timeout scan runs but the deadline
-           has not passed: no verdict.
-- t=2.5    port 3000: unrelated traffic. A scan runs, the deadline has passed:
-           the timeout transition fires and rule 9101 reports, on a packet
-           that matches none of its events.
+- t=0.5    port 3000: unrelated traffic. The per-message timeout walk runs
+           but the deadline has not passed: no verdict.
+- t=2.5    port 3000: unrelated traffic. The deadline has passed: the
+           timeout transition fires and rule 9101 reports, carried by
+           event_0 on a packet that matches none of its events.
 - t=5.0    port 2000: event a again (new instance of 9101).
 - t=5.5    port 2001: b, in time (< 1 s): the instance fails silently.
-- t=8.0    port 3000: unrelated traffic; a scan runs, nothing to report.
+- t=8.0    port 3000: unrelated traffic; nothing to report.
 - t=10.0   port 2100: event a of rule 9102 (a THEN b within 1 s).
 - t=10.5   port 2101: b in time: rule 9102 reports on this packet.
 - t=15.0   port 2100: event a of 9102 again.
 - t=15.5   port 3000: unrelated traffic.
 - t=16.5   port 2101: b, but too late (> 1 s): the instance timed out, no alert.
 
-Expected: one alert of rule 9101 whose event_2 is the t=2.5 timeout message
+Expected: one alert of rule 9101 whose event_0 is the t=2.5 timeout message
 (about 2.5 s after event_1), and one alert of rule 9102 at t=10.5.
 """
 import sys

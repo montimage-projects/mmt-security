@@ -1,16 +1,26 @@
 #!/usr/bin/env bash
-# Checks of the timeout scan of _process_multi_packets() (Montimage fork #31,
-# E2), run by `make check`. The test rules check/timeout/*.xml are compiled
-# into a temporary rules/ folder (they are not installed) and run on
-# check/timeout/timeout.pcap (check/gen/timeout_pcap.py):
+# Checks of the NOT/THEN timeout verdict path of _process_multi_packets()
+# (Montimage fork #31, E2), run by `make check`. The test rules
+# check/timeout/*.xml are compiled into a temporary rules/ folder (they are
+# not installed) and run on check/timeout/timeout.pcap
+# (check/gen/timeout_pcap.py):
 #  - 9101 is "a NOT b within 1 s": its only path to a verdict is the timeout
-#    transition, so the alert must come from the scan, on the unrelated
-#    datagram of t=2.5 (event_2), about 2.5 s after event_1 at t=0. A second
+#    transition. The alert is carried by event_0 (the timeout event) on the
+#    unrelated datagram of t=2.5, about 2.5 s after event_1 at t=0. A second
 #    instance whose b arrives in time (t=5.5) must not alert.
 #  - 9102 is "a THEN b within 1 s": b in time (t=10.5) alerts; b that is late
 #    (t=16.5, after the 1 s deadline) must not.
 #
-# On main the timeout scan never runs, so rule 9101 never reports.
+# The FSM_EVENT_TYPE_TIMEOUT scan at the bottom of _process_multi_packets()
+# was dead code before the guard fix, but its work was already done by the
+# per-message event-0 walk: proto_atts_events[0] is always generated empty
+# (rule_verif_engine.c:437, gen_code.c:873), so the timeout list is walked
+# on every message that reaches the engine and black-box output is the same
+# with or without the scan. This check therefore passes on the pre-fix tree
+# too: it characterises the NOT/THEN timeout verdict path and catches a
+# change in which event carries the verdict; it is not a regression
+# detector for the guard, which can only be covered by white-box
+# instrumentation.
 #
 # Usage: check/check-timeout.sh [path/to/compile_rule] [path/to/mmt_sec_standalone]
 set -u
@@ -24,7 +34,7 @@ status=0
 fail(){ echo "  => FAILED: $*"; status=1; }
 
 echo
-echo "Testing the timeout scan of the rule verification engine"
+echo "Testing the timeout verdict path of the rule verification engine"
 mkdir "$TMP/rules" "$TMP/out"
 for xml in "$DIR"/*.xml; do
 	id=$(basename "$xml" .xml)
@@ -58,8 +68,12 @@ fi
 
 # rule 9102: the alert is on event_2, the datagram of t=10.5 that arrived in time
 t2=$(printf '%s\n' "$csv" | awk -F, '$5 == 9102' | grep -oE '"event_2":\{"timestamp":[0-9.]*' | grep -oE '[0-9.]*$')
-[ -n "$t2" ] && awk -v b="$t2" 'BEGIN{ exit !(b >= 1795200010 && b < 1795200011) }' \
-	|| [ -z "$t2" ] || fail "rule 9102: alert is on event_2 at $t2, expected the t=10.5 datagram"
+if [ -n "$t2" ]; then
+	awk -v b="$t2" 'BEGIN{ exit !(b >= 1795200010 && b < 1795200011) }' \
+		|| fail "rule 9102: alert is on event_2 at $t2, expected the t=10.5 datagram"
+else
+	[ "$n92" = 0 ] || fail "rule 9102: cannot read event_2 timestamp in the alert"
+fi
 
 [ $status -eq 0 ] && echo "  => OK"
 exit $status
