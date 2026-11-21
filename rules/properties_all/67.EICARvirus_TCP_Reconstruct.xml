@@ -3,26 +3,271 @@
 <beginning>
 <embedded_functions><![CDATA[
 //each function name should be prefixed by em_
+/*
+ * EICAR test file in the file reconstructed from a TCP stream
+ * (tcp.tcp_session_payload_up, which needs -R).
+ *
+ * MMT-DPI returns the whole reassembled stream of the flow on each of its
+ * packets, and the stream only grows. Searching it whole, on every packet,
+ * alerted once for each later packet of the flow (fork issue #22): the rule
+ * now keeps, for each flow, the number of bytes already searched, and each
+ * packet searches only the appended bytes plus the last NEEDLE_LEN - 1 old
+ * ones, so a string overlapping the boundary is not missed. One occurrence
+ * of the string alerts once: two occurrences far enough apart to complete in
+ * different packets alert twice; occurrences completing in the same packet
+ * share its alert.
+ *
+ * The searched offset of each flow is kept in a table of
+ * MMT_SEC_EICAR_FLOWS entries (environment variable, 1024 by default,
+ * 1048576 at most) of each mmt-security thread, keyed by the 4-tuple (the
+ * lower endpoint first, so the packets of both directions share it). A new
+ * flow replaces the least recently used entry of its set of E67_WAYS; the
+ * replaced flow is searched from its start again if it sends more data, so
+ * it can alert once more. The sets are a seeded hash of the key, so a sender
+ * cannot choose 4-tuples that collide with another flow; MMT_SEC_EICAR_SEED
+ * (environment variable) fixes the seed: for tests only. A stream shorter
+ * than the remembered offset is a new one on the same 4-tuple: it is
+ * searched from its start again. on_unload frees the tables of every thread.
+ *
+ * The key needs ip.src, ip.dst, tcp.src_port and tcp.dest_port of the
+ * packet, which the engine requires to be present to evaluate the event:
+ * the rule only sees the packets of IPv4 TCP flows, exactly the ones its
+ * second event covers.
+ */
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <ctype.h>
+#include "mmt_lib.h"
+#include <stdint.h>
+#include <pthread.h>
+#include <time.h>
+#include <sys/random.h>
+#include <errno.h>
+#include <inttypes.h>
+#define E67_RULE_ID   "67"
+#define E67_WAYS      4          //flows per set of the flow table of a thread
+#define E67_FLOWS     1024       //default flows per thread (env. MMT_SEC_EICAR_FLOWS)
+#define E67_MAX_FLOWS 1048576
+#define E67_KEY_LEN   12         //2 * (4-byte address + 2-byte port)
+static const char E67_NEEDLE[] = "EICAR-STANDARD-ANTIVIRUS-TEST-FILE";
+#define E67_NEEDLE_LEN (sizeof(E67_NEEDLE) - 1)
+
+//the searched offset of the "up" stream of one flow
+typedef struct e67_flow_struct{
+	bool     used;
+	uint64_t last_use;
+	uint8_t  key[E67_KEY_LEN]; //the two endpoints (address, port), the lower first
+	uint64_t scanned;          //bytes of the stream already searched
+}e67_flow_t;
+
+//the flows of one thread
+typedef struct e67_table_struct{
+	struct e67_table_struct *next;   //list of the tables of every thread
+	uint64_t  seed, clock;
+	uint32_t  sets;
+	e67_flow_t flows[];              //sets * E67_WAYS flows
+}e67_table_t;
+
+static __thread e67_table_t *e67_table  = NULL;
+static e67_table_t          *e67_tables = NULL;
+static pthread_mutex_t       e67_tables_lock = PTHREAD_MUTEX_INITIALIZER;
+//set by on_load, before any packet is read
+static uint32_t e67_sets = E67_FLOWS / E67_WAYS;
+static bool     e67_seed_fixed = false;
+static uint64_t e67_seed;
+
+/**
+ * Read the environment variable #name as a decimal integer in [#min, #max].
+ * Return false if it is not set, or, with a warning, if it is not valid.
+ */
+static inline bool e67_env_uint( const char *name, uint64_t min, uint64_t max, uint64_t *v ){
+	const char *str = getenv( name );
+	char *end;
+	unsigned long long x;
+	if( str == NULL )
+		return false;
+	errno = 0;
+	x = strtoull( str, &end, 10 );
+	if( !isdigit( (unsigned char)str[0] ) || *end != '\0' || errno != 0 || x < min || x > max ){
+		mmt_warn( "Rule %s: ignore %s=\"%s\": not an integer from %"PRIu64" to %"PRIu64", use the default",
+				E67_RULE_ID, name, str, min, max );
+		return false;
+	}
+	*v = x;
+	return true;
+}
+
+//the environment variables of the flow table; called by on_load
+static inline void e67_load_env( void ){
+	uint64_t v;
+	if( e67_env_uint( "MMT_SEC_EICAR_FLOWS", E67_WAYS, E67_MAX_FLOWS, &v )){
+		e67_sets = (uint32_t)((v + E67_WAYS - 1) / E67_WAYS);
+		mmt_info( "Rule %s: set MMT_SEC_EICAR_FLOWS=%"PRIu64": %u flows per thread",
+				E67_RULE_ID, v, e67_sets * E67_WAYS );
+	}
+	if( e67_env_uint( "MMT_SEC_EICAR_SEED", 0, UINT64_MAX, &v )){
+		e67_seed_fixed = true;
+		e67_seed       = v;
+		mmt_warn( "Rule %s: MMT_SEC_EICAR_SEED is set: the flow table is predictable (for tests only)", E67_RULE_ID );
+	}
+}
+
+static inline uint64_t e67_new_seed( const void *addr ){
+	uint64_t seed = 0;
+	struct timespec ts;
+	if( e67_seed_fixed )
+		return e67_seed;
+	if( getrandom( &seed, sizeof( seed ), GRND_NONBLOCK ) != (ssize_t)sizeof( seed )){
+		clock_gettime( CLOCK_REALTIME, &ts );
+		seed = ((uint64_t)ts.tv_sec << 32) ^ (uint64_t)ts.tv_nsec ^ (uint64_t)(uintptr_t)addr;
+	}
+	return seed;
+}
+
+//set of the flow #key: seeded FNV-1a, then the MurmurHash3 finaliser so that every bit counts
+static inline uint32_t e67_set_of( const e67_table_t *t, const uint8_t *key ){
+	uint64_t h = 14695981039346656037ull ^ t->seed;
+	int i;
+	for( i=0; i<E67_KEY_LEN; i++ )
+		h = (h ^ key[i]) * 1099511628211ull;
+	h ^= h >> 33;
+	h *= 0xff51afd7ed558ccdull;
+	h ^= h >> 33;
+	h *= 0xc4ceb9fe1a85ec53ull;
+	h ^= h >> 33;
+	return (uint32_t)(h % t->sets);
+}
+
+static inline e67_table_t *e67_get_table( void ){
+	e67_table_t *t = e67_table;
+	if( t != NULL )
+		return t;
+	t = calloc( 1, sizeof( e67_table_t ) + (size_t)e67_sets * E67_WAYS * sizeof( e67_flow_t ));
+	if( t == NULL )
+		return NULL;
+	t->sets = e67_sets;
+	t->seed = e67_new_seed( t );
+	pthread_mutex_lock( &e67_tables_lock );
+	t->next    = e67_tables;
+	e67_tables = t;
+	pthread_mutex_unlock( &e67_tables_lock );
+	e67_table = t;
+	return t;
+}
+
+/**
+ * The entry of the flow #key: a new one, or the least recently used one of
+ * its set that is then reset.
+ */
+static inline e67_flow_t *e67_get_flow( const uint8_t *key ){
+	e67_flow_t *set, *f, *victim = NULL;
+	e67_table_t *t = e67_get_table();
+	int i;
+	if( t == NULL )
+		return NULL;
+	set = &t->flows[ e67_set_of( t, key ) * E67_WAYS ];
+	for( i=0; i<E67_WAYS; i++ ){
+		f = &set[i];
+		if( f->used && memcmp( f->key, key, E67_KEY_LEN ) == 0 )
+			goto found;
+		//a free entry, else the least recently used one
+		if( victim == NULL || (victim->used && (!f->used || f->last_use < victim->last_use)) )
+			victim = f;
+	}
+	f = victim;
+	memset( f, 0, sizeof( *f ));
+	memcpy( f->key, key, E67_KEY_LEN );
+	f->used    = true;
+found:
+	f->last_use = ++ t->clock;
+	return f;
+}
+
+//free the flow tables of every thread; called by on_unload
+static inline void e67_free_tables( void ){
+	e67_table_t *t, *next;
+	pthread_mutex_lock( &e67_tables_lock );
+	for( t = e67_tables; t != NULL; t = next ){
+		next = t->next;
+		free( t );
+	}
+	e67_tables = NULL;
+	pthread_mutex_unlock( &e67_tables_lock );
+	e67_table = NULL;
+}
+
+/**
+ * The first occurrence of the EICAR test string in #p (#len bytes), or NULL.
+ */
+static inline const uint8_t *e67_find( const uint8_t *p, size_t len ){
+	size_t i;
+	if( len < E67_NEEDLE_LEN )
+		return NULL;
+	for( i = 0; i + E67_NEEDLE_LEN <= len; i++ )
+		if( p[i] == 'E' && memcmp( p + i, E67_NEEDLE, E67_NEEDLE_LEN ) == 0 )
+			return p + i;
+	return NULL;
+}
+
 /**
 * Return:
 * - 0: ok
 * - 1: invalid
 * - 2: NULL
 */
-static inline int em_check_eicar_virus_tcpstream(const char *stru){
-   // X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*
-   
-   const char* cu = stru; //up
-   while( *cu != '\0' ){
-      //if (*cu=='X' && cu[1]=='5' && cu[2]=='O' && cu[3]=='!' && cu[4]=='P'){
-      if (*cu=='E' && cu[1]=='I' && cu[2]=='C' && cu[3]=='A' && cu[4]=='R'){
-      	if (strstr(cu, "EICAR-STANDARD-ANTIVIRUS-TEST-FILE") != NULL) return 1;
-      	// "\\" represents "\"
-      	break;
-      	} 
-      cu ++;
-   }
-   return 0;
+static inline int em_check_eicar_virus_tcpstream( const void *payload,
+		const void *src, const void *dst, double sport, double dport ){
+	// X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*
+	uint8_t key[E67_KEY_LEN], a[6], b[6];
+	const uint8_t *image = (const uint8_t *) payload;
+	e67_flow_t *f;
+	uint64_t start;
+	size_t image_len;
+	int side;
+
+	//the stream is NULL on a packet whose message holds no copy of it
+	// (a stream that does not fit in "input.max_message_size" is skipped)
+	if( image == NULL )
+		return 0;
+	image_len = mmt_mem_size( payload );
+
+	//the flow key: the two endpoints (address, port), the lower first,
+	// so the packets of both directions of the flow share it
+	if( src == NULL || dst == NULL )
+		//no way to tell the flows apart: search the whole stream as before;
+		// its later packets can alert again
+		return (e67_find( image, image_len ) != NULL);
+	memcpy( a, src, 4 );
+	a[4] = ((uint32_t)sport) >> 8; a[5] = ((uint32_t)sport) & 0xFF;
+	memcpy( b, dst, 4 );
+	b[4] = ((uint32_t)dport) >> 8; b[5] = ((uint32_t)dport) & 0xFF;
+	side = ( memcmp( a, b, 6 ) > 0 );
+	memcpy( key,     side ? b : a, 6 );
+	memcpy( key + 6, side ? a : b, 6 );
+
+	f = e67_get_flow( key );
+	if( f == NULL )
+		return (e67_find( image, image_len ) != NULL);
+	if( image_len < f->scanned )
+		//a new stream on the same 4-tuple: forget the old offset
+		f->scanned = 0;
+	else if( image_len == f->scanned )
+		return 0;   //no new byte
+	//search the bytes appended since the last packet, plus the last
+	// E67_NEEDLE_LEN - 1 old ones: an occurrence overlapping the boundary is not missed
+	start = (f->scanned > E67_NEEDLE_LEN - 1) ? f->scanned - (E67_NEEDLE_LEN - 1) : 0;
+	f->scanned = image_len;
+	return (e67_find( image + start, image_len - start ) != NULL);
+}
+
+void on_load(){
+	e67_load_env();
+}
+
+//called once, by the main thread: free the state of every thread
+void on_unload(){
+	e67_free_tables();
 }
 ]]></embedded_functions>
 <!-- Property 67: Detect EICAR virus test file within file reconstructed from TCP payload-->
@@ -30,7 +275,7 @@ static inline int em_check_eicar_virus_tcpstream(const char *stru){
      description="Detect EICAR virus test file within the file reconstructed from TCP payload" >
    <event event_id="1" value="COMPUTE" 
            description="EICAR virus test file"
-           boolean_expression="(#em_check_eicar_virus_tcpstream(tcp.tcp_session_payload_up)==1)"/>
+           boolean_expression="(#em_check_eicar_virus_tcpstream(tcp.tcp_session_payload_up, ip.src, ip.dst, tcp.src_port, tcp.dest_port)==1)"/>
    <event event_id="2" value="COMPUTE"
            description="Print IP source and destination addresses"
            boolean_expression="(ip.src != ip.dst)"/>
