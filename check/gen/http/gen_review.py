@@ -613,7 +613,21 @@ attacks3 = [
     b'{"q":"$( id )"}',                                           # not this, document or window
     b'{"h":"$(el).hide()"}',                                      # benign, reported by design
 ]
-for i, body in enumerate(benign + attacks + benign3 + attacks3):
+# review 4, R2: jQuery only when the argument is exactly a quoted string, this,
+# document or window, after the others
+benign4 = [
+    b'{"js":"$( \\"#x\\" ).show()"}',                              # selector, spaces around it
+    b'{"js":"$(\\t document ).ready(fn)"}',                         # JSON-escaped tab after '('
+    b"{\"js\":\"$( 'li.item' ).hide()\"}",                            # single quotes
+]
+attacks4 = [
+    b'{"js":"$( document;id ).x"}',                               # "document", then "id"
+    b'{"js":"$(document&&id).log"}',
+    b'{"js":"$( documents ).x"}',                                 # not "document"
+    b"{\"js\":\"$('a';id)\"}",                                      # not only a quoted string
+    b'{"js":"$(\\tid)"}',                                          # JSON-escaped tab, then "id"
+]
+for i, body in enumerate(benign + attacks + benign3 + attacks3 + benign4 + attacks4):
     a = Conn(c, 48000 + i)
     a.h2_setup()
     json_request(a, body)

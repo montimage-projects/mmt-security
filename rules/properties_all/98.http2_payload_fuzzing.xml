@@ -23,7 +23,9 @@ Ordinary JSON text is not reported: a '#', '%', '$' or '\' alone ("#ff0000",
 text ("Rock%20n%20Roll", "it%20s%20s"), a single "../" ("../images/logo.png"),
 markdown code ("Use `git status`"), jQuery on this, document or window
 ("$(document).ready", "$( document ).ready", "$(this).hide()") or on a
-selector ("$('#id')"), printf documentation ("%s has %d items").
+selector ("$('#id')", "$( \"#id\" )"): the argument must be exactly one of
+these, between optional spaces ("$( document;id ).x" is reported), printf
+documentation ("%s has %d items").
 
 So, by design, these attack bodies are not reported either:
 - a backtick that is not after a shell operator and does not span a whole
@@ -35,8 +37,8 @@ So, by design, these attack bodies are not reported either:
   after a letter or a digit and before another '%', read as URL-encoded
   text: "AAAA%20x%20x" (but "AAAA%10x%10x" and "%20s%20s" are reported);
 - a single "../": "../etc/passwd", "../..";
-- "$(...)" followed by '.' when it starts with a quote, "this", "document" or
-  "window": "$(document.cookie).x".
+- "$(...)" around a quoted string only, or around "this", "document" or
+  "window" only and followed by '.': "$('id')", "$(this).x".
 And these benign bodies are reported: jQuery on another object, such as a
 variable or an expression: "$(el).hide()", "$(e.target).closest('li')".
 
@@ -812,6 +814,62 @@ static inline bool mem_starts( const uint8_t *p, uint32_t len, const char *s ){
 	return ( len >= n && memcmp( p, s, n ) == 0 );
 }
 
+//the index of the first byte from #q on that is not a space (' ' or the JSON escape "\t"), 64 bytes on at most
+static inline uint32_t json_spaces( const uint8_t *p, uint32_t len, uint32_t q ){
+	uint32_t end = q + 64;
+	while( q < len && q < end ){
+		if( p[q] == ' ' )
+			q ++;
+		else if( q + 1 < len && p[q] == '\\' && p[q+1] == 't' )
+			q += 2;
+		else
+			break;
+	}
+	return q;
+}
+
+/**
+ * Whether the "$(" before #q opens a call of jQuery, not a command
+ * substitution: its argument is exactly a quoted string ("$('#id')",
+ * "$(\"#id\")"), or "this", "document" or "window" followed by a method call
+ * ("$(document).ready"), between optional spaces ("$( document ).ready").
+ * "$(whoami).log", "$( document;id ).x" and "$( documents ).x" are not.
+ */
+static inline bool json_jquery( const uint8_t *p, uint32_t len, uint32_t q ){
+	static const char *const objects[] = { "this", "document", "window" };
+	uint32_t k, end, n;
+	bool quoted = true;
+	q   = json_spaces( p, len, q );
+	end = q + 256;
+	if( q + 1 < len && p[q] == '\\' && p[q+1] == '"' ){ //"\"...\"" (JSON-escaped double quotes)
+		for( k = q + 2; k + 1 < len && k < end && !(p[k] == '\\' && p[k+1] == '"'); k++ )
+			if( p[k] == '"' )
+				return false; //end of the JSON string
+		if( k + 1 >= len || k >= end )
+			return false;
+		k += 2;
+	}else if( q < len && p[q] == '\'' ){                //'...'
+		for( k = q + 1; k < len && k < end && p[k] != '\''; k++ )
+			if( p[k] == '"' && p[k-1] != '\\' )
+				return false; //end of the JSON string
+		if( k >= len || k >= end )
+			return false;
+		k ++;
+	}else{
+		quoted = false;
+		for( n = 0; n < sizeof( objects ) / sizeof( objects[0] ); n++ )
+			if( q < len && mem_starts( p + q, len - q, objects[n] ))
+				break;
+		if( n == sizeof( objects ) / sizeof( objects[0] ))
+			return false;
+		k = q + (uint32_t)strlen( objects[n] );
+	}
+	k = json_spaces( p, len, k );
+	if( k >= len || p[k] != ')' )
+		return false;
+	return quoted || (k + 1 < len && p[k+1] == '.');
+}
+
 //whether a closing backtick follows #i before the end of the JSON string; its index in #close
 static inline bool json_backtick_close( const uint8_t *p, uint32_t len, uint32_t i, uint32_t *close ){
 	uint32_t k;
@@ -848,7 +906,7 @@ static inline bool url_escape_in_text( const uint8_t *p, uint32_t len, uint32_t 
  * jQuery ("$(document).ready"), printf documentation ("%s has %d items").
  */
 static inline bool json_has_injection( const uint8_t *p, uint32_t len ){
-	uint32_t i, j, k, q, run = 0, conv_end = 0;
+	uint32_t i, j, k, run = 0, conv_end = 0;
 	uint8_t prev;
 	bool conv;
 	for( i=0; i<len; i++ ){
@@ -885,22 +943,9 @@ static inline bool json_has_injection( const uint8_t *p, uint32_t len ){
 			}
 			break;
 		case '$': //command substitution "$(cmd)", not jQuery: "$(this).hide()", "$('#id')", "$(\"#id\")"
-			if( i + 1 >= len || p[i+1] != '(' )
-				break;
-			//spaces after '(': "$( document ).ready" (jQuery's documented style)
-			for( q = i + 2; q < len && q < i + 64 && p[q] == ' '; q++ )
-				;
-			if( q < len && (p[q] == '\'' || p[q] == '\\') )
-				break;
-			for( k = q; k < len && k < i + 256 && p[k] != ')' && p[k] != '"'; k++ )
-				;
-			//a method call on the jQuery object of this, document or window ("$(document).ready"),
-			// not "$(whoami).log"
-			if( k < len && p[k] == ')' && k + 1 < len && p[k+1] == '.'
-					&& (mem_starts( p + q, k - q, "this" ) || mem_starts( p + q, k - q, "document" )
-						|| mem_starts( p + q, k - q, "window" )) )
-				break;
-			return true;
+			if( i + 1 < len && p[i+1] == '(' && !json_jquery( p, len, i + 2 ))
+				return true;
+			break;
 		case '`': //command substitution "`cmd`": a whole value ("`reboot`") or after a shell operator ("x;`id`")
 			prev = ( i > 0 ) ? p[i-1] : '"';
 			if( !json_backtick_close( p, len, i, &k ))
