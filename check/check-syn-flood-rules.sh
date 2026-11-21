@@ -18,9 +18,11 @@
 #     at once and all complete, and reports only on a packet to the victim
 #     server port (check/syn_flood_rule56.c);
 #  6. the servers of check/pcap/56.crafted_servers_attack.pcap, crafted for the
-#     unseeded hash, still hide the victim from rule 56 with seed 0: the pcap
-#     keeps proving that the seed is what defends (make check runs it with
-#     another seed, from its .env file, and expects the 3 alerts of the victim).
+#     unseeded hash, do fill the victim's slot run with seed 0, but their
+#     pending alerts expire 2 s after they are raised and their slots become
+#     evictable again: the victim is then reported even with a known seed
+#     (make check also runs it with another seed, from its .env file, and
+#     expects the 3 alerts of the victim).
 #
 # Usage: check/check-syn-flood-rules.sh [path/to/mmt_sec_standalone]
 set -u
@@ -136,11 +138,13 @@ echo "  MMT_SEC_SYN_FLOOD_HASH_SEED=0: $n alert(s), $v for the victim 192.168.1.
 [ "$v" = 1 ] || fail "rule 57 does not report the victim 192.168.1.10:80 of $PCAP57C with the unseeded hash"
 
 echo
-echo "Testing rule 56 against servers crafted to share the victim's slots (unseeded hash)"
+echo "Testing rule 56 against servers crafted to share the victim's slots (unseeded hash, pending-alert expiry)"
 PCAP56C=check/pcap/56.crafted_servers_attack.pcap
 n=$(alerts 56 "$PCAP56C" MMT_SEC_SYN_FLOOD_HASH_SEED=0)
-echo "  MMT_SEC_SYN_FLOOD_HASH_SEED=0: $n alert(s) (make check expects 3 with the seed of its .env file)"
-[ "$n" = 0 ] || fail "rule 56 gives $n alerts on $PCAP56C with the unseeded hash, expected 0: the pcap no longer targets the unseeded hash"
+v=$(cat "$TMP"/out/*.csv 2>/dev/null | grep -c '^[^,]*,[^,]*,[^,]*,[^,]*,56,.*"ip.dst","172.31.77.10"\].*"tcp.dest_port",80\]')
+echo "  MMT_SEC_SYN_FLOOD_HASH_SEED=0: $n alert(s), $v for the victim 172.31.77.10:80"
+[ "$n" = 2 ] || fail "rule 56 gives $n alerts on $PCAP56C with the unseeded hash, expected 2: the expired pending alerts must free the victim's slots"
+[ "$v" = "$n" ] || fail "rule 56 gives $n alerts on $PCAP56C with the unseeded hash, $v for the victim 172.31.77.10:80"
 
 echo
 echo "Testing rule 56's C: more than 65536 pending handshakes, side of the victim"

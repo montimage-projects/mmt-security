@@ -20,15 +20,17 @@
        of that port, not necessarily an attacker;
      - at most one alert per server port per second (of packet time): the half-open handshakes counted
        since the previous alert of that port are reported together, on the first packet to that port at
-       least 1 s after the previous alert.
+       least 1 s after the previous alert. An alert still pending 2 s after it is raised expires: the
+       server's slot is then evictable again, and the pending alert is dropped when a new server takes the
+       slot;
      Notes:
      - the 1 s are checked on later TCP packets (of any connection), and the alert waits for a packet to the
        server port: a spoofed flood (the clients never answer) shorter than 1 s, after which that port
        receives nothing, is not reported by this rule. Rule 57 reports it from its SYN rate only if it reaches
        rule 57's threshold (100 SYN within 1 s by default): a smaller burst on a port that then receives
-       nothing is reported by neither rule. Any later packet to the port (a legitimate client, the next pulse
-       of a pulsing flood) reports it. A real-source flood (the clients reset the handshakes) is counted at
-       once;
+       nothing is reported by neither rule. A packet to the port while the alert is still pending (a
+       legitimate client, the next pulse of a pulsing flood) reports it. A real-source flood (the clients
+       reset the handshakes) is counted at once;
      - the FIFO holds 65536 SYN-ACKs (1 s at 65536 new connections per second). When it is full, a new
        SYN-ACK is not tracked until the oldest ones leave after their 1 s: above about 65 k new connections
        per second, a part of the handshakes is not checked, and a flood is reported from the tracked ones,
@@ -41,7 +43,13 @@
        with a random seed drawn once per process (in on_load), so that an attacker cannot choose servers that
        share the slots of a victim and evict it. For tests only, MMT_SEC_SYN_FLOOD_HASH_SEED (a decimal
        integer from 0 to 4294967295, also read by rule 57) sets the seed: 0 gives the unseeded hash. A server
-       whose alert waits for a packet to its port keeps its slot until that packet comes;
+       whose alert waits for a packet to its port keeps its slot until that packet comes or until the alert
+       expires 2 s after it is raised (the slot is then evictable, and the pending alert is dropped when a
+       new server takes it — a packet to the port still reports it while the slot is held). A quiet fake
+       server can therefore not hold a victim's slot run for ever even when the seed is known; the price is
+       that a real flood whose port goes quiet for more than 2 s loses its last pending alert if the slot is
+       taken before a packet reaches the port — an acceptable trade-off, since an attacker who re-arms
+       pending alerts within 2 s can still hold slots, and the seed remains the primary defence;
      - the tables are shared by all the engine instances of a process (the threads of mmt-probe) and
        protected by a mutex.
 -->
@@ -64,6 +72,7 @@
 #define EM_SYN56_SERVERS        4096  //server IP address and port (power of 2)
 #define EM_SYN56_PROBES            8
 #define EM_SYN56_REPORT_US   1000000  //at most one alert per server port per second
+#define EM_SYN56_EXPIRE_US   2000000  //a pending alert expires 2 s after it is raised
 
 enum { EM_SYN56_FREE = 0, EM_SYN56_WAITING, EM_SYN56_DONE };
 
@@ -85,6 +94,7 @@ typedef struct {
 	uint64_t ts[ EM_SYN56_HALF_OPEN - 1 ]; //SYN-ACK times of these handshakes
 	uint64_t last;            //SYN-ACK time of the last half-open handshake
 	uint64_t reported_ts;     //packet time of the last alert of this server port
+	uint64_t alert_ts;        //packet time when the pending alert was raised
 } em_syn56_srv_t;
 
 static em_syn56_hs_t  em_syn56_fifo[ EM_SYN56_PENDING ];
@@ -169,7 +179,7 @@ static em_syn56_hs_t *em_syn56_find( uint32_t srv_ip, uint16_t srv_port, uint32_
 	return NULL;
 }
 
-static em_syn56_srv_t *em_syn56_server( uint32_t ip, uint16_t port, int create ){
+static em_syn56_srv_t *em_syn56_server( uint32_t ip, uint16_t port, int create, uint64_t now ){
 	uint32_t h = em_syn56_mix( em_syn56_mix( ip ^ em_syn56_seed ) ^ port ), p;
 	em_syn56_srv_t *s, *free_slot = NULL, *old = NULL;
 	for( p = 0; p < EM_SYN56_PROBES; p++ ){
@@ -178,8 +188,11 @@ static em_syn56_srv_t *em_syn56_server( uint32_t ip, uint16_t port, int create )
 			return s;
 		if( free_slot == NULL && !s->used )
 			free_slot = s;
-		//the server without an alert whose last half-open handshake is the oldest
-		if( s->used && !s->alert && ( old == NULL || s->last < old->last ))
+		//the evictable server whose last half-open handshake is the oldest: no alert pending, or an
+		//alert that expired (more than EM_SYN56_EXPIRE_US without a packet to the port reported it)
+		if( s->used && ( !s->alert
+				|| ( now > s->alert_ts && now - s->alert_ts > EM_SYN56_EXPIRE_US ))
+				&& ( old == NULL || s->last < old->last ))
 			old = s;
 	}
 	if( !create )
@@ -187,10 +200,12 @@ static em_syn56_srv_t *em_syn56_server( uint32_t ip, uint16_t port, int create )
 	if( free_slot == NULL )
 		free_slot = old;
 	if( free_slot == NULL ){
-		//8 servers waiting for their alert: replace the first one
+		//all 8 slots have an alert still pending: replace the first one
 		free_slot = &em_syn56_srv[ h & (EM_SYN56_SERVERS - 1) ];
-		em_syn56_alerts --;
 	}
+	//the pending alert of the replaced server is dropped (it expired, or all 8 slots had one)
+	if( free_slot->alert )
+		em_syn56_alerts --;
 	memset( free_slot, 0, sizeof( *free_slot ));
 	free_slot->used = 1;
 	free_slot->ip   = ip;
@@ -203,8 +218,8 @@ static inline int em_syn56_within( uint64_t a, uint64_t b ){
 }
 
 //a handshake of server ip:port, whose SYN-ACK was sent at ts, is half-open
-static void em_syn56_half_open( uint32_t ip, uint16_t port, uint64_t ts ){
-	em_syn56_srv_t *s = em_syn56_server( ip, port, 1 );
+static void em_syn56_half_open( uint32_t ip, uint16_t port, uint64_t ts, uint64_t now ){
+	em_syn56_srv_t *s = em_syn56_server( ip, port, 1, now );
 	int i, n = 0;
 	//keep only the half-open handshakes within 200 ms of this one
 	for( i = 0; i < s->count; i++ )
@@ -215,7 +230,8 @@ static void em_syn56_half_open( uint32_t ip, uint16_t port, uint64_t ts ){
 	if( n == EM_SYN56_HALF_OPEN - 1 ){
 		s->count = 0;
 		if( !s->alert ){
-			s->alert = 1;
+			s->alert    = 1;
+			s->alert_ts = now;
 			em_syn56_alerts ++;
 		}
 	} else
@@ -223,10 +239,10 @@ static void em_syn56_half_open( uint32_t ip, uint16_t port, uint64_t ts ){
 }
 
 //take the oldest SYN-ACK out of the FIFO (after its 1 s): still pending, it is half-open
-static void em_syn56_pop(){
+static void em_syn56_pop( uint64_t now ){
 	em_syn56_hs_t *hs = &em_syn56_fifo[ em_syn56_head ];
 	if( hs->state == EM_SYN56_WAITING )
-		em_syn56_half_open( hs->srv_ip, hs->srv_port, hs->ts );
+		em_syn56_half_open( hs->srv_ip, hs->srv_port, hs->ts, now );
 	hs->state = EM_SYN56_FREE;
 	em_syn56_head = (em_syn56_head + 1) & (EM_SYN56_PENDING - 1);
 	em_syn56_size --;
@@ -290,7 +306,7 @@ static int em_syn_flood_half_open( const void *ip_src, const void *ip_dst, doubl
 	//the handshakes waiting for more than 1 s (time going backwards stops this until it catches up)
 	while( em_syn56_size > 0 && now > em_syn56_fifo[ em_syn56_head ].ts
 			&& now - em_syn56_fifo[ em_syn56_head ].ts > EM_SYN56_TIMEOUT_US )
-		em_syn56_pop();
+		em_syn56_pop( now );
 
 	if( f == 0x12 ){
 		if( src != dst )
@@ -304,13 +320,13 @@ static int em_syn_flood_half_open( const void *ip_src, const void *ip_dst, doubl
 		hs = em_syn56_find( dst, dp, src, sp );
 		if( hs != NULL && hs->state == EM_SYN56_WAITING ){
 			hs->state = EM_SYN56_DONE;
-			em_syn56_half_open( hs->srv_ip, hs->srv_port, hs->ts );
+			em_syn56_half_open( hs->srv_ip, hs->srv_port, hs->ts, now );
 		}
 	}
 
 	//report on a packet to the server port, at most once per second (time going backwards reports)
 	if( em_syn56_alerts > 0 && src != dst ){
-		s = em_syn56_server( dst, dp, 0 );
+		s = em_syn56_server( dst, dp, 0, now );
 		if( s != NULL && s->alert && ( !s->reported || now < s->reported_ts
 				|| now - s->reported_ts >= EM_SYN56_REPORT_US )){
 			s->alert       = 0;
