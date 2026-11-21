@@ -1,0 +1,13 @@
+<beginning>
+<!-- Test rule of check/check-expressions.sh: 5 &lt; http.method -->
+<!-- expect-error: cannot compare a string with a number: (5 < http.method) -->
+<property value="THEN" delay_units="s" delay_min="0" delay_max="0" property_id="9021" type_property="TEST"
+    description="5 &lt; http.method">
+    <event value="COMPUTE" event_id="1"
+           description="5 &lt; http.method"
+           boolean_expression="(5 &lt; http.method)"/>
+    <event value="COMPUTE" event_id="2"
+           description="Same packet"
+           boolean_expression="(ip.src != ip.dst)"/>
+</property>
+</beginning>

@@ -1,0 +1,12 @@
+<beginning>
+<!-- Test rule of check/check-expressions.sh: absence test (ip.src == 0): never alerts -->
+<property value="THEN" delay_units="s" delay_min="0" delay_max="0" property_id="9028" type_property="TEST"
+    description="absence test (ip.src == 0): never alerts">
+    <event value="COMPUTE" event_id="1"
+           description="absence test (ip.src == 0): never alerts"
+           boolean_expression="(ip.src == 0)"/>
+    <event value="COMPUTE" event_id="2"
+           description="Same packet"
+           boolean_expression="(ip.src != ip.dst)"/>
+</property>
+</beginning>

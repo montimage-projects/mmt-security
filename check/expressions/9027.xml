@@ -1,0 +1,12 @@
+<beginning>
+<!-- Test rule of check/check-expressions.sh: presence test (ip.src != 0), string 'GET' -->
+<property value="THEN" delay_units="s" delay_min="0" delay_max="0" property_id="9027" type_property="TEST"
+    description="presence test (ip.src != 0), string 'GET'">
+    <event value="COMPUTE" event_id="1"
+           description="presence test (ip.src != 0), string 'GET'"
+           boolean_expression="((ip.src != 0) &amp;&amp; (http.method == 'GET'))"/>
+    <event value="COMPUTE" event_id="2"
+           description="Same packet"
+           boolean_expression="(ip.src != ip.dst)"/>
+</property>
+</beginning>

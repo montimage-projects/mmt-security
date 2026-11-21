@@ -93,6 +93,8 @@ static void _iterate_event_to_gen_guards( void *key, void *data, void *user_data
 	uint16_t event_id = event->id;
 
 	_gen_comment( fd, "Rule %"PRIu32", event %d\n  * %s", rule_id, event_id, event->description == NULL? "" : event->description );
+	//a rule may not compare a string with a number (it compiles to garbage C)
+	expr_assert_comparison_types( event->expression, rule_id, event_id );
 	size = expr_stringify_expression( &str, event->expression );
 	if( size == 0 ) return;
 

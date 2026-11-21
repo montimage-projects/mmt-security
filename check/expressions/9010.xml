@@ -1,0 +1,12 @@
+<beginning>
+<!-- Test rule of check/check-expressions.sh: string: http.method < HEAD -->
+<property value="THEN" delay_units="s" delay_min="0" delay_max="0" property_id="9010" type_property="TEST"
+    description="string: http.method &lt; HEAD">
+    <event value="COMPUTE" event_id="1"
+           description="string: http.method &lt; HEAD"
+           boolean_expression="(http.method &lt; 'HEAD')"/>
+    <event value="COMPUTE" event_id="2"
+           description="Same packet"
+           boolean_expression="(ip.src != ip.dst)"/>
+</property>
+</beginning>

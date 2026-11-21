@@ -1,0 +1,12 @@
+<beginning>
+<!-- Test rule of check/check-expressions.sh: numeric: (a - b) <= (c - d) -->
+<property value="THEN" delay_units="s" delay_min="0" delay_max="0" property_id="9004" type_property="TEST"
+    description="numeric: (a - b) &lt;= (c - d)">
+    <event value="COMPUTE" event_id="1"
+           description="numeric: (a - b) &lt;= (c - d)"
+           boolean_expression="((udp.dest_port - udp.src_port) &lt;= (udp.len - 8))"/>
+    <event value="COMPUTE" event_id="2"
+           description="Same packet"
+           boolean_expression="(udp.src_port == 1000)"/>
+</property>
+</beginning>
