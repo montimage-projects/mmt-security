@@ -7,13 +7,47 @@ frame can follow the HEADERS frame in the same segment or come in a later one.
 Only the DATA frames sent by the client (the side that sent the connection
 preface or a request header block) are checked, and only when the body starts
 with '{' or '['. An alert is raised when the body
-- holds an injection pattern: a format string ("%n", or 2 conversions such as
-  "%s%s"), "%00", "\u0000", "%2e%2e", a command substitution "$(" or a
-  backtick, or a path traversal "../" or "..\\";
+- holds an injection pattern:
+  - a format string: "%n" (not followed by a letter), or 2 conversions next to
+    each other, such as "%s%s", "%x.%x" or "%p %p";
+  - a NUL: "%00" or "\u0000";
+  - a command substitution: "$(cmd)", or "`cmd`" as a whole string value or
+    after a shell operator (";`cmd`", "|`cmd`", "=`cmd`");
+  - a path traversal: "../../", "..\\..\\" (JSON-escaped backslashes),
+    "%2e%2e", "..%2f" or "..%5c";
 - or, when the whole body is in one DATA frame, is not valid JSON (RFC 8259):
   e.g., the random characters written by a fuzzer such as 5Greplay.
-A '#', '%', '$' or '\' alone is ordinary JSON ("#ff0000", "10%", "$5",
-"C:\\Users") and is not reported.
+  Newline-delimited JSON is valid, and so is any nesting depth.
+Ordinary JSON text is not reported: a '#', '%', '$' or '\' alone ("#ff0000",
+"10%", "100%natural", "$5", "C:\\Users"), a URL escape ("%3d", "%2d"), URL-encoded
+text ("Rock%20n%20Roll", "it%20s%20s"), a single "../" ("../images/logo.png"),
+markdown code ("Use `git status`"), jQuery on this, document or window
+("$(document).ready", "$( document ).ready", "$(this).hide()") or on a
+selector ("$('#id')", "$( \"#id\" )"): the argument must be exactly one of
+these, between optional spaces ("$( document;id ).x" is reported), printf
+documentation ("%s has %d items").
+
+So, by design, these attack bodies are not reported either:
+- a backtick that is not after a shell operator and does not span a whole
+  string value: "ping `id`", "x`id`";
+- conversions that are not next to each other: "%x, %x, %x";
+- a "%d" conversion with a width of 2 hex digits, read as a URL escape:
+  "%10d%10d" (but "%08x", "%20s" and "%10n" are conversions);
+- a conversion whose 2-digit width is a printable URL escape (20 to 7e),
+  after a letter or a digit and before another '%', read as URL-encoded
+  text: "AAAA%20x%20x" (but "AAAA%10x%10x" and "%20s%20s" are reported);
+- a single "../": "../etc/passwd", "../..";
+- "$(...)" around a quoted string only, or around "this", "document" or
+  "window" only and followed by '.': "$('id')", "$(this).x".
+And these benign bodies are reported: jQuery on another object, such as a
+variable or an expression: "$(el).hide()", "$(e.target).closest('li')".
+
+Each mmt-security thread tracks MMT_SEC_HTTP2_CONNECTIONS connections
+(environment variable, 128 by default, 65536 at most; the least recently used
+one is replaced). The state of a connection takes about 33 KB at most in this
+rule, i.e., about 4 MB per thread by default and about 2 GB per thread at the
+maximum. The variable also sets the table of rule 97, whose connections take
+about 200 KB each: about 13 GB per thread at the maximum.
 -->
 
 <embedded_functions><![CDATA[
@@ -22,39 +56,108 @@ A '#', '%', '$' or '\' alone is ordinary JSON ("#ff0000", "10%", "$5",
 #include <stdlib.h>
 #include <ctype.h>
 #include "mmt_lib.h"
+#define H2_RULE_ID "98"
 /*
  * HTTP/2 frame reader over the TCP payload of each packet.
  *
  * mmt-dpi gives the packet's TCP segment, not HTTP/2 frames: a frame can
  * span segments and a segment can hold several frames. The state of each
- * direction of a connection (thread-local, so several mmt-security threads
- * never share it) keeps the next TCP sequence number, and the bytes of an
- * incomplete frame, so every frame is handled once and whole:
+ * direction of a connection keeps the next TCP sequence number, and the
+ * bytes of an incomplete frame, so every frame is handled once and whole:
  * - a retransmitted segment is ignored;
  * - after a gap (lost segment), or when the capture starts in the middle of
  *   a connection, the reader resynchronises on a segment that starts with a
- *   plausible frame header.
+ *   plausible frame header;
+ * - a segment that starts with the connection preface starts a new
+ *   connection on the same 4-tuple (it has a new ISN), and the state of both
+ *   directions restarts, only once the old connection is over: its sender
+ *   ended it, or the peer accepted a new connection (a SYN-ACK), whose first
+ *   byte is the preface. The sender ends it with:
+ *   - a FIN after its last byte that the receiver accepts: with the ACK bit
+ *     (RFC 9293, 3.10.7.4: a segment without ACK is dropped), without SYN
+ *     (RFC 5961, 4.2: a SYN is answered with a challenge ACK and dropped),
+ *     and acknowledging only data that the peer sent (RFC 9293, 3.10.7.4:
+ *     SEG.ACK > SND.NXT is dropped; the FIN of the peer counts 1);
+ *   - or an RST at the expected sequence number (RFC 5961, 3.2), with or
+ *     without ACK or SYN: the receiver checks the RST bit before the SYN and
+ *     ACK bits (RFC 9293, 3.10.7.4), and an RST needs no ACK.
+ *   Any other preface is read as a segment of the current connection: data
+ *   at the expected sequence number (e.g., the end of a DATA frame), or a
+ *   segment the receiver drops (a retransmission, a segment out of its
+ *   window). A SYN alone does not end a connection: the receiver of a SYN on
+ *   an established connection answers with an ACK (RFC 5961, 4.2). So the
+ *   rule reads the TCP flags of every TCP packet, also without data, of the
+ *   connections it tracks;
+ * - limit (insertion): the rule does not do every check of the receiver. A
+ *   FIN or an RST that the receiver drops for a reason the rule does not
+ *   check still ends the connection for the rule: a bad TCP checksum (mmt-dpi
+ *   does not verify it), a sequence number out of the receiver's window
+ *   (when the rule's expected sequence number is not the receiver's, e.g.,
+ *   after a dropped segment far ahead), an ack too old (RFC 5961, 5.2), or
+ *   an ack of unsent data when the rule has seen no data of the peer. Then
+ *   one preface that the receiver also drops restarts the state. The sender
+ *   can do it with its own packets: a packet forged with the peer's address
+ *   is needed only for the SYN-ACK path. It is the same class as a data
+ *   segment that the receiver drops and the rule reads, which can already
+ *   blind the rule; closing it needs the checks of the receiver;
+ * - a sequence number more than H2_MAX_BACKWARD bytes behind the expected one
+ *   starts a new byte stream (the frame reader resynchronises).
+ *
+ * Both directions of a connection share one entry of a table of sets of
+ * H2_WAYS entries, so they never evict each other. The table holds
+ * MMT_SEC_HTTP2_CONNECTIONS connections (environment variable, 128 by
+ * default, rounded up to a multiple of H2_WAYS). The set is a hash of the
+ * 4-tuple with a random seed, so a sender cannot choose a 4-tuple that
+ * collides with another connection. MMT_SEC_HTTP2_SEED (environment
+ * variable) fixes the seed: for tests only, as it makes the sets
+ * predictable. A new connection replaces the least
+ * recently used entry of its set. Each mmt-security thread has its own
+ * table (thread-local, never shared); every table is in a list, so that
+ * on_unload frees the tables of every thread.
+ *
+ * Frames larger than the default SETTINGS_MAX_FRAME_SIZE (16384 bytes) are
+ * skipped: a peer that advertises a larger maximum can send bigger frames,
+ * which are not read.
  */
 #include <stdint.h>
 #include <strings.h>
+#include <pthread.h>
+#include <time.h>
+#include <sys/random.h>
+#include <errno.h>
+#include <inttypes.h>
+#include <mmt_core.h>
 
-#define H2_SLOTS      256              //connection directions tracked per thread
-#define H2_MAX_FRAME  16384            //default SETTINGS_MAX_FRAME_SIZE (RFC 9113, 6.5.2)
-#define H2_BUF_MAX    (H2_MAX_FRAME + 9)
+#define H2_WAYS          4                //connections per set of the connection table of a thread
+#define H2_CONNECTIONS   128              //default connections per thread (env. MMT_SEC_HTTP2_CONNECTIONS)
+#define H2_MAX_CONNECTIONS 65536
+#define H2_MAX_FRAME     16384            //default SETTINGS_MAX_FRAME_SIZE (RFC 9113, 6.5.2)
+#define H2_BUF_MAX       (H2_MAX_FRAME + 9)
+#define H2_MAX_BACKWARD  (1u << 20)       //a sequence number this far behind starts a new byte stream
+
+#define H2_PROTO_HTTP2   700              //PROTO_HTTP2 of mmt-dpi (tcpip/mmt_tcpip_protocols.h)
+#define H2_TCP_FIN       0x01
+#define H2_TCP_SYN       0x02
+#define H2_TCP_RST       0x04
+#define H2_TCP_ACK       0x10
 
 static const char H2_PREFACE[] = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
 //fields of the state of one direction of a connection, shared by the rules
 #define H2_DIR_COMMON_FIELDS \
-	bool     used;                                               \
-	uint8_t  key[12];     /*src ip, dst ip, src port, dst port*/ \
 	bool     synced;      /*next_seq is known*/                  \
 	uint32_t next_seq;                                           \
 	bool     aligned;     /*the next byte starts a frame*/       \
 	uint32_t skip;        /*bytes left of a frame not buffered*/ \
 	uint8_t *buf;         /*incomplete frame*/                   \
 	uint32_t buf_len;                                            \
-	bool     is_client;   /*sent the preface or a request*/
+	bool     is_client;   /*sent the preface or a request*/      \
+	bool     preface_seen;                                       \
+	uint32_t preface_seq; /*sequence number of the preface*/     \
+	bool     ended;       /*FIN or RST of the sender at next_seq*/ \
+	bool     fin;         /*a FIN of the sender ended it*/       \
+	bool     syn_acked;   /*a SYN-ACK accepted a new connection*/ \
+	uint32_t syn_next;    /*its first sequence number*/
 
 
 #define H2_OPEN_STREAMS 16
@@ -69,13 +172,71 @@ struct h2_dir_struct{
 
 typedef struct h2_dir_struct h2_dir_t;
 
+//one connection: both directions
+typedef struct h2_conn_struct{
+	bool     used;
+	uint8_t  key[12];    //the two endpoints (IPv4 address, port), the lower one first
+	uint64_t last_use;
+	h2_dir_t dir[2];     //dir[0]: sent by the first endpoint of #key, dir[1]: by the second
+}h2_conn_t;
+
+//the connections of one thread
+typedef struct h2_table_struct{
+	struct h2_table_struct *next;   //list of the tables of every thread
+	uint64_t  seed, clock;
+	uint32_t  sets;
+	h2_conn_t conn[];               //sets * H2_WAYS connections
+}h2_table_t;
+
 //rule-specific: called for each complete frame
 static int h2_on_frame( h2_dir_t *d, uint8_t type, uint8_t flags, uint32_t sid, const uint8_t *p, uint32_t len );
 //rule-specific: called when the byte stream of #d is lost (gap), or #d is reset
 static void h2_on_desync( h2_dir_t *d );
 static void h2_on_reset( h2_dir_t *d );
 
-static __thread h2_dir_t *h2_dirs = NULL;
+static __thread h2_table_t *h2_table = NULL;
+static h2_table_t *h2_tables = NULL;
+static pthread_mutex_t h2_tables_lock = PTHREAD_MUTEX_INITIALIZER;
+//set by on_load, before any packet is read
+static uint32_t h2_sets = H2_CONNECTIONS / H2_WAYS;
+static bool     h2_seed_fixed = false;
+static uint64_t h2_seed;
+
+/**
+ * Read the environment variable #name as a decimal integer in [#min, #max].
+ * Return false if it is not set, or, with a warning, if it is not valid.
+ */
+static inline bool h2_env_uint( const char *name, uint64_t min, uint64_t max, uint64_t *v ){
+	const char *str = getenv( name );
+	char *end;
+	unsigned long long x;
+	if( str == NULL )
+		return false;
+	errno = 0;
+	x = strtoull( str, &end, 10 );
+	if( !isdigit( (unsigned char)str[0] ) || *end != '\0' || errno != 0 || x < min || x > max ){
+		mmt_warn( "Rule %s: ignore %s=\"%s\": not an integer from %"PRIu64" to %"PRIu64", use the default",
+				H2_RULE_ID, name, str, min, max );
+		return false;
+	}
+	*v = x;
+	return true;
+}
+
+//the environment variables of the connection table; called by on_load
+static inline void h2_load_env( void ){
+	uint64_t v;
+	if( h2_env_uint( "MMT_SEC_HTTP2_CONNECTIONS", 1, H2_MAX_CONNECTIONS, &v )){
+		h2_sets = (uint32_t)((v + H2_WAYS - 1) / H2_WAYS);
+		mmt_info( "Rule %s: set MMT_SEC_HTTP2_CONNECTIONS=%"PRIu64": %u connections per thread",
+				H2_RULE_ID, v, h2_sets * H2_WAYS );
+	}
+	if( h2_env_uint( "MMT_SEC_HTTP2_SEED", 0, UINT64_MAX, &v )){
+		h2_seed_fixed = true;
+		h2_seed       = v;
+		mmt_warn( "Rule %s: MMT_SEC_HTTP2_SEED is set: the connection table is predictable (for tests only)", H2_RULE_ID );
+	}
+}
 
 static inline uint32_t h2_u24( const uint8_t *p ){
 	return ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | p[2];
@@ -95,31 +256,97 @@ static inline void h2_reset( h2_dir_t *d ){
 	memset( d, 0, sizeof( *d ));
 }
 
-//the state of the direction src:sport -> dst:dport
-static inline h2_dir_t *h2_get_dir( const void *src, const void *dst, double sport, double dport ){
-	uint8_t key[12];
-	uint32_t h = 2166136261u;
-	int i;
-	h2_dir_t *d;
+static inline void h2_reset_conn( h2_conn_t *c ){
+	h2_reset( &c->dir[0] );
+	h2_reset( &c->dir[1] );
+	c->used = false;
+}
 
-	if( h2_dirs == NULL ){
-		h2_dirs = calloc( H2_SLOTS, sizeof( h2_dir_t ));
-		if( h2_dirs == NULL )
-			return NULL;
+static inline uint64_t h2_new_seed( const void *addr ){
+	uint64_t seed = 0;
+	struct timespec ts;
+	if( h2_seed_fixed )
+		return h2_seed;
+	if( getrandom( &seed, sizeof( seed ), GRND_NONBLOCK ) != (ssize_t)sizeof( seed )){
+		clock_gettime( CLOCK_REALTIME, &ts );
+		seed = ((uint64_t)ts.tv_sec << 32) ^ (uint64_t)ts.tv_nsec ^ (uint64_t)(uintptr_t)addr;
 	}
-	memcpy( key, src, 4 );
-	memcpy( key + 4, dst, 4 );
-	key[8]  = ((uint32_t)sport) >> 8; key[9]  = ((uint32_t)sport) & 0xFF;
-	key[10] = ((uint32_t)dport) >> 8; key[11] = ((uint32_t)dport) & 0xFF;
+	return seed;
+}
+
+//set of the connection #key: seeded FNV-1a, then the MurmurHash3 finaliser so that every bit counts
+static inline uint32_t h2_set_of( const h2_table_t *t, const uint8_t *key ){
+	uint64_t h = 14695981039346656037ull ^ t->seed;
+	int i;
 	for( i=0; i<12; i++ )
-		h = (h ^ key[i]) * 16777619u;
-	d = &h2_dirs[ h % H2_SLOTS ];
-	if( !d->used || memcmp( d->key, key, 12 ) != 0 ){
-		h2_reset( d ); //replace the least recent connection using this slot
-		memcpy( d->key, key, 12 );
-		d->used = true;
+		h = (h ^ key[i]) * 1099511628211ull;
+	h ^= h >> 33;
+	h *= 0xff51afd7ed558ccdull;
+	h ^= h >> 33;
+	h *= 0xc4ceb9fe1a85ec53ull;
+	h ^= h >> 33;
+	return (uint32_t)(h % t->sets);
+}
+
+static inline h2_table_t *h2_get_table( void ){
+	h2_table_t *t = h2_table;
+	if( t != NULL )
+		return t;
+	t = calloc( 1, sizeof( h2_table_t ) + (size_t)h2_sets * H2_WAYS * sizeof( h2_conn_t ));
+	if( t == NULL )
+		return NULL;
+	t->sets = h2_sets;
+	t->seed = h2_new_seed( t );
+	pthread_mutex_lock( &h2_tables_lock );
+	t->next   = h2_tables;
+	h2_tables = t;
+	pthread_mutex_unlock( &h2_tables_lock );
+	h2_table = t;
+	return t;
+}
+
+/**
+ * The state of the direction src:sport -> dst:dport, and in #reverse the
+ * state of the opposite direction of the same connection. If the connection
+ * is not tracked: a new entry if #create, else NULL.
+ */
+static inline h2_dir_t *h2_get_dir( const void *src, const void *dst, double sport, double dport, h2_dir_t **reverse, bool create ){
+	uint8_t a[6], b[6], key[12];
+	int side, i;
+	h2_conn_t *set, *c, *victim = NULL;
+	h2_table_t *t = h2_get_table();
+
+	if( t == NULL )
+		return NULL;
+	memcpy( a, src, 4 );
+	a[4] = ((uint32_t)sport) >> 8; a[5] = ((uint32_t)sport) & 0xFF;
+	memcpy( b, dst, 4 );
+	b[4] = ((uint32_t)dport) >> 8; b[5] = ((uint32_t)dport) & 0xFF;
+	side = ( memcmp( a, b, 6 ) > 0 ); //1: the source is the second endpoint
+	memcpy( key,     side ? b : a, 6 );
+	memcpy( key + 6, side ? a : b, 6 );
+
+	set = &t->conn[ h2_set_of( t, key ) * H2_WAYS ];
+	for( i=0; i<H2_WAYS; i++ ){
+		c = &set[i];
+		if( c->used && memcmp( c->key, key, 12 ) == 0 )
+			goto found;
+		//a free entry, else the least recently used one
+		if( victim == NULL || (victim->used && (!c->used || c->last_use < victim->last_use)) )
+			victim = c;
 	}
-	return d;
+	if( !create )
+		return NULL;
+	c = victim;
+	h2_reset_conn( c );
+	memcpy( c->key, key, 12 );
+	c->used = true;
+
+	found:
+	c->last_use = ++ t->clock;
+	if( reverse != NULL )
+		*reverse = &c->dir[ !side ];
+	return &c->dir[ side ];
 }
 
 static inline void h2_desync( h2_dir_t *d ){
@@ -147,16 +374,44 @@ static inline bool h2_buffer( h2_dir_t *d, const uint8_t *p, size_t n ){
 }
 
 /**
- * Feed the TCP segment (#seq, #p, #len) of direction #d to the frame reader.
+ * Whether a segment of direction #d that starts with the connection preface
+ * at #seq starts a new connection on the 4-tuple.
+ */
+static inline bool h2_new_connection( const h2_dir_t *d, uint32_t seq ){
+	if( !d->synced )                              //first segment of this direction
+		return true;
+	if( d->preface_seen && seq == d->preface_seq ) //retransmission of the preface already read
+		return false;
+	return d->ended                               //the old connection is over
+		|| (d->syn_acked && seq == d->syn_next);  //first byte of the new connection
+}
+
+/**
+ * Feed the TCP segment (#seq, #p, #len) of direction #d to the frame reader;
+ * #rev is the opposite direction (or NULL).
  * Return 1 if a frame of the segment made #h2_on_frame return 1.
  */
-static inline int h2_segment( h2_dir_t *d, uint32_t seq, const uint8_t *p, size_t len ){
+static inline int h2_segment( h2_dir_t *d, h2_dir_t *rev, uint32_t seq, const uint8_t *p, size_t len ){
 	int ret = 0;
 	uint32_t flen, n, total;
 
-	if( d->synced ){
+	if( len >= 24 && memcmp( p, H2_PREFACE, 24 ) == 0 && h2_new_connection( d, seq )){
+		//a new connection on this 4-tuple: both directions restart
+		h2_reset( d );
+		if( rev != NULL && rev != d )
+			h2_reset( rev );
+		d->preface_seen = true;
+		d->preface_seq  = seq;
+		d->is_client    = true;
+		d->aligned      = true;
+		p   += 24;
+		len -= 24;
+		seq += 24;
+	}else if( d->synced ){
 		int32_t diff = (int32_t)(seq - d->next_seq);
-		if( diff < 0 ){ //retransmission, possibly overlapping new data
+		if( diff < 0 && (uint32_t)(-(int64_t)diff) > H2_MAX_BACKWARD )
+			h2_desync( d ); //far behind: a new byte stream, not a retransmission
+		else if( diff < 0 ){ //retransmission, possibly overlapping new data
 			if( (size_t)(-(int64_t)diff) >= len )
 				return 0;
 			p   += -diff;
@@ -167,15 +422,6 @@ static inline int h2_segment( h2_dir_t *d, uint32_t seq, const uint8_t *p, size_
 	}
 	d->synced   = true;
 	d->next_seq = seq + (uint32_t)len;
-
-	if( len >= 24 && memcmp( p, H2_PREFACE, 24 ) == 0 ){
-		p   += 24;
-		len -= 24;
-		d->is_client = true;
-		d->aligned   = true;
-		d->skip      = 0;
-		d->buf_len   = 0;
-	}
 
 	while( len > 0 ){
 		//rest of a frame too large to be buffered
@@ -243,6 +489,99 @@ static inline int h2_segment( h2_dir_t *d, uint32_t seq, const uint8_t *p, size_
 	return ret;
 }
 
+/**
+ * Whether #ack, in a packet of direction #d, acknowledges only data that the
+ * opposite direction #rev sent (and its FIN): the receiver drops a segment
+ * that acknowledges more (RFC 9293, 3.10.7.4). Unknown if #rev sent no data.
+ */
+static inline bool h2_ack_sent( const h2_dir_t *d, const h2_dir_t *rev, uint32_t ack ){
+	if( rev == NULL || rev == d || !rev->synced )
+		return true;
+	return (int32_t)(ack - (rev->next_seq + (rev->fin ? 1 : 0))) <= 0;
+}
+
+/**
+ * Feed the TCP packet (#seq, #ack, #flags, and #len bytes of data at #p,
+ * #len can be 0) of direction #d; #rev is the opposite direction (or NULL).
+ * The flags tell when a connection is over (h2_new_connection).
+ * Return 1 if a frame of the segment made #h2_on_frame return 1.
+ */
+static inline int h2_packet( h2_dir_t *d, h2_dir_t *rev, uint32_t seq, uint32_t ack, uint8_t flags, const uint8_t *p, size_t len ){
+	int ret = 0;
+
+	if( flags & H2_TCP_RST ){
+		//the receiver ignores an RST that is not at the expected sequence number (RFC 5961, 3.2)
+		if( d->synced && seq == d->next_seq )
+			d->ended = true;
+		return 0; //the data of an RST is not data of the stream
+	}
+	if( flags & H2_TCP_SYN ){
+		if( (flags & H2_TCP_ACK) && rev != NULL ){
+			//the sender accepted a new connection, whose data starts at #ack
+			rev->syn_acked = true;
+			rev->syn_next  = ack;
+		}
+		seq ++; //data in a SYN (TCP Fast Open) starts after it
+	}
+	if( len > 0 )
+		ret = h2_segment( d, rev, seq, p, len );
+	//FIN after the last byte of the stream (not of a retransmission behind it, not out of the window),
+	// that the receiver accepts: with ACK, without SYN, acknowledging only data of the peer
+	if( (flags & H2_TCP_FIN) && (flags & H2_TCP_ACK) && !(flags & H2_TCP_SYN)
+			&& d->synced && seq + (uint32_t)len == d->next_seq && h2_ack_sent( d, rev, ack )){
+		d->ended = true;
+		d->fin   = true;
+	}
+	return ret;
+}
+
+//whether the protocol hierarchy (meta.proto_hierarchy) of a packet holds HTTP/2
+static inline bool h2_in_hierarchy( const void *hierarchy ){
+	const proto_hierarchy_t *h = (const proto_hierarchy_t *)hierarchy;
+	int i;
+	if( h == NULL )
+		return false;
+	for( i=0; i<h->len && i<PROTO_PATH_SIZE; i++ )
+		if( h->proto_path[i] == H2_PROTO_HTTP2 )
+			return true;
+	return false;
+}
+
+/**
+ * The state of the direction of a TCP packet, or NULL if the rule has nothing
+ * to do with it: a packet with data, of HTTP/2, creates the state of its
+ * connection; a SYN, FIN or RST without data matters only to a connection
+ * already tracked; other packets are ignored. #len is set to the data length.
+ */
+static inline h2_dir_t *h2_packet_dir( const void *src, const void *dst, double sport, double dport, double flags,
+		const char *payload, const void *hierarchy, h2_dir_t **reverse, size_t *len ){
+	bool h2 = ( payload != NULL && h2_in_hierarchy( hierarchy ));
+	*len = 0;
+	if( src == NULL || dst == NULL )
+		return NULL;
+	if( !h2 && (payload != NULL || ((uint32_t)flags & (H2_TCP_SYN | H2_TCP_FIN | H2_TCP_RST)) == 0) )
+		return NULL;
+	if( h2 )
+		*len = mmt_mem_size( payload );
+	return h2_get_dir( src, dst, sport, dport, reverse, h2 );
+}
+
+//free the connection tables of every thread
+static inline void h2_free_tables( void ){
+	h2_table_t *t, *next;
+	uint32_t i;
+	pthread_mutex_lock( &h2_tables_lock );
+	for( t = h2_tables; t != NULL; t = next ){
+		next = t->next;
+		for( i=0; i<t->sets * H2_WAYS; i++ )
+			h2_reset_conn( &t->conn[i] );
+		free( t );
+	}
+	h2_tables = NULL;
+	pthread_mutex_unlock( &h2_tables_lock );
+	h2_table = NULL;
+}
+
 //payload of a HEADERS (type 1) or PUSH_PROMISE (type 5) frame without padding, priority and promised stream id
 static inline bool h2_header_block( uint8_t type, uint8_t flags, const uint8_t **p, uint32_t *len ){
 	uint32_t pad = 0;
@@ -295,16 +634,14 @@ static inline int h2_open_find( const h2_dir_t *d, uint32_t sid ){
 }
 
 /*
- * Strict JSON syntax check (RFC 8259) of [p, end).
+ * Strict JSON syntax check (RFC 8259), without recursion: any nesting depth
+ * is accepted. Newline-delimited JSON (JSON texts separated by a line break,
+ * e.g., a bulk request) is accepted too.
  */
-#define JSON_MAX_DEPTH 64
-
 static inline void json_ws( const uint8_t **p, const uint8_t *end ){
 	while( *p < end && (**p == ' ' || **p == '\t' || **p == '\n' || **p == '\r') )
 		(*p) ++;
 }
-
-static bool json_value( const uint8_t **p, const uint8_t *end, int depth );
 
 static inline bool json_string( const uint8_t **p, const uint8_t *end ){
 	const uint8_t *c = *p + 1; //after '"'
@@ -363,59 +700,103 @@ static inline bool json_literal( const uint8_t **p, const uint8_t *end, const ch
 	return true;
 }
 
-static bool json_value( const uint8_t **p, const uint8_t *end, int depth ){
-	uint8_t close;
+//a member name and its ':'
+static inline bool json_key( const uint8_t **p, const uint8_t *end ){
 	json_ws( p, end );
-	if( *p >= end || depth > JSON_MAX_DEPTH )
+	if( *p >= end || **p != '"' || !json_string( p, end ))
 		return false;
+	json_ws( p, end );
+	if( *p >= end || **p != ':' )
+		return false;
+	(*p) ++;
+	return true;
+}
+
+//scalar value: string, number, true, false, null
+static inline bool json_scalar( const uint8_t **p, const uint8_t *end ){
 	switch( **p ){
 	case '"': return json_string( p, end );
 	case 't': return json_literal( p, end, "true" );
 	case 'f': return json_literal( p, end, "false" );
 	case 'n': return json_literal( p, end, "null" );
-	case '{':
-	case '[':
-		close = ( **p == '{' ) ? '}' : ']';
-		(*p) ++;
-		json_ws( p, end );
-		if( *p < end && **p == close ){
-			(*p) ++;
-			return true;
-		}
-		while( true ){
-			if( close == '}' ){
-				json_ws( p, end );
-				if( *p >= end || **p != '"' || !json_string( p, end ))
-					return false;
-				json_ws( p, end );
-				if( *p >= end || **p != ':' )
-					return false;
-				(*p) ++;
-			}
-			if( !json_value( p, end, depth + 1 ))
-				return false;
-			json_ws( p, end );
-			if( *p >= end )
-				return false;
-			if( **p == close ){
-				(*p) ++;
-				return true;
-			}
-			if( **p != ',' )
-				return false;
-			(*p) ++;
-		}
-	default:
-		return json_number( p, end );
+	default:  return json_number( p, end );
 	}
 }
 
 static inline bool json_is_valid( const uint8_t *p, uint32_t len ){
 	const uint8_t *end = p + len;
-	if( !json_value( &p, end, 0 ))
-		return false;
-	json_ws( &p, end );
-	return p == end;
+	//kinds of the open containers: bit i is 1 if the container at depth i is an object
+	uint8_t small[ 256 ], *kinds = small;
+	uint32_t depth = 0, top;
+	bool after = false, ok = false, nl;
+
+	//the depth is at most #len: one byte per container
+	if( len / 8 + 1 > sizeof( small )){
+		kinds = malloc( len / 8 + 1 );
+		if( kinds == NULL )
+			return true; //cannot check: no alert
+	}
+	while( true ){
+		if( after && depth == 0 ){
+			//end of a JSON text: end of the body, or a next JSON text after a line break
+			nl = false;
+			while( p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') ){
+				if( *p == '\n' )
+					nl = true;
+				p ++;
+			}
+			if( p == end ){
+				ok = true;
+				break;
+			}
+			if( !nl )
+				break;
+			after = false;
+		}
+		json_ws( &p, end );
+		if( p >= end )
+			break;
+		if( after ){
+			//after a value inside a container: ',' or the end of the container
+			top = depth - 1;
+			bool is_object = (kinds[ top / 8 ] >> (top % 8)) & 1;
+			if( *p == ',' ){
+				p ++;
+				if( is_object && !json_key( &p, end ))
+					break;
+				after = false;
+			}else if( *p == (is_object ? '}' : ']') ){
+				p ++;
+				depth --;
+			}else
+				break;
+			continue;
+		}
+		//a value
+		if( *p == '{' || *p == '[' ){
+			bool is_object = ( *p == '{' );
+			if( is_object )
+				kinds[ depth / 8 ] |=  (uint8_t)(1u << (depth % 8));
+			else
+				kinds[ depth / 8 ] &= (uint8_t)~(1u << (depth % 8));
+			depth ++;
+			p ++;
+			json_ws( &p, end );
+			if( p < end && *p == (is_object ? '}' : ']') ){ //empty container
+				p ++;
+				depth --;
+				after = true;
+			}else if( is_object && !json_key( &p, end ))
+				break;
+			continue;
+		}
+		if( !json_scalar( &p, end ))
+			break;
+		after = true;
+	}
+	if( kinds != small )
+		free( kinds );
+	return ok;
 }
 
 static inline bool mem_has( const uint8_t *p, uint32_t len, const char *s ){
@@ -427,43 +808,164 @@ static inline bool mem_has( const uint8_t *p, uint32_t len, const char *s ){
 	return false;
 }
 
+//whether the #len bytes at #p start with #s
+static inline bool mem_starts( const uint8_t *p, uint32_t len, const char *s ){
+	size_t n = strlen( s );
+	return ( len >= n && memcmp( p, s, n ) == 0 );
+}
+
+//the index of the first byte from #q on that is not a space (' ' or the JSON escape "\t"), 64 bytes on at most
+static inline uint32_t json_spaces( const uint8_t *p, uint32_t len, uint32_t q ){
+	uint32_t end = q + 64;
+	while( q < len && q < end ){
+		if( p[q] == ' ' )
+			q ++;
+		else if( q + 1 < len && p[q] == '\\' && p[q+1] == 't' )
+			q += 2;
+		else
+			break;
+	}
+	return q;
+}
+
 /**
- * Injection and fuzzing patterns in a JSON body. A '#', '%', '$' or '\'
- * alone is ordinary JSON ("#ff0000", "10%", "$5", "C:\\Users").
+ * Whether the "$(" before #q opens a call of jQuery, not a command
+ * substitution: its argument is exactly a quoted string ("$('#id')",
+ * "$(\"#id\")"), or "this", "document" or "window" followed by a method call
+ * ("$(document).ready"), between optional spaces ("$( document ).ready").
+ * "$(whoami).log", "$( document;id ).x" and "$( documents ).x" are not.
+ */
+static inline bool json_jquery( const uint8_t *p, uint32_t len, uint32_t q ){
+	static const char *const objects[] = { "this", "document", "window" };
+	uint32_t k, end, n;
+	bool quoted = true;
+	q   = json_spaces( p, len, q );
+	end = q + 256;
+	if( q + 1 < len && p[q] == '\\' && p[q+1] == '"' ){ //"\"...\"" (JSON-escaped double quotes)
+		for( k = q + 2; k + 1 < len && k < end && !(p[k] == '\\' && p[k+1] == '"'); k++ )
+			if( p[k] == '"' )
+				return false; //end of the JSON string
+		if( k + 1 >= len || k >= end )
+			return false;
+		k += 2;
+	}else if( q < len && p[q] == '\'' ){                //'...'
+		for( k = q + 1; k < len && k < end && p[k] != '\''; k++ )
+			if( p[k] == '"' && p[k-1] != '\\' )
+				return false; //end of the JSON string
+		if( k >= len || k >= end )
+			return false;
+		k ++;
+	}else{
+		quoted = false;
+		for( n = 0; n < sizeof( objects ) / sizeof( objects[0] ); n++ )
+			if( q < len && mem_starts( p + q, len - q, objects[n] ))
+				break;
+		if( n == sizeof( objects ) / sizeof( objects[0] ))
+			return false;
+		k = q + (uint32_t)strlen( objects[n] );
+	}
+	k = json_spaces( p, len, k );
+	if( k >= len || p[k] != ')' )
+		return false;
+	return quoted || (k + 1 < len && p[k+1] == '.');
+}
+
+//whether a closing backtick follows #i before the end of the JSON string; its index in #close
+static inline bool json_backtick_close( const uint8_t *p, uint32_t len, uint32_t i, uint32_t *close ){
+	uint32_t k;
+	for( k = i + 1; k < len && k < i + 256 && p[k] != '"'; k++ )
+		if( p[k] == '`' ){
+			*close = k;
+			return true;
+		}
+	return false;
+}
+
+static inline int hex_value( uint8_t c ){
+	return isdigit( c ) ? c - '0' : tolower( c ) - 'a' + 10;
+}
+
+/**
+ * Whether the "%XX" at #i, followed by the conversion letter at #j, is a URL
+ * escape in URL-encoded text, not a conversion with a width: the escape is a
+ * printable character, it follows a letter or a digit that does not end a
+ * conversion (#conv_end is the end of the last one), and the letter is
+ * followed by another '%' ("Rock%20n%20Roll", "it%20s%20s").
+ */
+static inline bool url_escape_in_text( const uint8_t *p, uint32_t len, uint32_t i, uint32_t j, uint32_t conv_end ){
+	int c = hex_value( p[i+1] ) * 16 + hex_value( p[i+2] );
+	return j == i + 3 && j + 1 < len && p[j+1] == '%'
+		&& c >= 0x20 && c < 0x7F
+		&& i > 0 && isalnum( p[i-1] ) && i != conv_end;
+}
+
+/**
+ * Injection and fuzzing patterns in a JSON body. Ordinary text is not
+ * reported: '#', '%', '$' or '\' alone ("#ff0000", "10%", "$5", "C:\\Users"),
+ * URL escapes ("%3d", "%2d"), a single "../", markdown code ("Use `ls`"),
+ * jQuery ("$(document).ready"), printf documentation ("%s has %d items").
  */
 static inline bool json_has_injection( const uint8_t *p, uint32_t len ){
-	uint32_t i, j, specifiers = 0;
+	uint32_t i, j, k, run = 0, conv_end = 0;
+	uint8_t prev;
+	bool conv;
 	for( i=0; i<len; i++ ){
 		switch( p[i] ){
 		case '%':
-			//format string: "%n", or 2 conversions or more ("%s%s", "%x %p")
+			//conversion: flags, width, precision and length ("%08x", "%-10.2ld"), then the conversion letter p[j]
 			j = i + 1;
 			while( j < len && (isdigit( p[j] ) || p[j] == '.' || p[j] == '-' || p[j] == 'l' || p[j] == 'h' ))
 				j++;
-			if( j < len && p[j] == 'n' )
-				return true;
-			if( j < len && strchr( "sxXpd", p[j] ) != NULL && p[j] != '\0' )
-				specifiers ++;
-			//URL-encoded NUL or dots: "%00", "%2e%2e"
+			//NUL "%00", also before a conversion letter ("%00x")
 			if( i + 2 < len && p[i+1] == '0' && p[i+2] == '0' )
 				return true;
-			if( i + 5 < len && strncasecmp( (const char *)p + i, "%2e%2e", 6 ) == 0 )
+			//URL escape "%XX", unless it starts a "%s", "%x", "%X", "%p" or "%n" conversion with a width
+			// ("%08x", "%20s", "%10n") outside URL-encoded text: dots "%2e%2e" are reported, the others
+			// are text ("%3d", "%2d": a "%d" conversion cannot be told from a URL escape)
+			conv = ( j < len && p[j] != '\0' && strchr( "sxXp", p[j] ) != NULL )
+					|| ( j < len && p[j] == 'n' && (j + 1 >= len || !isalpha( p[j+1] )) );
+			if( i + 2 < len && isxdigit( p[i+1] ) && isxdigit( p[i+2] )
+					&& (!conv || url_escape_in_text( p, len, i, j, conv_end ))){
+				if( i + 5 < len && strncasecmp( (const char *)p + i, "%2e%2e", 6 ) == 0 )
+					return true;
+				break;
+			}
+			//format string: "%n" (not "100%natural"), or 2 conversions next to each other ("%s%s", "%x.%x", "%p %p")
+			if( j >= len )
+				break;
+			if( p[j] == 'n' && (j + 1 >= len || !isalpha( p[j+1] )) )
+				return true;
+			if( p[j] != '\0' && strchr( "sxXpd", p[j] ) != NULL ){
+				run = ( run > 0 && i <= conv_end + 1 ) ? run + 1 : 1;
+				conv_end = j + 1;
+				if( run >= 2 )
+					return true;
+			}
+			break;
+		case '$': //command substitution "$(cmd)", not jQuery: "$(this).hide()", "$('#id')", "$(\"#id\")"
+			if( i + 1 < len && p[i+1] == '(' && !json_jquery( p, len, i + 2 ))
 				return true;
 			break;
-		case '$': //command substitution
-			if( i + 1 < len && p[i+1] == '(' )
+		case '`': //command substitution "`cmd`": a whole value ("`reboot`") or after a shell operator ("x;`id`")
+			prev = ( i > 0 ) ? p[i-1] : '"';
+			if( !json_backtick_close( p, len, i, &k ))
+				break;
+			if( strchr( ";|&(=", prev ) != NULL && prev != '\0' )
 				return true;
+			if( prev == '"' && k + 1 < len && p[k+1] == '"' )
+				return true;
+			i = k; //the closing backtick does not open another one
 			break;
-		case '`':
-			return true;
-		case '.': //path traversal: "../" or "..\\" (an escaped backslash in JSON)
-			if( i + 2 < len && p[i+1] == '.' && (p[i+2] == '/' || (p[i+2] == '\\' && i + 3 < len && p[i+3] == '\\')) )
+		case '.': //path traversal: "../../", "..\\..\\" (escaped backslashes), "..%2f", "..%5c"
+			if( i + 5 < len && memcmp( p + i, "../../", 6 ) == 0 )
+				return true;
+			if( i + 7 < len && memcmp( p + i, "..\\\\..\\\\", 8 ) == 0 )
+				return true;
+			if( i + 4 < len && p[i+1] == '.' && (strncasecmp( (const char *)p + i + 2, "%2f", 3 ) == 0 || strncasecmp( (const char *)p + i + 2, "%5c", 3 ) == 0) )
 				return true;
 			break;
 		}
 	}
-	if( specifiers >= 2 )
-		return true;
 	//NUL character, escaped
 	return mem_has( p, len, "\\u0000" );
 }
@@ -536,24 +1038,25 @@ static int h2_on_frame( h2_dir_t *d, uint8_t type, uint8_t flags, uint32_t sid, 
  * Return 1 if the TCP segment completes a DATA frame of an HTTP/2 request
  * whose JSON body holds an injection pattern or is not valid JSON.
  */
-static int em_check_fuzzing( const void *src, const void *dst, double sport, double dport, double seq, const char *payload ){
-	h2_dir_t *d;
-	if( src == NULL || dst == NULL || payload == NULL )
-		return 0;
-	d = h2_get_dir( src, dst, sport, dport );
+static int em_check_fuzzing( const void *src, const void *dst, double sport, double dport, double seq, double ack,
+		double flags, const char *payload, const void *hierarchy ){
+	h2_dir_t *d, *rev;
+	size_t len;
+	d = h2_packet_dir( src, dst, sport, dport, flags, payload, hierarchy, &rev, &len );
 	if( d == NULL )
 		return 0;
-	return h2_segment( d, (uint32_t)seq, (const uint8_t *)payload, mmt_mem_size( payload ));
+	if( d == rev ) //same source and destination
+		rev = NULL;
+	return h2_packet( d, rev, (uint32_t)seq, (uint32_t)ack, (uint8_t)flags, (const uint8_t *)payload, len );
 }
 
+void on_load(){
+	h2_load_env();
+}
+
+//called once, by the main thread: free the state of every thread
 void on_unload(){
-	int i;
-	if( h2_dirs == NULL )
-		return;
-	for( i=0; i<H2_SLOTS; i++ )
-		h2_reset( &h2_dirs[i] );
-	free( h2_dirs );
-	h2_dirs = NULL;
+	h2_free_tables();
 }
 ]]></embedded_functions>
 
@@ -564,6 +1067,6 @@ void on_unload(){
         boolean_expression=" true"/>  
     <event value="COMPUTE" event_id="2" 
         description="HTTP2 request with a fuzzed JSON body"
-        boolean_expression="( (256 &gt; http2.type) &amp;&amp; (#em_check_fuzzing( ip.src, ip.dst, tcp.src_port, tcp.dest_port, tcp.seq_nb, tcp.p_payload ) == 1) &amp;&amp; (ip.src != ip.dst) )"/>
+        boolean_expression="( (#em_check_fuzzing( ip.src, ip.dst, tcp.src_port, tcp.dest_port, tcp.seq_nb, tcp.ack_nb, tcp.flags, tcp.p_payload, meta.proto_hierarchy ) == 1) &amp;&amp; ((#is_exist( tcp.p_payload ) == 1) || true) &amp;&amp; (ip.src != ip.dst) )"/>
 </property>
 </beginning>

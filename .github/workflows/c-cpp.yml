@@ -45,6 +45,11 @@ jobs:
          sudo apt update -y && sudo apt install -y libxml2-dev libpcap-dev libconfuse-dev libpcap-dev
          make clean-all && make DEBUG=1 && make deb && make check VERBOSE=1  && sudo make install
 
+    - name: check-valgrind
+      run: |
+         sudo apt install -y valgrind
+         make check-valgrind
+
     #The following steps are executed only on new tag
     - name: Upload artifact
       if: ${{ fromJSON(env.IS_NEED_TO_PACKAGE) }}

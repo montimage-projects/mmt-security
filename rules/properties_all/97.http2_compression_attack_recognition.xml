@@ -15,9 +15,27 @@ under-estimated. An entry inserted before the capture started, or in a lost
 segment, is unknown and counts 32 bytes.
 
 An alert is raised when a block decodes to MMT_SEC_HTTP2_HPACK_BOMB_SIZE bytes
-or more (environment variable, 65536 by default) and to at least 10 times its
-encoded size. A block that is large because of large literal values (e.g., a big
-cookie) is not reported: it is not compressed.
+or more (environment variable, 65536 by default) and to at least
+MMT_SEC_HTTP2_HPACK_BOMB_RATIO times its encoded size (environment variable,
+10 by default). A block that is large because of large literal values (e.g., a
+big cookie) is not reported: it is not compressed.
+
+Each mmt-security thread tracks MMT_SEC_HTTP2_CONNECTIONS connections
+(environment variable, 128 by default, 65536 at most; the least recently used
+one is replaced). The state of a connection takes about 200 KB at most, i.e.,
+about 25 MB per thread by default and about 13 GB per thread at the maximum.
+The variable also sets the table of rule 98 (about 33 KB per connection).
+
+A segment that starts with the connection preface restarts the state of a
+connection only once the connection is over (a FIN or an RST of its sender
+that the server accepts, or a SYN-ACK of a new connection): a retransmission
+of the preface alone, or a preface out of the window, cannot wipe the HPACK
+table. So the rule reads the TCP flags of the packets without data of the
+connections it tracks. By design, a FIN or an RST that the server drops for a
+reason the rule does not check (a bad TCP checksum, out of the window, an ack
+too old) still ends the connection for the rule: the client can then wipe the
+table with its own packets and hide a bomb. A data segment that the server
+drops (insertion) can already hide a bomb in the same way.
 -->
 <embedded_functions><![CDATA[
 #include <string.h>
@@ -25,39 +43,111 @@ cookie) is not reported: it is not compressed.
 #include <stdlib.h>
 #include <ctype.h>
 #include "mmt_lib.h"
+#define H2_RULE_ID "97"
 /*
  * HTTP/2 frame reader over the TCP payload of each packet.
  *
  * mmt-dpi gives the packet's TCP segment, not HTTP/2 frames: a frame can
  * span segments and a segment can hold several frames. The state of each
- * direction of a connection (thread-local, so several mmt-security threads
- * never share it) keeps the next TCP sequence number, and the bytes of an
- * incomplete frame, so every frame is handled once and whole:
+ * direction of a connection keeps the next TCP sequence number, and the
+ * bytes of an incomplete frame, so every frame is handled once and whole:
  * - a retransmitted segment is ignored;
  * - after a gap (lost segment), or when the capture starts in the middle of
  *   a connection, the reader resynchronises on a segment that starts with a
- *   plausible frame header.
+ *   plausible frame header;
+ * - a segment that starts with the connection preface starts a new
+ *   connection on the same 4-tuple (it has a new ISN), and the state of both
+ *   directions restarts, only once the old connection is over: its sender
+ *   ended it, or the peer accepted a new connection (a SYN-ACK), whose first
+ *   byte is the preface. The sender ends it with:
+ *   - a FIN after its last byte that the receiver accepts: with the ACK bit
+ *     (RFC 9293, 3.10.7.4: a segment without ACK is dropped), without SYN
+ *     (RFC 5961, 4.2: a SYN is answered with a challenge ACK and dropped),
+ *     and acknowledging only data that the peer sent (RFC 9293, 3.10.7.4:
+ *     SEG.ACK > SND.NXT is dropped; the FIN of the peer counts 1);
+ *   - or an RST at the expected sequence number (RFC 5961, 3.2), with or
+ *     without ACK or SYN: the receiver checks the RST bit before the SYN and
+ *     ACK bits (RFC 9293, 3.10.7.4), and an RST needs no ACK.
+ *   Any other preface is read as a segment of the current connection: data
+ *   at the expected sequence number (e.g., the end of a DATA frame), or a
+ *   segment the receiver drops (a retransmission, a segment out of its
+ *   window). A SYN alone does not end a connection: the receiver of a SYN on
+ *   an established connection answers with an ACK (RFC 5961, 4.2). So the
+ *   rule reads the TCP flags of every TCP packet, also without data, of the
+ *   connections it tracks;
+ * - limit (insertion): the rule does not do every check of the receiver. A
+ *   FIN or an RST that the receiver drops for a reason the rule does not
+ *   check still ends the connection for the rule: a bad TCP checksum (mmt-dpi
+ *   does not verify it), a sequence number out of the receiver's window
+ *   (when the rule's expected sequence number is not the receiver's, e.g.,
+ *   after a dropped segment far ahead), an ack too old (RFC 5961, 5.2), or
+ *   an ack of unsent data when the rule has seen no data of the peer. Then
+ *   one preface that the receiver also drops restarts the state. The sender
+ *   can do it with its own packets: a packet forged with the peer's address
+ *   is needed only for the SYN-ACK path. It is the same class as a data
+ *   segment that the receiver drops and the rule reads, which can already
+ *   blind the rule; closing it needs the checks of the receiver;
+ * - a segment behind the expected sequence number is a retransmission, also
+ *   when it is far behind: a receiver drops a segment out of its window, so
+ *   such a segment must not reset the state either. After a segment far
+ *   ahead (out of window), the reader takes the next segments for
+ *   retransmissions until the stream reaches it: telling such a segment from
+ *   a lost one needs TCP window tracking, which is not done.
+ *
+ * Both directions of a connection share one entry of a table of sets of
+ * H2_WAYS entries, so they never evict each other. The table holds
+ * MMT_SEC_HTTP2_CONNECTIONS connections (environment variable, 128 by
+ * default, rounded up to a multiple of H2_WAYS). The set is a hash of the
+ * 4-tuple with a random seed, so a sender cannot choose a 4-tuple that
+ * collides with another connection. MMT_SEC_HTTP2_SEED (environment
+ * variable) fixes the seed: for tests only, as it makes the sets
+ * predictable. A new connection replaces the least
+ * recently used entry of its set. Each mmt-security thread has its own
+ * table (thread-local, never shared); every table is in a list, so that
+ * on_unload frees the tables of every thread.
+ *
+ * Frames larger than the default SETTINGS_MAX_FRAME_SIZE (16384 bytes) are
+ * skipped: a peer that advertises a larger maximum can send bigger frames,
+ * which are not read.
  */
 #include <stdint.h>
 #include <strings.h>
+#include <pthread.h>
+#include <time.h>
+#include <sys/random.h>
+#include <errno.h>
+#include <inttypes.h>
+#include <mmt_core.h>
 
-#define H2_SLOTS      256              //connection directions tracked per thread
-#define H2_MAX_FRAME  16384            //default SETTINGS_MAX_FRAME_SIZE (RFC 9113, 6.5.2)
-#define H2_BUF_MAX    (H2_MAX_FRAME + 9)
+#define H2_WAYS          4                //connections per set of the connection table of a thread
+#define H2_CONNECTIONS   128              //default connections per thread (env. MMT_SEC_HTTP2_CONNECTIONS)
+#define H2_MAX_CONNECTIONS 65536
+#define H2_MAX_FRAME     16384            //default SETTINGS_MAX_FRAME_SIZE (RFC 9113, 6.5.2)
+#define H2_BUF_MAX       (H2_MAX_FRAME + 9)
+
+#define H2_PROTO_HTTP2   700              //PROTO_HTTP2 of mmt-dpi (tcpip/mmt_tcpip_protocols.h)
+#define H2_TCP_FIN       0x01
+#define H2_TCP_SYN       0x02
+#define H2_TCP_RST       0x04
+#define H2_TCP_ACK       0x10
 
 static const char H2_PREFACE[] = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
 //fields of the state of one direction of a connection, shared by the rules
 #define H2_DIR_COMMON_FIELDS \
-	bool     used;                                               \
-	uint8_t  key[12];     /*src ip, dst ip, src port, dst port*/ \
 	bool     synced;      /*next_seq is known*/                  \
 	uint32_t next_seq;                                           \
 	bool     aligned;     /*the next byte starts a frame*/       \
 	uint32_t skip;        /*bytes left of a frame not buffered*/ \
 	uint8_t *buf;         /*incomplete frame*/                   \
 	uint32_t buf_len;                                            \
-	bool     is_client;   /*sent the preface or a request*/
+	bool     is_client;   /*sent the preface or a request*/      \
+	bool     preface_seen;                                       \
+	uint32_t preface_seq; /*sequence number of the preface*/     \
+	bool     ended;       /*FIN or RST of the sender at next_seq*/ \
+	bool     fin;         /*a FIN of the sender ended it*/       \
+	bool     syn_acked;   /*a SYN-ACK accepted a new connection*/ \
+	uint32_t syn_next;    /*its first sequence number*/
 
 
 #define HPACK_DEFAULT_TABLE_SIZE 4096
@@ -76,7 +166,9 @@ struct h2_dir_struct{
 	hpack_entry_t *entries;
 	uint32_t entries_count, first;
 	uint32_t table_size, table_max;  //current size, and maximum (RFC 7541, 4.1 and 4.2)
+	bool     table_max_known;        //table_max is set (0 is a valid maximum)
 	uint32_t settings_max;           //SETTINGS_HEADER_TABLE_SIZE sent by the peer
+	bool     settings_known;         //settings_max is set
 	//header block being received in HEADERS and CONTINUATION frames
 	uint8_t *block;
 	uint32_t block_len;
@@ -85,13 +177,71 @@ struct h2_dir_struct{
 
 typedef struct h2_dir_struct h2_dir_t;
 
+//one connection: both directions
+typedef struct h2_conn_struct{
+	bool     used;
+	uint8_t  key[12];    //the two endpoints (IPv4 address, port), the lower one first
+	uint64_t last_use;
+	h2_dir_t dir[2];     //dir[0]: sent by the first endpoint of #key, dir[1]: by the second
+}h2_conn_t;
+
+//the connections of one thread
+typedef struct h2_table_struct{
+	struct h2_table_struct *next;   //list of the tables of every thread
+	uint64_t  seed, clock;
+	uint32_t  sets;
+	h2_conn_t conn[];               //sets * H2_WAYS connections
+}h2_table_t;
+
 //rule-specific: called for each complete frame
 static int h2_on_frame( h2_dir_t *d, uint8_t type, uint8_t flags, uint32_t sid, const uint8_t *p, uint32_t len );
 //rule-specific: called when the byte stream of #d is lost (gap), or #d is reset
 static void h2_on_desync( h2_dir_t *d );
 static void h2_on_reset( h2_dir_t *d );
 
-static __thread h2_dir_t *h2_dirs = NULL;
+static __thread h2_table_t *h2_table = NULL;
+static h2_table_t *h2_tables = NULL;
+static pthread_mutex_t h2_tables_lock = PTHREAD_MUTEX_INITIALIZER;
+//set by on_load, before any packet is read
+static uint32_t h2_sets = H2_CONNECTIONS / H2_WAYS;
+static bool     h2_seed_fixed = false;
+static uint64_t h2_seed;
+
+/**
+ * Read the environment variable #name as a decimal integer in [#min, #max].
+ * Return false if it is not set, or, with a warning, if it is not valid.
+ */
+static inline bool h2_env_uint( const char *name, uint64_t min, uint64_t max, uint64_t *v ){
+	const char *str = getenv( name );
+	char *end;
+	unsigned long long x;
+	if( str == NULL )
+		return false;
+	errno = 0;
+	x = strtoull( str, &end, 10 );
+	if( !isdigit( (unsigned char)str[0] ) || *end != '\0' || errno != 0 || x < min || x > max ){
+		mmt_warn( "Rule %s: ignore %s=\"%s\": not an integer from %"PRIu64" to %"PRIu64", use the default",
+				H2_RULE_ID, name, str, min, max );
+		return false;
+	}
+	*v = x;
+	return true;
+}
+
+//the environment variables of the connection table; called by on_load
+static inline void h2_load_env( void ){
+	uint64_t v;
+	if( h2_env_uint( "MMT_SEC_HTTP2_CONNECTIONS", 1, H2_MAX_CONNECTIONS, &v )){
+		h2_sets = (uint32_t)((v + H2_WAYS - 1) / H2_WAYS);
+		mmt_info( "Rule %s: set MMT_SEC_HTTP2_CONNECTIONS=%"PRIu64": %u connections per thread",
+				H2_RULE_ID, v, h2_sets * H2_WAYS );
+	}
+	if( h2_env_uint( "MMT_SEC_HTTP2_SEED", 0, UINT64_MAX, &v )){
+		h2_seed_fixed = true;
+		h2_seed       = v;
+		mmt_warn( "Rule %s: MMT_SEC_HTTP2_SEED is set: the connection table is predictable (for tests only)", H2_RULE_ID );
+	}
+}
 
 static inline uint32_t h2_u24( const uint8_t *p ){
 	return ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | p[2];
@@ -111,31 +261,97 @@ static inline void h2_reset( h2_dir_t *d ){
 	memset( d, 0, sizeof( *d ));
 }
 
-//the state of the direction src:sport -> dst:dport
-static inline h2_dir_t *h2_get_dir( const void *src, const void *dst, double sport, double dport ){
-	uint8_t key[12];
-	uint32_t h = 2166136261u;
-	int i;
-	h2_dir_t *d;
+static inline void h2_reset_conn( h2_conn_t *c ){
+	h2_reset( &c->dir[0] );
+	h2_reset( &c->dir[1] );
+	c->used = false;
+}
 
-	if( h2_dirs == NULL ){
-		h2_dirs = calloc( H2_SLOTS, sizeof( h2_dir_t ));
-		if( h2_dirs == NULL )
-			return NULL;
+static inline uint64_t h2_new_seed( const void *addr ){
+	uint64_t seed = 0;
+	struct timespec ts;
+	if( h2_seed_fixed )
+		return h2_seed;
+	if( getrandom( &seed, sizeof( seed ), GRND_NONBLOCK ) != (ssize_t)sizeof( seed )){
+		clock_gettime( CLOCK_REALTIME, &ts );
+		seed = ((uint64_t)ts.tv_sec << 32) ^ (uint64_t)ts.tv_nsec ^ (uint64_t)(uintptr_t)addr;
 	}
-	memcpy( key, src, 4 );
-	memcpy( key + 4, dst, 4 );
-	key[8]  = ((uint32_t)sport) >> 8; key[9]  = ((uint32_t)sport) & 0xFF;
-	key[10] = ((uint32_t)dport) >> 8; key[11] = ((uint32_t)dport) & 0xFF;
+	return seed;
+}
+
+//set of the connection #key: seeded FNV-1a, then the MurmurHash3 finaliser so that every bit counts
+static inline uint32_t h2_set_of( const h2_table_t *t, const uint8_t *key ){
+	uint64_t h = 14695981039346656037ull ^ t->seed;
+	int i;
 	for( i=0; i<12; i++ )
-		h = (h ^ key[i]) * 16777619u;
-	d = &h2_dirs[ h % H2_SLOTS ];
-	if( !d->used || memcmp( d->key, key, 12 ) != 0 ){
-		h2_reset( d ); //replace the least recent connection using this slot
-		memcpy( d->key, key, 12 );
-		d->used = true;
+		h = (h ^ key[i]) * 1099511628211ull;
+	h ^= h >> 33;
+	h *= 0xff51afd7ed558ccdull;
+	h ^= h >> 33;
+	h *= 0xc4ceb9fe1a85ec53ull;
+	h ^= h >> 33;
+	return (uint32_t)(h % t->sets);
+}
+
+static inline h2_table_t *h2_get_table( void ){
+	h2_table_t *t = h2_table;
+	if( t != NULL )
+		return t;
+	t = calloc( 1, sizeof( h2_table_t ) + (size_t)h2_sets * H2_WAYS * sizeof( h2_conn_t ));
+	if( t == NULL )
+		return NULL;
+	t->sets = h2_sets;
+	t->seed = h2_new_seed( t );
+	pthread_mutex_lock( &h2_tables_lock );
+	t->next   = h2_tables;
+	h2_tables = t;
+	pthread_mutex_unlock( &h2_tables_lock );
+	h2_table = t;
+	return t;
+}
+
+/**
+ * The state of the direction src:sport -> dst:dport, and in #reverse the
+ * state of the opposite direction of the same connection. If the connection
+ * is not tracked: a new entry if #create, else NULL.
+ */
+static inline h2_dir_t *h2_get_dir( const void *src, const void *dst, double sport, double dport, h2_dir_t **reverse, bool create ){
+	uint8_t a[6], b[6], key[12];
+	int side, i;
+	h2_conn_t *set, *c, *victim = NULL;
+	h2_table_t *t = h2_get_table();
+
+	if( t == NULL )
+		return NULL;
+	memcpy( a, src, 4 );
+	a[4] = ((uint32_t)sport) >> 8; a[5] = ((uint32_t)sport) & 0xFF;
+	memcpy( b, dst, 4 );
+	b[4] = ((uint32_t)dport) >> 8; b[5] = ((uint32_t)dport) & 0xFF;
+	side = ( memcmp( a, b, 6 ) > 0 ); //1: the source is the second endpoint
+	memcpy( key,     side ? b : a, 6 );
+	memcpy( key + 6, side ? a : b, 6 );
+
+	set = &t->conn[ h2_set_of( t, key ) * H2_WAYS ];
+	for( i=0; i<H2_WAYS; i++ ){
+		c = &set[i];
+		if( c->used && memcmp( c->key, key, 12 ) == 0 )
+			goto found;
+		//a free entry, else the least recently used one
+		if( victim == NULL || (victim->used && (!c->used || c->last_use < victim->last_use)) )
+			victim = c;
 	}
-	return d;
+	if( !create )
+		return NULL;
+	c = victim;
+	h2_reset_conn( c );
+	memcpy( c->key, key, 12 );
+	c->used = true;
+
+	found:
+	c->last_use = ++ t->clock;
+	if( reverse != NULL )
+		*reverse = &c->dir[ !side ];
+	return &c->dir[ side ];
 }
 
 static inline void h2_desync( h2_dir_t *d ){
@@ -163,14 +379,40 @@ static inline bool h2_buffer( h2_dir_t *d, const uint8_t *p, size_t n ){
 }
 
 /**
- * Feed the TCP segment (#seq, #p, #len) of direction #d to the frame reader.
+ * Whether a segment of direction #d that starts with the connection preface
+ * at #seq starts a new connection on the 4-tuple.
+ */
+static inline bool h2_new_connection( const h2_dir_t *d, uint32_t seq ){
+	if( !d->synced )                              //first segment of this direction
+		return true;
+	if( d->preface_seen && seq == d->preface_seq ) //retransmission of the preface already read
+		return false;
+	return d->ended                               //the old connection is over
+		|| (d->syn_acked && seq == d->syn_next);  //first byte of the new connection
+}
+
+/**
+ * Feed the TCP segment (#seq, #p, #len) of direction #d to the frame reader;
+ * #rev is the opposite direction (or NULL).
  * Return 1 if a frame of the segment made #h2_on_frame return 1.
  */
-static inline int h2_segment( h2_dir_t *d, uint32_t seq, const uint8_t *p, size_t len ){
+static inline int h2_segment( h2_dir_t *d, h2_dir_t *rev, uint32_t seq, const uint8_t *p, size_t len ){
 	int ret = 0;
 	uint32_t flen, n, total;
 
-	if( d->synced ){
+	if( len >= 24 && memcmp( p, H2_PREFACE, 24 ) == 0 && h2_new_connection( d, seq )){
+		//a new connection on this 4-tuple: both directions restart
+		h2_reset( d );
+		if( rev != NULL && rev != d )
+			h2_reset( rev );
+		d->preface_seen = true;
+		d->preface_seq  = seq;
+		d->is_client    = true;
+		d->aligned      = true;
+		p   += 24;
+		len -= 24;
+		seq += 24;
+	}else if( d->synced ){
 		int32_t diff = (int32_t)(seq - d->next_seq);
 		if( diff < 0 ){ //retransmission, possibly overlapping new data
 			if( (size_t)(-(int64_t)diff) >= len )
@@ -183,15 +425,6 @@ static inline int h2_segment( h2_dir_t *d, uint32_t seq, const uint8_t *p, size_
 	}
 	d->synced   = true;
 	d->next_seq = seq + (uint32_t)len;
-
-	if( len >= 24 && memcmp( p, H2_PREFACE, 24 ) == 0 ){
-		p   += 24;
-		len -= 24;
-		d->is_client = true;
-		d->aligned   = true;
-		d->skip      = 0;
-		d->buf_len   = 0;
-	}
 
 	while( len > 0 ){
 		//rest of a frame too large to be buffered
@@ -259,6 +492,99 @@ static inline int h2_segment( h2_dir_t *d, uint32_t seq, const uint8_t *p, size_
 	return ret;
 }
 
+/**
+ * Whether #ack, in a packet of direction #d, acknowledges only data that the
+ * opposite direction #rev sent (and its FIN): the receiver drops a segment
+ * that acknowledges more (RFC 9293, 3.10.7.4). Unknown if #rev sent no data.
+ */
+static inline bool h2_ack_sent( const h2_dir_t *d, const h2_dir_t *rev, uint32_t ack ){
+	if( rev == NULL || rev == d || !rev->synced )
+		return true;
+	return (int32_t)(ack - (rev->next_seq + (rev->fin ? 1 : 0))) <= 0;
+}
+
+/**
+ * Feed the TCP packet (#seq, #ack, #flags, and #len bytes of data at #p,
+ * #len can be 0) of direction #d; #rev is the opposite direction (or NULL).
+ * The flags tell when a connection is over (h2_new_connection).
+ * Return 1 if a frame of the segment made #h2_on_frame return 1.
+ */
+static inline int h2_packet( h2_dir_t *d, h2_dir_t *rev, uint32_t seq, uint32_t ack, uint8_t flags, const uint8_t *p, size_t len ){
+	int ret = 0;
+
+	if( flags & H2_TCP_RST ){
+		//the receiver ignores an RST that is not at the expected sequence number (RFC 5961, 3.2)
+		if( d->synced && seq == d->next_seq )
+			d->ended = true;
+		return 0; //the data of an RST is not data of the stream
+	}
+	if( flags & H2_TCP_SYN ){
+		if( (flags & H2_TCP_ACK) && rev != NULL ){
+			//the sender accepted a new connection, whose data starts at #ack
+			rev->syn_acked = true;
+			rev->syn_next  = ack;
+		}
+		seq ++; //data in a SYN (TCP Fast Open) starts after it
+	}
+	if( len > 0 )
+		ret = h2_segment( d, rev, seq, p, len );
+	//FIN after the last byte of the stream (not of a retransmission behind it, not out of the window),
+	// that the receiver accepts: with ACK, without SYN, acknowledging only data of the peer
+	if( (flags & H2_TCP_FIN) && (flags & H2_TCP_ACK) && !(flags & H2_TCP_SYN)
+			&& d->synced && seq + (uint32_t)len == d->next_seq && h2_ack_sent( d, rev, ack )){
+		d->ended = true;
+		d->fin   = true;
+	}
+	return ret;
+}
+
+//whether the protocol hierarchy (meta.proto_hierarchy) of a packet holds HTTP/2
+static inline bool h2_in_hierarchy( const void *hierarchy ){
+	const proto_hierarchy_t *h = (const proto_hierarchy_t *)hierarchy;
+	int i;
+	if( h == NULL )
+		return false;
+	for( i=0; i<h->len && i<PROTO_PATH_SIZE; i++ )
+		if( h->proto_path[i] == H2_PROTO_HTTP2 )
+			return true;
+	return false;
+}
+
+/**
+ * The state of the direction of a TCP packet, or NULL if the rule has nothing
+ * to do with it: a packet with data, of HTTP/2, creates the state of its
+ * connection; a SYN, FIN or RST without data matters only to a connection
+ * already tracked; other packets are ignored. #len is set to the data length.
+ */
+static inline h2_dir_t *h2_packet_dir( const void *src, const void *dst, double sport, double dport, double flags,
+		const char *payload, const void *hierarchy, h2_dir_t **reverse, size_t *len ){
+	bool h2 = ( payload != NULL && h2_in_hierarchy( hierarchy ));
+	*len = 0;
+	if( src == NULL || dst == NULL )
+		return NULL;
+	if( !h2 && (payload != NULL || ((uint32_t)flags & (H2_TCP_SYN | H2_TCP_FIN | H2_TCP_RST)) == 0) )
+		return NULL;
+	if( h2 )
+		*len = mmt_mem_size( payload );
+	return h2_get_dir( src, dst, sport, dport, reverse, h2 );
+}
+
+//free the connection tables of every thread
+static inline void h2_free_tables( void ){
+	h2_table_t *t, *next;
+	uint32_t i;
+	pthread_mutex_lock( &h2_tables_lock );
+	for( t = h2_tables; t != NULL; t = next ){
+		next = t->next;
+		for( i=0; i<t->sets * H2_WAYS; i++ )
+			h2_reset_conn( &t->conn[i] );
+		free( t );
+	}
+	h2_tables = NULL;
+	pthread_mutex_unlock( &h2_tables_lock );
+	h2_table = NULL;
+}
+
 //payload of a HEADERS (type 1) or PUSH_PROMISE (type 5) frame without padding, priority and promised stream id
 static inline bool h2_header_block( uint8_t type, uint8_t flags, const uint8_t **p, uint32_t *len ){
 	uint32_t pad = 0;
@@ -310,14 +636,20 @@ static const uint8_t hpack_static[62][2] = {
 
 //decoded header list size above which a header block is reported (env. MMT_SEC_HTTP2_HPACK_BOMB_SIZE)
 static uint64_t hpack_bomb_size  = 65536;
-//minimal ratio decoded size / encoded size of a reported header block
-#define HPACK_BOMB_RATIO 10
+//minimal ratio decoded size / encoded size of a reported header block (env. MMT_SEC_HTTP2_HPACK_BOMB_RATIO)
+static uint64_t hpack_bomb_ratio = 10;
 
 void on_load(){
 	const char *str = getenv( "MMT_SEC_HTTP2_HPACK_BOMB_SIZE" );
+	h2_load_env();
 	if( str != NULL && strtoull( str, NULL, 0 ) > 0 ){
 		hpack_bomb_size = strtoull( str, NULL, 0 );
 		mmt_info( "Rule 97: set MMT_SEC_HTTP2_HPACK_BOMB_SIZE=%"PRIu64, hpack_bomb_size );
+	}
+	str = getenv( "MMT_SEC_HTTP2_HPACK_BOMB_RATIO" );
+	if( str != NULL && strtoull( str, NULL, 0 ) > 0 ){
+		hpack_bomb_ratio = strtoull( str, NULL, 0 );
+		mmt_info( "Rule 97: set MMT_SEC_HTTP2_HPACK_BOMB_RATIO=%"PRIu64, hpack_bomb_ratio );
 	}
 }
 
@@ -354,8 +686,10 @@ static inline void hpack_insert( h2_dir_t *d, uint32_t name_len, uint32_t value_
 		if( d->entries == NULL )
 			return;
 	}
-	if( d->table_max == 0 )
+	if( !d->table_max_known ){
 		d->table_max = HPACK_DEFAULT_TABLE_SIZE;
+		d->table_max_known = true;
+	}
 	if( size > d->table_max ){ //RFC 7541, 4.4: the table is emptied
 		hpack_clear( d );
 		return;
@@ -409,8 +743,11 @@ static inline uint64_t hpack_decoded_size( h2_dir_t *d, const uint8_t *p, uint32
 	uint32_t index, name_len, value_len;
 	uint8_t b;
 
-	if( d->table_max == 0 )
-		d->table_max = ( d->settings_max != 0 ) ? d->settings_max : HPACK_DEFAULT_TABLE_SIZE;
+	//the table size is the peer's SETTINGS_HEADER_TABLE_SIZE, 4096 by default (0 is a valid size)
+	if( !d->table_max_known ){
+		d->table_max = d->settings_known ? d->settings_max : HPACK_DEFAULT_TABLE_SIZE;
+		d->table_max_known = true;
+	}
 
 	while( p < end ){
 		b = *p;
@@ -423,6 +760,7 @@ static inline uint64_t hpack_decoded_size( h2_dir_t *d, const uint8_t *p, uint32
 			if( !hpack_int( &p, end, 5, &index ))
 				goto error;
 			d->table_max = ( index > HPACK_MAX_TABLE_SIZE ) ? HPACK_MAX_TABLE_SIZE : index;
+			d->table_max_known = true;
 			hpack_evict( d, d->table_max );
 		}else{                            //literal header field
 			bool indexing = ( (b & 0xC0) == 0x40 );
@@ -450,7 +788,7 @@ static inline uint64_t hpack_decoded_size( h2_dir_t *d, const uint8_t *p, uint32
 
 static inline int hpack_check_block( h2_dir_t *d, const uint8_t *p, uint32_t len ){
 	uint64_t size = hpack_decoded_size( d, p, len );
-	return ( size >= hpack_bomb_size && size >= (uint64_t)HPACK_BOMB_RATIO * len );
+	return ( size >= hpack_bomb_size && size >= hpack_bomb_ratio * len );
 }
 
 static inline int h2_block_fragment( h2_dir_t *d, uint8_t flags, const uint8_t *p, uint32_t len ){
@@ -508,9 +846,11 @@ static int h2_on_frame( h2_dir_t *d, uint8_t type, uint8_t flags, uint32_t sid, 
 			value = h2_u32( p + i + 2 );
 			if( id == 1 ){
 				value = ( value > HPACK_MAX_TABLE_SIZE ) ? HPACK_MAX_TABLE_SIZE : value;
-				h2_reverse->settings_max = value;
+				h2_reverse->settings_max   = value;
+				h2_reverse->settings_known = true;
 				//without a size update, the encoder uses the new limit
-				h2_reverse->table_max = value;
+				h2_reverse->table_max       = value;
+				h2_reverse->table_max_known = true;
 				hpack_evict( h2_reverse, value );
 			}
 		}
@@ -523,38 +863,33 @@ static int h2_on_frame( h2_dir_t *d, uint8_t type, uint8_t flags, uint32_t sid, 
 /**
  * Return 1 if the TCP segment completes an HTTP/2 header block whose decoded
  * header list is at least MMT_SEC_HTTP2_HPACK_BOMB_SIZE bytes (64 KiB by
- * default) and at least 10 times larger than the block: an HPACK bomb.
+ * default) and at least MMT_SEC_HTTP2_HPACK_BOMB_RATIO times (10 by default)
+ * larger than the block: an HPACK bomb.
  */
-static int em_check_hpack_bomb( const void *src, const void *dst, double sport, double dport, double seq, const char *payload ){
+static int em_check_hpack_bomb( const void *src, const void *dst, double sport, double dport, double seq, double ack,
+		double flags, const char *payload, const void *hierarchy ){
 	h2_dir_t *d;
-	if( src == NULL || dst == NULL || payload == NULL )
-		return 0;
-	//state of the reverse direction, for the SETTINGS sent in this direction
-	h2_reverse = h2_get_dir( dst, src, dport, sport );
-	d = h2_get_dir( src, dst, sport, dport );
+	size_t len;
+	//the state of the reverse direction is for the SETTINGS sent in this direction
+	d = h2_packet_dir( src, dst, sport, dport, flags, payload, hierarchy, &h2_reverse, &len );
 	if( d == NULL )
 		return 0;
-	if( d == h2_reverse ) //both directions use the same slot: #d replaced the reverse one
+	if( d == h2_reverse ) //same source and destination
 		h2_reverse = NULL;
-	return h2_segment( d, (uint32_t)seq, (const uint8_t *)payload, mmt_mem_size( payload ));
+	return h2_packet( d, h2_reverse, (uint32_t)seq, (uint32_t)ack, (uint8_t)flags, (const uint8_t *)payload, len );
 }
 
+//called once, by the main thread: free the state of every thread
 void on_unload(){
-	int i;
-	if( h2_dirs == NULL )
-		return;
-	for( i=0; i<H2_SLOTS; i++ )
-		h2_reset( &h2_dirs[i] );
-	free( h2_dirs );
-	h2_dirs = NULL;
+	h2_free_tables();
 }
 ]]></embedded_functions>
 
 <property value="THEN"  property_id="97" type_property="ATTACK" 
     description="5G Http2 Compression Attack" if_satisfied="">
     <event value="COMPUTE" event_id="1" 
-        description="HTTP/2 header block that decodes to 64 KiB or more and to 10 times its size or more (HPACK bomb)"
-        boolean_expression="( (256 &gt; http2.type) &amp;&amp; (#em_check_hpack_bomb( ip.src, ip.dst, tcp.src_port, tcp.dest_port, tcp.seq_nb, tcp.p_payload ) == 1) )"/>
+        description="HTTP/2 header block that decodes to 64 KiB or more and to 10 times its size or more, by default (HPACK bomb)"
+        boolean_expression="( (#em_check_hpack_bomb( ip.src, ip.dst, tcp.src_port, tcp.dest_port, tcp.seq_nb, tcp.ack_nb, tcp.flags, tcp.p_payload, meta.proto_hierarchy ) == 1) &amp;&amp; ((#is_exist( tcp.p_payload ) == 1) || true) )"/>
 
  <event value="COMPUTE" event_id="2" 
         description="Print IP source and destination addresses"
