@@ -17,6 +17,19 @@
 //include dirs of the generated code; compile_rule's extra gcc option follows them
 #define GCC_INCLUDES "./src/lib -I ./src/dpi -I/opt/mmt/security/include -I/opt/mmt/dpi/include"
 
+//-h/--help exits 0; any other wrong invocation is a usage error and exits 1
+static void _usage( const char *prog_name ){
+	fprintf( stderr, "Usage: %s output_file property_file option", prog_name );
+	fprintf( stderr, "\n - output_file   : path of file containing result that can be either a .c file or .so file");
+	fprintf( stderr, "\n - property_file : path to property file to read");
+	fprintf( stderr, "\n - option        : ");
+	fprintf( stderr, "\n      + \"-c\"     : generate only code c" );
+	fprintf( stderr, "\n      + otherwise: generate code c, then compile to .so file.");
+	fprintf( stderr, "\n                   This option will be transfered to gcc, for example, \"-I /tmp/include -lmath\"");
+	fprintf( stderr, "\n       %s -h, --help: print this usage\n", prog_name );
+	fprintf( stderr, "\n");
+}
+
 int main( int argc, char** argv ){
 	rule_t **rule_list;
 	size_t rule_count, i;
@@ -27,15 +40,12 @@ int main( int argc, char** argv ){
 	char *embedded_functions;
 	int ret, exit_code = 0;
 
+	if( argc == 2 && (strcmp( argv[1], "-h" ) == 0 || strcmp( argv[1], "--help" ) == 0 )){
+		_usage( argv[0] );
+		return 0;
+	}
 	if( argc != 3 && argc != 4){
-		fprintf( stderr, "Usage: %s output_file property_file option", argv[0] );
-		fprintf( stderr, "\n - output_file   : path of file containing result that can be either a .c file or .so file");
-		fprintf( stderr, "\n - property_file : path to property file to read");
-		fprintf( stderr, "\n - option        : ");
-		fprintf( stderr, "\n      + \"-c\"     : generate only code c" );
-		fprintf( stderr, "\n      + otherwise: generate code c, then compile to .so file.");
-		fprintf( stderr, "\n                   This option will be transfered to gcc, for example, \"-I /tmp/include -lmath\"");
-		fprintf( stderr, "\n");
+		_usage( argv[0] );
 		return 1;
 	}
 	xml_file     = argv[2];

@@ -79,16 +79,20 @@ void usage(const char * prg_name) {
 	fprintf(stderr, "\t-r <string> : Output results to redis, e.g., \"localhost:6379\"\n");
 	fprintf(stderr, "\t-v          : Verbose.\n");
 	fprintf(stderr, "\t-l          : Prints the available rules then exit.\n");
-	fprintf(stderr, "\t-h          : Prints this help.\n");
-	exit(1);
+	fprintf(stderr, "\t-h, --help  : Prints this help.\n");
+	//does not exit: -h exits with success, a usage error with failure
 }
 
 size_t parse_options(int argc, char ** argv, uint16_t *port_no, char *unix_domain, size_t *threads_count,
 		size_t *cores_count, uint32_t **core_mask, char *excluded_rules_mask, char *rule_mask, bool *verbose ) {
 	int opt, optcount = 0, x;
+	static const struct option long_opts[] = {
+		{ "help", no_argument, NULL, 'h' },
+		{ NULL, 0, NULL, 0 }
+	};
 	excluded_rules_mask[0] = '\0';
 	rule_mask[0]           = '\0';
-	while ((opt = getopt(argc, argv, "p:n:f:r:c:m:x:vlbh")) != EOF) {
+	while ((opt = getopt_long(argc, argv, "p:n:f:r:c:m:x:vlbh", long_opts, NULL)) != EOF) {
 		switch (opt) {
 		case 'p':
 			optcount++;
@@ -111,12 +115,15 @@ size_t parse_options(int argc, char ** argv, uint16_t *port_no, char *unix_domai
 			optcount++;
 			if (optcount < 1) {
 				usage(argv[0]);
+				exit(1);
 			}
 			x = atoi( optarg );
 			if( x >= 0 )
 				*threads_count = x;
-			else
+			else{
 				usage(argv[0]);
+				exit(1);
+			}
 			break;
 		case 'm':
 			optcount++;
@@ -129,8 +136,10 @@ size_t parse_options(int argc, char ** argv, uint16_t *port_no, char *unix_domai
 		case 'c':
 			optcount++;
 			*cores_count = expand_number_range( optarg, core_mask );
-			if( *cores_count == 0 )
+			if( *cores_count == 0 ){
 				usage(argv[0]);
+				exit(1);
+			}
 			break;
 		case 'l':
 			mmt_sec_init( excluded_rules_mask );
@@ -146,7 +155,11 @@ size_t parse_options(int argc, char ** argv, uint16_t *port_no, char *unix_domai
 			*verbose = YES;
 			break;
 		case 'h':
-		default: usage(argv[0]);
+			usage(argv[0]);
+			exit(0);
+		default:
+			usage(argv[0]);
+			exit(1);
 		}
 	}
 	return 0;

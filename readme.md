@@ -65,8 +65,8 @@ cd mmt-security
     - `REDIS`: this module allows to output to redis. Consequently `hiredis` library must be installed. 
     - `UPDATE_RULES`: this module allows to add or remove rules at runtime. This is enabled by default. To disable this, e.g., in the case we do not need this feature: `MODULE_NAME=0`
 
-- compile mmt-security to get .deb file in order to re-distribute its binary: `make deb` (needs `dpkg-dev`, for `dpkg-deb` and `dpkg-shlibdeps`)  
-   You will get a .deb file, e.g., `mmt-security_1.0.1_8d5d7ea_Linux_x86_64.deb`, containing the mmt-security binaries, libraries and compiled rules.  
+- compile mmt-security to get .deb file in order to re-distribute its binary: `make deb` (needs `dpkg-dev`, for `dpkg-shlibdeps`; `dpkg-deb` is in the essential `dpkg` package)  
+   You will get a .deb file, e.g., `mmt-security_1.0.1_8d5d7ea_Linux_x86_64.deb`, containing the mmt-security binaries, libraries and compiled rules. The commit part of the name (`8d5d7ea` above) is `nogit` when the tree has no git metadata git can read, e.g., a tarball — the same holds for the rpm's `Release:` tag.
    To install this deb file on a new debian-based machine, install the `mmt-dpi` package (the bound, `MIN_DPI_VERSION` in the `Makefile`, is 1.10.3 or later) first — either a package from the [MMT-DPI releases](https://github.com/Montimage/mmt-dpi/releases) or a deb built by MMT-DPI's own `make deb` — then use: `sudo dpkg -i file_name.deb`. An MMT-DPI installed from source (`make install`) registers no `mmt-dpi` package, so `dpkg -i` fails on the dependency: install an `mmt-dpi` deb instead.
 
 - install mmt-security on the current machine: `make install`

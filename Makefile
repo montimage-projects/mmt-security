@@ -23,8 +23,13 @@ MMT_DPI_DIR := $(MMT_BASE)/dpi
 # directory where MMT-DPI was installed
 
 
-#get git version abbrev
-GIT_VERSION := $(shell git log --format="%h" -n 1)
+#get git version abbrev; "nogit" when the tree has no git metadata that git can
+# read (a tarball, or a mount whose ownership git refuses), so a package built
+# there still gets a clear version part (fork #47)
+GIT_VERSION := $(shell git log --format="%h" -n 1 2>/dev/null)
+ifeq ($(GIT_VERSION),)
+  GIT_VERSION := nogit
+endif
 VERSION     := 1.2.20
 # minimum MMT-DPI version required by the deb and rpm packages (readme.md):
 # the latest release, the one CI tests (DPI_VERSION in .github/workflows/c-cpp.yml)
@@ -285,25 +290,33 @@ endif
 	
 DEB_NAME = mmt-security_$(VERSION)_$(GIT_VERSION)_$(shell uname -s)_$(shell uname -m)
 
+#Depends: the packages of the shared libraries the packaged binaries are
+# linked to (the libxml2 soname differs by release), resolved by
+# dpkg-shlibdeps (dpkg-dev); its mmt-dpi entry is replaced by the
+# MIN_DPI_VERSION bound, which also covers an mmt-dpi installed without
+# a package (--ignore-missing-info). dpkg-shlibdeps wants a
+# debian/control in the current directory; a minimal one is lent to it
+# inside the package tree and removed before dpkg-deb runs.
+#The whole recipe is one shell: the trap removes the staging dir and the
+# .shlibs-deps file on any failing step, so a failed run leaves nothing
+# behind — and a stale staging dir from a previous (killed or failed) run
+# is removed first, which a non-empty dir would otherwise break mv on
+# (fork #47)
 deb: all lib sample_rules copy_files
-	$(QUIET) $(MKDIR) $(DEB_NAME)/DEBIAN $(DEB_NAME)/$(INSTALL_DIR)
-	$(QUIET) $(MV) $(TMP_DIR)/* $(DEB_NAME)/$(INSTALL_DIR)
-	$(QUIET) $(RM) $(TMP_DIR)
-	
-	@#Depends: the packages of the shared libraries the packaged binaries are
-	@# linked to (the libxml2 soname differs by release), resolved by
-	@# dpkg-shlibdeps (dpkg-dev); its mmt-dpi entry is replaced by the
-	@# MIN_DPI_VERSION bound, which also covers an mmt-dpi installed without
-	@# a package (--ignore-missing-info). dpkg-shlibdeps wants a
-	@# debian/control in the current directory; a minimal one is lent to it
-	@# inside the package tree and removed before dpkg-deb runs.
-	$(QUIET) ( cd $(DEB_NAME) \
+	$(QUIET) set -e; \
+	trap 's=$$?; if [ $$s -ne 0 ]; then $(RM) $(DEB_NAME) $(DEB_NAME).shlibs-deps; fi; exit $$s' EXIT; \
+	$(RM) $(DEB_NAME); \
+	$(MKDIR) $(DEB_NAME)/DEBIAN $(DEB_NAME)/$(INSTALL_DIR); \
+	$(MV) $(TMP_DIR)/* $(DEB_NAME)/$(INSTALL_DIR); \
+	$(RM) $(TMP_DIR); \
+	\
+	( cd $(DEB_NAME) \
 		&& $(MKDIR) debian \
 		&& printf 'Source: mmt-security\nPackage: mmt-security\n' > debian/control \
 		&& dpkg-shlibdeps --ignore-missing-info -l$(MMT_DPI_DIR)/lib -O \
 			.$(INSTALL_DIR)/bin/* .$(INSTALL_DIR)/lib/$(LIB_NAME).so.$(VERSION); \
-		s=$$?; $(RM) debian; exit $$s ) > $(DEB_NAME).shlibs-deps
-	$(QUIET) shlibs=`sed -n 's/^shlibs:Depends=//p' $(DEB_NAME).shlibs-deps \
+		s=$$?; $(RM) debian; exit $$s ) > $(DEB_NAME).shlibs-deps; \
+	shlibs=`sed -n 's/^shlibs:Depends=//p' $(DEB_NAME).shlibs-deps \
 		| sed 's/mmt-dpi ([^,]*)//g; s/, ,/,/g; s/^, //; s/, $$//'`; \
 	$(RM) $(DEB_NAME).shlibs-deps; \
 	printf '%s\n' \
@@ -317,14 +330,13 @@ deb: all lib sample_rules copy_files
 		'Description: MMT-Security: An intrusion detection system' \
 		"  Version id: $(GIT_VERSION). Build time: `date +'%Y-%m-%d %H:%M:%S'`" \
 		'Homepage: http://www.montimage.com' \
-		> $(DEB_NAME)/DEBIAN/control
-		
-	$(QUIET) $(MKDIR) $(DEB_NAME)/etc/ld.so.conf.d/
-	@echo "$(INSTALL_DIR)/lib" > $(DEB_NAME)/etc/ld.so.conf.d/mmt-security.conf
-	
-	@#--root-owner-group: the files are root's whatever user runs make deb
-	$(QUIET) dpkg-deb --root-owner-group -b $(DEB_NAME)
-	$(QUIET) $(RM) $(DEB_NAME)
+		> $(DEB_NAME)/DEBIAN/control; \
+	\
+	$(MKDIR) $(DEB_NAME)/etc/ld.so.conf.d/; \
+	echo "$(INSTALL_DIR)/lib" > $(DEB_NAME)/etc/ld.so.conf.d/mmt-security.conf; \
+	\
+	dpkg-deb --root-owner-group -b $(DEB_NAME); \
+	$(RM) $(DEB_NAME)
 	
 	
 #create rpm file for RHEL
@@ -512,6 +524,11 @@ check-smp-server: _prepare sec_server rule_info
 check: check-fsm-bounds
 check-fsm-bounds: _prepare
 	@./check/check-fsm-bounds.sh
+
+# -h/--help exits 0 and a bad option exits 1 for every tool (fork #47)
+check: check-help
+check-help: _prepare sec_server rule_info
+	@./check/check-help.sh ./$(MAIN_STAND_ALONE) ./$(MAIN_SEC_SERVER) ./$(MAIN_PLUGIN_INFO) ./$(MAIN_GEN_PLUGIN)
 
 # ThreadSanitizer on the SMP message hand-off (fork #45): a TSan build in a
 # scratch copy (the normal build is untouched), then `-c 1-8` on every
