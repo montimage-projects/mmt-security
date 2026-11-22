@@ -90,6 +90,11 @@ static inline enum fsm_handle_event_value _update_fsm( fsm_t *fsm, const fsm_sta
 
 	//mmt_debug( "fsm_id = %d (%p), ref = %zu, event_id: %d", fsm->id, fsm, mmt_mem_reference_count( event_data), tran->event_type );
 
+	//#current_event_id must index inside the execution trace; an invalid
+	//value would make the accesses below corrupt the heap
+	if( unlikely( fsm->current_event_id >= fsm->execution_trace->elements_count ))
+		return FSM_ERR_ARG;
+
 	//check if we will override an element of execution trace
 	if( unlikely( fsm->execution_trace->data[ fsm->current_event_id   ] != NULL ) ){
 		free_message_t( fsm->execution_trace->data[ fsm->current_event_id   ] );
@@ -186,6 +191,12 @@ enum fsm_handle_event_value fsm_handle_event( fsm_t *fsm, uint16_t transition_in
 	if( transition_index >= fsm->current_state->transitions_count )
 		mmt_halt("Transition_index is greater than transitions_count (%d >= %zu)", transition_index,  fsm->current_state->transitions_count );
 #endif
+
+	//#transition_index was recorded for the state the fsm was in when its
+	//node was registered; if the fsm has since moved to another state having
+	//fewer transitions, the index would be out of bounds => do not fire
+	if( unlikely( transition_index >= fsm->current_state->transitions_count ))
+		return FSM_NO_STATE_CHANGE;
 
 	//	mmt_debug( "Verify transition: %d of fsm %p", transition_index, fsm );
 

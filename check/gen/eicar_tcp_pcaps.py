@@ -50,7 +50,7 @@ def main(out_dir):
         client("A",  c_seq + 1, s_seq + 1),   # 3  ACK
     ]
     # upload 1: header + first 40 bytes of the file, then the 28 last ones;
-    # the test string completes on packet 5 -> first alert
+    # the test string completes on packet 6 -> first alert
     d1 = req(b"a") + EICAR[:40]
     pkts += [
         client("PA", c_seq + 1, s_seq + 1, d1),                       # 4

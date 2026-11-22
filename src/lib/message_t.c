@@ -97,12 +97,19 @@ size_t free_message_ts( message_t *msg, uint16_t size ){
 	//free message only when there is no more reference to it:
 	//read ref_count and decrement atomically, so two threads dropping the
 	//last references cannot both see "ref_count <= size" and both free
+	__tsan_release_msg( msg );
 	ret = __sync_fetch_and_sub( &mem->ref_count, size );
 
 	if( ret <= size ){
 		//ref_count was not yet 0: we dropped the last references => free once
-		if( ret != 0 )
+		if( ret != 0 ){
+			//order the free after every previous reference drop: without an
+			//acquire here, a reader that released its reference on another
+			//thread has no happens-before edge with the reuse of this block,
+			//so a sanitizer pairs its read with the next user's write.
+			__tsan_acquire_msg( msg );
 			mmt_mem_force_free( msg );
+		}
 		return 0;
 	}
 

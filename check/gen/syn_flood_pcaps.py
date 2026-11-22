@@ -53,6 +53,19 @@ under 100 KB, so the packets are minimal Ethernet + IPv4 + TCP headers.
   retransmissions 1 s and 3 s later, then 4 s of completed handshakes between
   two other hosts, and no packet to port 80. It documents a gap: no alert of
   rule 56 (it reports on a packet to the server port) nor of rule 57.
+- 56.evict_post_expiry.pcap: the drop of a pending alert that expired. 3
+  spoofed SYN-ACKs of 172.31.99.10:80 raise a pending alert at ~1 s; its port
+  then stays quiet. 7 other servers crafted for the unseeded hash (seed 0)
+  fill the victim's slot run at ~1.5 s, and an 8th one's handshake creates
+  its slot at ~5 s: the victim's alert, raised more than 2 s earlier
+  (EM_SYN56_EXPIRE_US), is evictable, it has the oldest half-open handshake,
+  so the new server takes its slot and drops the pending alert. A witness
+  server goes through the same pending-alert path but is then reported by a
+  packet to its port, and a probe packet finally reaches the victim's port:
+  it would report the victim's alert had it survived. Expected: exactly 1
+  alert of rule 56, for the witness. With a larger EM_SYN56_EXPIRE_US the
+  victim's slot is still protected when the attacker's slot is created and
+  the probe reports the victim: 2 alerts.
 """
 import os
 import random
@@ -278,6 +291,43 @@ def spoofed_short():
     return pkts
 
 
+def evict_post_expiry():
+    victim, witness = "172.31.99.10", "172.31.99.20"
+    home = home56(victim, 80)
+    others, x = [], 1
+    while len(others) < 8:
+        ip = ip_str(0x0A000000 + x)
+        x += 1
+        if home56(ip, 80) == home:
+            others.append(ip)
+    fillers, attacker = others[:7], others[7]
+    pkts = []
+    # the victim's 3 half-open handshakes: spoofed SYN-ACKs (nothing is ever
+    # sent to its port, so the alert they raise stays pending)
+    for i in range(3):
+        pkts.append(pkt(T0 + i * 0.001, victim, ip_str(0x0B000000 + i), 80, 4000 + i, "SA",
+                        random.getrandbits(32), random.getrandbits(32), to_server=False))
+    # 7 crafted servers fill the victim's slot run, one half-open handshake each
+    for k, ip in enumerate(fillers):
+        pkts.append(pkt(T0 + 0.5 + k * 0.001, ip, ip_str(0x0C000000 + k), 80, 5000 + k, "SA",
+                        random.getrandbits(32), random.getrandbits(32), to_server=False))
+    # the attacker joins the slot run: its handshake leaves the FIFO at ~5 s,
+    # when the victim's alert (raised at ~1 s) expired and is dropped
+    pkts.append(pkt(T0 + 4.0, attacker, ip_str(0x0D000000), 80, 6000, "SA",
+                    random.getrandbits(32), random.getrandbits(32), to_server=False))
+    # the witness goes through the same pending-alert path; the packet to its
+    # port both pops its handshakes and reports the alert
+    for i in range(3):
+        pkts.append(pkt(T0 + 5.0 + i * 0.001, witness, ip_str(0x0E000000 + i), 80, 7000 + i, "SA",
+                        random.getrandbits(32), random.getrandbits(32), to_server=False))
+    pkts.append(pkt(T0 + 6.5, "10.20.30.40", witness, 41000, 80, "S", random.getrandbits(32)))
+    # probe: would report the victim's alert if the eviction had not dropped it
+    pkts.append(pkt(T0 + 7.0, "10.20.30.41", victim, 41001, 80, "S", random.getrandbits(32)))
+    other_traffic(pkts, T0, 8.0, 0.05)
+    pkts.sort(key=lambda p: p.time)
+    return pkts
+
+
 def main():
     out = sys.argv[1] if len(sys.argv) > 1 else "."
     for name, gen in (("57.syn_flood_lan_decoys", lan_decoys),
@@ -288,7 +338,8 @@ def main():
                       ("56.crafted_servers_control", crafted_servers_control),
                       ("56.crafted_servers_attack", crafted_servers_attack),
                       ("57.syn_flood_flush_lowcount", flush_lowcount),
-                      ("56.57.syn_flood_spoofed_short", spoofed_short)):
+                      ("56.57.syn_flood_spoofed_short", spoofed_short),
+                      ("56.evict_post_expiry", evict_post_expiry)):
         random.seed(name)
         path = os.path.join(out, name + ".pcap")
         wrpcap(path, gen())

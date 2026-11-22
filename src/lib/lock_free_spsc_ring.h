@@ -34,8 +34,8 @@
 
 typedef struct lock_free_spsc_ring_struct
 {
-    volatile uint32_t _head __aligned;
-    volatile uint32_t _tail;
+    _Atomic uint32_t _head __aligned;
+    _Atomic uint32_t _tail;
 
     uint32_t _cached_head;
     uint32_t _cached_tail;

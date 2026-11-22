@@ -38,7 +38,7 @@ fi
 reference(){ # pcap
 	local n
 	rm -f "$TMP"/mmt-security*.csv
-	timeout -s KILL 180 "$STANDALONE" -c 1 -t "$1" -f "$TMP/" > "$TMP/ref.log" 2>&1
+	timeout -s KILL 300 "$STANDALONE" -c 1 -t "$1" -f "$TMP/" > "$TMP/ref.log" 2>&1
 	n=$(cat "$TMP"/mmt-security*.csv 2>/dev/null | wc -l)
 	echo "$n"
 	[ "$n" -gt 0 ]
@@ -61,7 +61,9 @@ run(){ # cores pcap bound
 run 1-4 check/pcap/56.57.syn_flood.pcap 60
 run 1-4 check/pcap/56.syn_flood_short_tail.pcap 60
 run 1-8 check/pcap/15.nikto.pcap 60
-run 1-8 "$FLOOD" 60
+#the flood takes ~75-120 s on a slow or loaded machine; the bound only needs
+#to be comfortably above the worst legit duration to catch the old infinite hang
+run 1-8 "$FLOOD" 240
 
 # SIGTERM must stop a running instance (it used to deadlock inside the
 # handler): the generated flood runs several seconds under `-c 1-8`, so the

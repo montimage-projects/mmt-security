@@ -52,6 +52,17 @@ ifdef VALGRIND
   CFLAGS += -DVALGRIND_MODE
 endif
 
+# ThreadSanitizer build of the engine and the rules (fork #45): `make TSAN=1`.
+# check/check-tsan.sh sweeps every check/pcap with -c under such a build.
+ifdef TSAN
+  CFLAGS        += -fsanitize=thread
+  CLDFLAGS      += -fsanitize=thread
+  RULE_GCC_ARGS := -fsanitize=thread
+  # -fsanitize=thread links a PIE, which resolves the undefined references of
+  # libmmt_tcpip.so: it needs libmmt_core in the link (standalone already has it)
+  LIBS          += -l:libmmt_core.so
+endif
+
 ifdef REDIS
   CFLAGS += -DMODULE_REDIS_OUTPUT
   LIBS   += -lhiredis
@@ -217,7 +228,7 @@ endif
 
 
 rules/%.so: compile_rule
-	$(QUIET) ./$(MAIN_GEN_PLUGIN) rules/$*.so rules/$*.xml
+	$(QUIET) ./$(MAIN_GEN_PLUGIN) rules/$*.so rules/$*.xml $(RULE_GCC_ARGS)
 	
 sample_rules: $(SAMPLE_RULES)
 
@@ -475,7 +486,15 @@ check-smp: _prepare
 check: check-smp-server
 check-smp-server: _prepare sec_server rule_info
 	@./check/check-smp-server.sh ./$(MAIN_SEC_SERVER)
-	
+
+# ThreadSanitizer on the SMP message hand-off (fork #45): a TSan build in a
+# scratch copy (the normal build is untouched), then `-c 1-8` on every
+# check/pcap, all rules and rule 54 alone; no report may remain unexplained
+# (check/tsan_suppressions.txt holds the explained false positives)
+check: check-tsan
+check-tsan:
+	@./check/check-tsan.sh
+
 _csv.%: _prepare
 	$(QUIET) $(RM) /tmp/mmt-security*.csv
 	$(QUIET) bash -c "$(CHECK_ENV) ./$(MAIN_STAND_ALONE) -v $(CHECK_OPT) -t check/pcap/$*.pcap -f /tmp/" || exit 1
