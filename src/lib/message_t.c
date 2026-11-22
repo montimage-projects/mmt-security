@@ -71,8 +71,15 @@ message_t *create_message_t(){
 	if( unlikely( _memory == NULL ))
 		_memory = mmt_mem_revert( _create_local_message_t() );
 
-	//the message being created is a copy of _memory
-	msg = mmt_mem_force_dup( _memory->data, _memory->size );
+	//the message being created is a copy of the head of _memory:
+	//the message_t struct and its elements array. The _data workspace
+	//(input.max_message_size, tens of KB) is never read before being
+	//written by set_element_data_message_t, so duplicating it would only
+	//copy uninitialized bytes for every message.
+	message_t *tpl  = (message_t *) _memory->data;
+	size_t head_len = sizeof( message_t ) + sizeof( message_element_t ) * tpl->elements_count;
+	msg = mmt_mem_alloc( _memory->size );
+	memcpy( msg, tpl, head_len );
 	EXEC_ONLY_IN_VALGRIND_MODE( ANNOTATE_HAPPENS_BEFORE( & msg ) );
 
 	//update data pointers
