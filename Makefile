@@ -57,8 +57,14 @@ ifdef VALGRIND
   CFLAGS += -DVALGRIND_MODE
 endif
 
-# ThreadSanitizer build of the engine and the rules (fork #45): `make TSAN=1`.
-# check/check-tsan.sh sweeps every check/pcap with -c under such a build.
+# AddressSanitizer build of the engine and the rules: `make ASAN=1`.
+ifdef ASAN
+  CFLAGS        += -fsanitize=address -g
+  CLDFLAGS      += -fsanitize=address
+  RULE_GCC_ARGS := -fsanitize=address
+  LIBS          += -l:libmmt_core.so
+endif
+
 ifdef TSAN
   CFLAGS        += -fsanitize=thread
   CLDFLAGS      += -fsanitize=thread
