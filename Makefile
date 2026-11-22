@@ -513,6 +513,11 @@ check: check-fsm-bounds
 check-fsm-bounds: _prepare
 	@./check/check-fsm-bounds.sh
 
+# -h/--help exits 0 and a bad option exits 1 for every tool (fork #47)
+check: check-help
+check-help: _prepare sec_server rule_info
+	@./check/check-help.sh ./$(MAIN_STAND_ALONE) ./$(MAIN_SEC_SERVER) ./$(MAIN_PLUGIN_INFO) ./$(MAIN_GEN_PLUGIN)
+
 # ThreadSanitizer on the SMP message hand-off (fork #45): a TSan build in a
 # scratch copy (the normal build is untouched), then `-c 1-8` on every
 # check/pcap, all rules and rule 54 alone; no report may remain unexplained

@@ -67,7 +67,7 @@ void usage(const char * prg_name) {
 	fprintf(stderr, "\t                 such rules see a flow only until its stream reaches that size.\n");
 	fprintf(stderr, "\t-v             : Verbose.\n");
 	fprintf(stderr, "\t-l             : Prints the available rules then exit.\n");
-	fprintf(stderr, "\t-h             : Prints this help.\n");
+	fprintf(stderr, "\t-h, --help     : Prints this help.\n");
 	//does not exit: -h exits with success, a usage error with failure
 }
 
@@ -80,10 +80,14 @@ size_t parse_options(int argc, char ** argv, char *filename, int *type, uint16_t
 	excludes_rules_mask[0] = '\0';
 	rule_mask[0]           = '\0';
 
+	static const struct option long_opts[] = {
+		{ "help", no_argument, NULL, 'h' },
+		{ NULL, 0, NULL, 0 }
+	};
 	*verbose = NO;
 	*is_ignore = NO;
 	filename[0] = '\0';
-	while ((opt = getopt(argc, argv, "t:i:f:r:c:m:x:lhvgR")) != EOF) {
+	while ((opt = getopt_long(argc, argv, "t:i:f:r:c:m:x:lhvgR", long_opts, NULL)) != EOF) {
 		switch (opt) {
 		case 't':
 			optcount++;
