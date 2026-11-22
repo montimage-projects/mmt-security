@@ -23,7 +23,7 @@ Suppose on your machine, you have:
 
 - *MMT-DPI* installed in `/opt/mmt/dpi`. CI builds and checks against MMT-DPI v1.10.3 (see `DPI_VERSION` in `.github/workflows/c-cpp.yml`). Avoid MMT-DPI v1.10.0 to v1.10.2: they lose the TCP payload of reassembled IPv4 fragments ([mmt-dpi#84](https://github.com/Montimage/mmt-dpi/issues/84)), so `make check` 19.SQLI fails.
 
-  The packages built by `make deb` and `make rpm` require MMT-DPI 1.10.3 or later (`Depends: mmt-dpi (>= 1.10.3)`, `Requires: mmt-dpi >= 1.10.3`; the version is `MIN_DPI_VERSION` in the `Makefile`). The DICOM rules read `tcp.payload_len` bytes of `tcp.p_payload`, and MMT-DPI bounds `tcp.payload_len` by the captured bytes only since 1.9.0; 1.10.3 is the release the project tests and pins.
+  The packages built by `make deb` and `make rpm` require MMT-DPI 1.10.3 or later (`Depends: mmt-dpi (>= 1.10.3)`, `Requires: mmt-dpi >= 1.10.3`; the version is `MIN_DPI_VERSION` in the `Makefile`, and an `mmt-dpi` deb built by MMT-DPI's own `make deb` satisfies it as well as a release package does). The DICOM rules read `tcp.payload_len` bytes of `tcp.p_payload`, and MMT-DPI bounds `tcp.payload_len` by the captured bytes only since 1.9.0; 1.10.3 is the release the project tests and pins.
 
 - *libxml2-dev, libpcap-dev, libconfuse-dev* :  `sudo apt-get install libxml2-dev libpcap-dev libconfuse-dev`
 
@@ -65,9 +65,9 @@ cd mmt-security
     - `REDIS`: this module allows to output to redis. Consequently `hiredis` library must be installed. 
     - `UPDATE_RULES`: this module allows to add or remove rules at runtime. This is enabled by default. To disable this, e.g., in the case we do not need this feature: `MODULE_NAME=0`
 
-- compile mmt-security to get .deb file in order to re-distribute its binary: `make deb`  
+- compile mmt-security to get .deb file in order to re-distribute its binary: `make deb` (needs `dpkg-dev`, for `dpkg-deb` and `dpkg-shlibdeps`)  
    You will get a .deb file, e.g., `mmt-security_1.0.1_8d5d7ea_Linux_x86_64.deb`, containing the mmt-security binaries, libraries and compiled rules.  
-   To install this deb file on a new debian-based machine, install the `mmt-dpi` package (1.10.3 or later, from the [MMT-DPI releases](https://github.com/Montimage/mmt-dpi/releases)) first, then use: `sudo dpkg -i file_name.deb`. An MMT-DPI installed from source (`make install`) registers no `mmt-dpi` package, so `dpkg -i` fails on the dependency: install the MMT-DPI release package instead.
+   To install this deb file on a new debian-based machine, install the `mmt-dpi` package (the bound, `MIN_DPI_VERSION` in the `Makefile`, is 1.10.3 or later) first — either a package from the [MMT-DPI releases](https://github.com/Montimage/mmt-dpi/releases) or a deb built by MMT-DPI's own `make deb` — then use: `sudo dpkg -i file_name.deb`. An MMT-DPI installed from source (`make install`) registers no `mmt-dpi` package, so `dpkg -i` fails on the dependency: install an `mmt-dpi` deb instead.
 
 - install mmt-security on the current machine: `make install`
 
