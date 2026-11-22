@@ -28,6 +28,24 @@ typedef struct mmt_memory_struct{
 	void*     data;
 }mmt_memory_t;
 
+/* ThreadSanitizer annotations for reference-counted objects shared between
+ * threads (notably message_t blocks dispatched to worker rings): each
+ * reference drop releases the object and the thread freeing the last
+ * reference acquires it, so the reuse of the block is ordered after every
+ * thread's accesses. No-ops outside a TSan build.
+ */
+#ifndef __has_feature
+	#define __has_feature( x ) 0
+#endif
+#if defined( __SANITIZE_THREAD__ ) || __has_feature( thread_sanitizer )
+	#include <sanitizer/tsan_interface.h>
+	#define __tsan_release_msg( p )  __tsan_release( p )
+	#define __tsan_acquire_msg( p )  __tsan_acquire( p )
+#else
+	#define __tsan_release_msg( p )  do{}while(0)
+	#define __tsan_acquire_msg( p )  do{}while(0)
+#endif
+
 #define SIZE_OF_MMT_MEMORY_T sizeof( mmt_memory_t )
 
 #define mmt_mem_revert( x ) (mmt_memory_t *) ( (uint8_t*)x - SIZE_OF_MMT_MEMORY_T )

@@ -90,6 +90,19 @@ static inline enum fsm_handle_event_value _update_fsm( fsm_t *fsm, const fsm_sta
 
 	//mmt_debug( "fsm_id = %d (%p), ref = %zu, event_id: %d", fsm->id, fsm, mmt_mem_reference_count( event_data), tran->event_type );
 
+	//#current_event_id must index inside the execution trace; an invalid
+	//value would make the accesses below corrupt the heap
+	if( unlikely( fsm->current_event_id >= fsm->execution_trace->elements_count )){
+		//unreachable on valid input: a corruption precursor that must not
+		//be silent in a release build; the counter bounds the log volume
+		//if a corrupt fsm fires the check on every message
+		static int _oob_event_id_logs;
+		if( __sync_fetch_and_add( &_oob_event_id_logs, 1 ) < 100 )
+			mmt_error( "fsm %u: current_event_id %u is outside the execution trace of %zu elements, event dropped",
+					fsm->id, fsm->current_event_id, fsm->execution_trace->elements_count );
+		return FSM_ERR_ARG;
+	}
+
 	//check if we will override an element of execution trace
 	if( unlikely( fsm->execution_trace->data[ fsm->current_event_id   ] != NULL ) ){
 		free_message_t( fsm->execution_trace->data[ fsm->current_event_id   ] );
@@ -186,6 +199,19 @@ enum fsm_handle_event_value fsm_handle_event( fsm_t *fsm, uint16_t transition_in
 	if( transition_index >= fsm->current_state->transitions_count )
 		mmt_halt("Transition_index is greater than transitions_count (%d >= %zu)", transition_index,  fsm->current_state->transitions_count );
 #endif
+
+	//#transition_index was recorded for the state the fsm was in when its
+	//node was registered; if the fsm has since moved to another state having
+	//fewer transitions, the index would be out of bounds => do not fire
+	if( unlikely( transition_index >= fsm->current_state->transitions_count )){
+		//same as above: unreachable on valid input, so log it once it
+		//happens, but bound the volume if a corrupt node fires repeatedly
+		static int _oob_tran_index_logs;
+		if( __sync_fetch_and_add( &_oob_tran_index_logs, 1 ) < 100 )
+			mmt_error( "fsm %u: transition_index %u is outside the %zu transitions of the current state, not fired",
+					fsm->id, transition_index, fsm->current_state->transitions_count );
+		return FSM_NO_STATE_CHANGE;
+	}
 
 	//	mmt_debug( "Verify transition: %d of fsm %p", transition_index, fsm );
 

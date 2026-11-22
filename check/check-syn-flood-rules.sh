@@ -154,5 +154,36 @@ else
 	fail "cannot compile check/syn_flood_rule56.c"
 fi
 
+echo
+echo "Testing rule 56's drop after expiry (56.evict_post_expiry) is ruled by EM_SYN56_EXPIRE_US"
+#check/pcap/56.evict_post_expiry.pcap expects 1 alert: the victim's pending alert
+# expires after EM_SYN56_EXPIRE_US (2 s) of quiet and its slot is taken by a new
+# server, so only the witness's pending alert survives to be reported.
+# Rebuilding rule 56 with a 20 s expiry must keep the victim's alert too (2
+# alerts): the count the committed expect file encodes is a function of the
+# constant, so the check fails if EM_SYN56_EXPIRE_US is changed.
+PCAP56E=check/pcap/56.evict_post_expiry.pcap
+n=$(alerts 56 "$PCAP56E" MMT_SEC_SYN_FLOOD_HASH_SEED=0)
+v=$(cat "$TMP"/out/*.csv 2>/dev/null | grep -c '^[^,]*,[^,]*,[^,]*,[^,]*,56,.*"ip.dst","172.31.99.20"\].*"tcp.dest_port",80\]')
+echo "  default EM_SYN56_EXPIRE_US=2000000: $n alert(s), $v for the witness 172.31.99.20:80"
+[ "$n" = 1 ] || fail "rule 56 gives $n alerts on $PCAP56E with the unseeded hash, expected 1: the victim's expired pending alert must be dropped"
+[ "$v" = 1 ] || fail "rule 56 gives $n alerts on $PCAP56E, $v for the witness 172.31.99.20:80"
+mkdir "$TMP/rules"
+sed 's/#define EM_SYN56_EXPIRE_US   2000000 /#define EM_SYN56_EXPIRE_US   20000000 /' rules/56.syn_flooding.xml > "$TMP/56.long_expire.xml"
+if grep -q "EM_SYN56_EXPIRE_US   20000000" "$TMP/56.long_expire.xml" \
+		&& ./compile_rule "$TMP/rules/56.syn_flooding.so" "$TMP/56.long_expire.xml" > "$TMP/log" 2>&1; then
+	(
+		cd "$TMP" || exit 1
+		rm -rf out; mkdir out
+		MMT_SEC_SYN_FLOOD_HASH_SEED=0 "$OLDPWD/$STANDALONE" -x "1-55,58-99999" -t "$OLDPWD/$PCAP56E" -f out/ > log2 2>&1 \
+			&& cat out/*.csv 2>/dev/null | cut -d, -f5 | grep -cx 56 > n2
+	) || true
+	n=$(cat "$TMP/n2" 2>/dev/null)
+	echo "  EM_SYN56_EXPIRE_US=20000000: ${n:-0} alert(s)"
+	[ "$n" = 2 ] || fail "rule 56 with EM_SYN56_EXPIRE_US=20 s gives ${n:-0} alerts on $PCAP56E, expected 2: the victim's pending alert must survive"
+else
+	fail "cannot build rule 56 with EM_SYN56_EXPIRE_US=20000000"
+fi
+
 [ $status -eq 0 ] && echo "  => OK"
 exit $status

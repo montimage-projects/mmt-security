@@ -198,18 +198,15 @@ void _reset_engine_for_fsm( rule_engine_t *_engine, fsm_t *fsm ){
 	_engine->avail_fsm_id = fsm_id;
 }
 /**
- * Remove only one instance from
- * - (1) list of expecting events, and from
- * - (2) list of instances
+ * Remove all nodes referencing #fsm from the lists #fsm_by_expecting_event_id.
+ * A node registered for a state becomes obsolete once the fsm moves to another
+ * state: keeping it would fire its transition index against the wrong state.
  */
 static inline
-void _reset_engine_for_instance( rule_engine_t *_engine, fsm_t *fsm ){
+void _remove_fsm_from_expecting_events( rule_engine_t *_engine, fsm_t *fsm ){
 	size_t i;
 	link_node_t *node, *ptr;
 	_fsm_tran_index_t *fsm_ind;
-	uint16_t fsm_id = fsm_get_id( fsm );
-
-	//(1) - remove fsm from the list #fsm_by_expecting_event_id
 
 	//for each entry (that is a list) of expecting event i
 	for( i=0; i<_engine->events_count; i++ ){
@@ -238,6 +235,19 @@ void _reset_engine_for_instance( rule_engine_t *_engine, fsm_t *fsm ){
 			node = ptr;
 		}
 	}
+}
+
+/**
+ * Remove only one instance from
+ * - (1) list of expecting events, and from
+ * - (2) list of instances
+ */
+static inline
+void _reset_engine_for_instance( rule_engine_t *_engine, fsm_t *fsm ){
+	uint16_t fsm_id = fsm_get_id( fsm );
+
+	//(1) - remove fsm from the list #fsm_by_expecting_event_id
+	_remove_fsm_from_expecting_events( _engine, fsm );
 
 	//(2) - remove fsm from the list of instances
 	//TODO: refine
@@ -308,14 +318,12 @@ enum verdict_type _process_a_node( link_node_t *node, uint16_t event_id, message
 		if( val == FSM_STATE_CHANGED ){
 			//mmt_debug( "FSM_STATE_CHANGED" );
 
-			//remove from old list
-			//=> the #fsm_ind->fsm does not wait for the #event_id any more
-			_engine->fsm_by_expecting_event_id[ event_id ] = remove_link_node_from_its_link_list( node, _engine->fsm_by_expecting_event_id[ event_id ] );
-
-			//free the node
-			mmt_mem_force_free( node );
-			//free node->data
-			mmt_mem_force_free( fsm_ind );
+			//#fsm moved to a new state => all nodes that were registered
+			//for the transitions of its previous state become obsolete.
+			//They must be removed, not only the node having #event_id:
+			//a leftover node would fire its transition index against the
+			//new state => wrong, or even out-of-bounds, transition.
+			_remove_fsm_from_expecting_events( _engine, fsm );
 		}
 	}
 
@@ -323,8 +331,9 @@ enum verdict_type _process_a_node( link_node_t *node, uint16_t event_id, message
 	case FSM_STATE_CHANGED:
 		//mmt_debug( "FSM_STATE_CHANGED" );
 		//add to new list(s) that waiting for a new event
-		//add also TIMEOUT event for the first time
-		_set_expecting_events_id( _engine, fsm, new_fsm != NULL,  message->counter );
+		//add also TIMEOUT event for the first time of an instance (fsm
+		//other than fsm_bootstrap, e.g., created by _fsm_clone)
+		_set_expecting_events_id( _engine, fsm, fsm != _engine->fsm_bootstrap,  message->counter );
 		break;
 
 	//a final state that is either valid state or invalid one
@@ -423,7 +432,7 @@ enum verdict_type _process_single_packet( rule_engine_t *engine, message_t *mess
 
 enum verdict_type _process_multi_packets( rule_engine_t *engine, message_t *message ){
 	uint8_t event_id;
-	link_node_t *node, *node_ptr;
+	link_node_t *node;
 	_fsm_tran_index_t *fsm_ind;
 	enum verdict_type ret;
 
@@ -439,26 +448,28 @@ enum verdict_type _process_multi_packets( rule_engine_t *engine, message_t *mess
 
 //		mmt_debug( "Event_id : %d", event_id );
 
-		//verify fsm instances that are waiting for event_id
-		node = engine->fsm_by_expecting_event_id[ event_id ];
+		//for each instance waiting for #event_id.
+		//#_process_a_node may free any node(s) in this list (fsm reset on a
+		//final/inconclusive state, or the removal of the other nodes of an
+		//fsm that changed state), so a "next" pointer cannot be kept across
+		//the call. Rescan from the head each round instead: nodes already
+		//processed carry message->counter and are skipped, while nodes
+		//inserted during processing are created with message->counter so
+		//they do not fire on this message - the same set of firings as
+		//before, but without ever dereferencing a freed node.
+		for(;;){
+			node = engine->fsm_by_expecting_event_id[ event_id ];
+			while( node != NULL
+					&& (fsm_ind = (_fsm_tran_index_t *)node->data)->counter == message->counter )
+				node = node->next;
 
-		//for each instance
-		while( node != NULL ){
-
-			fsm_ind  = (_fsm_tran_index_t *)node->data;
-			node_ptr = node;
-			node     = node->next;
-
-			//check whether the #fsm_ind was verified above
-			if( unlikely( fsm_ind->counter == message->counter ))
-				continue;
+			if( node == NULL )
+				break;
 
 			//the message will be processed by this fsm_ind
 			fsm_ind->counter = message->counter;
 
-			//put this after node = node->next
-			// because #node can be freed( or inserted a new node) in the function #_fire_transition
-			ret = _process_a_node( node_ptr, event_id, message, engine );
+			ret = _process_a_node( node, event_id, message, engine );
 
 			//get only one verdict per packet
 			if( ret != VERDICT_UNKNOWN ){
@@ -479,25 +490,24 @@ enum verdict_type _process_multi_packets( rule_engine_t *engine, message_t *mess
 
 	//check timeout
 	//verify instances that are waiting for timeout
-	node = engine->fsm_by_expecting_event_id[ FSM_EVENT_TYPE_TIMEOUT ];
 	//mmt_debug( "Zero-nodes count: %zu", count_nodes_from_link_list(node));
 
-	while( node != NULL ){
+	//same rescan discipline as the loop above: _process_a_node may free
+	//any node in the list, so the next node to try is always re-searched
+	//from the head using message->counter as the "already verified" mark.
+	for(;;){
+		node = engine->fsm_by_expecting_event_id[ FSM_EVENT_TYPE_TIMEOUT ];
+		while( node != NULL
+				&& (fsm_ind = (_fsm_tran_index_t *)node->data)->counter == message->counter )
+			node = node->next;
 
-		fsm_ind  = (_fsm_tran_index_t *)node->data;
-		node_ptr = node;
-		node     = node->next;
-
-		//check whether the #fsm_ind was verified above
-		if( fsm_ind->counter == message->counter )
-			continue;
+		if( node == NULL )
+			break;
 
 		//the message will be processed by the machine fsm_ind->fsm
 		fsm_ind->counter = message->counter;
 
-		//put this after node = node->next
-		// because #node can be freed( or inserted a new node) in the function #_fire_transition
-		ret = _process_a_node( node_ptr, FSM_EVENT_TYPE_TIMEOUT, message, engine );
+		ret = _process_a_node( node, FSM_EVENT_TYPE_TIMEOUT, message, engine );
 
 		//get only one verdict per packet
 		if( ret != VERDICT_UNKNOWN ){

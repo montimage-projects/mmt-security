@@ -1,0 +1,28 @@
+# ThreadSanitizer suppressions for `make check-tsan` (fork #45), run by
+# check/check-tsan.sh on the TSan build of mmt_sec_standalone with -c 1-8.
+#
+# This file is intentionally empty: no report remains unexplained.
+#
+# The races reported on the SMP message hand-off had two real causes, both
+# fixed in the engine (they were not suppressed):
+#
+# - the SPSC ring published head/tail through `volatile` fields read with
+#   __atomic builtins, which TSan does not instrument: the release/acquire
+#   edge of the hand-off was invisible, so every message read on a worker
+#   paired with the producer's pre-push writes as a "data race". The fields
+#   are now `_Atomic uint32_t` (src/lib/lock_free_spsc_ring.h), so the edge
+#   is both real C11 and visible to TSan;
+#
+# - the event/timeout loops of _process_multi_packets kept a `next` pointer
+#   across _process_a_node, which can free that node; the iteration now
+#   rescans from the list head (src/lib/rule_verif_engine.c).
+#
+# The reference-count hand-off of message_t additionally carries explicit
+# __tsan_release/__tsan_acquire annotations (src/lib/mmt_alloc.h): they are
+# no-ops outside a TSan build and do not hide races - they only express the
+# ordering the protocol already guarantees, so a worker's last read of a
+# message is ordered before the reuse of its block by another thread.
+#
+# If a report ever needs suppressing again, add it here with the reason:
+#
+# Format: race:<function-or-library-pattern>
