@@ -507,6 +507,12 @@ check: check-smp-server
 check-smp-server: _prepare sec_server rule_info
 	@./check/check-smp-server.sh ./$(MAIN_SEC_SERVER)
 
+# bounds checks of mmt_fsm.c: a crafted fsm must be rejected AND log an
+# mmt_error - a silent return would hide a corruption precursor (fork #45)
+check: check-fsm-bounds
+check-fsm-bounds: _prepare
+	@./check/check-fsm-bounds.sh
+
 # ThreadSanitizer on the SMP message hand-off (fork #45): a TSan build in a
 # scratch copy (the normal build is untouched), then `-c 1-8` on every
 # check/pcap, all rules and rule 54 alone; no report may remain unexplained

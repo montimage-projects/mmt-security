@@ -11,6 +11,9 @@
 # ring's acquire/release) are suppressed, narrowly and with the reason, in
 # check/tsan_suppressions.txt.
 #
+# The pcaps are swept in parallel, one job per pcap running both legs into
+# its own logs; the jobs are bounded by TSAN_JOBS (default: half the cores).
+#
 # Usage: check/check-tsan.sh
 set -u
 cd "$(dirname "$0")/.."
@@ -79,37 +82,60 @@ fi
 
 export TSAN_OPTIONS="suppressions=$SUPP:exitcode=66"
 
-# one -c 1-8 run of the TSan binary on $pcap, $* extra args (e.g. -x mask);
-# the pcap's .env and .opt apply; reports fail the check
-run(){ # pcap extra-args...
-	local pcap=$1 name env opt rc
-	pcap=$1; shift
-	name=${pcap%.pcap}
-	env=$(cat "$name.env" 2>/dev/null)
-	opt=$(cat "$name.opt" 2>/dev/null)
-	mkdir -p "$TMP/out"
-	rm -f "$TMP"/out/mmt-security*.csv
-	( cd "$B" && timeout -s KILL 300 env $env ./mmt_sec_standalone -c 1-8 $opt "$@" \
-		-t "$ROOT/$pcap" -f "$TMP/out/" ) > "$TMP/log" 2>&1
-	rc=$?
-	runs=$((runs + 1))
-	if grep -q "WARNING: ThreadSanitizer" "$TMP/log"; then
-		fail "ThreadSanitizer reports on $pcap ($*)"
-		cat "$TMP/log"
-	elif [ "$rc" -ne 0 ]; then
-		fail "mmt_sec_standalone -c 1-8 $* exits $rc on $pcap under TSan"
-		tail -20 "$TMP/log"
-	fi
-}
+# the sweep runs in parallel, one job per pcap, bounded by TSAN_JOBS
+# (default: half the cores) - each job does both legs of its pcap
+# sequentially into its own logs in $LOGS, so a report is always attributed
+# to the pcap and the leg that produced it
+JOBS=${TSAN_JOBS:-$(( $(nproc 2>/dev/null || echo 2) / 2 ))}
+[ "$JOBS" -ge 1 ] 2>/dev/null || JOBS=1
+LOGS="$TMP/logs"; mkdir -p "$LOGS"
+export B ROOT LOGS
 
+sweep_one(){ # pcap
+	local pcap=$1 name env opt leg seg rc
+	name=$(basename "$pcap" .pcap)
+	env=$(cat "${pcap%.pcap}.env" 2>/dev/null)
+	opt=$(cat "${pcap%.pcap}.opt" 2>/dev/null)
+	mkdir -p "$LOGS/out.$name"
+	for leg in all r54; do
+		seg="$LOGS/$name.$leg.log"
+		[ "$leg" = r54 ] && set -- -x 1-53,55-99999 || set --
+		( cd "$B" && timeout -s KILL 300 env $env ./mmt_sec_standalone -c 1-8 $opt "$@" \
+			-t "$ROOT/$pcap" -f "$LOGS/out.$name/" ) > "$seg" 2>&1
+		rc=$?
+		if grep -q "WARNING: ThreadSanitizer" "$seg"; then
+			echo "tsan $leg" >> "$LOGS/$name.fail"
+		elif [ "$rc" -ne 0 ]; then
+			echo "rc=$rc $leg" >> "$LOGS/$name.fail"
+		fi
+	done
+}
+export -f sweep_one
+
+printf '%s\n' check/pcap/*.pcap | xargs -P "$JOBS" -n1 bash -c 'sweep_one "$1"' _
+
+# report, in the deterministic order of the pcap listing
 for pcap in check/pcap/*.pcap; do
 	name=$(basename "$pcap" .pcap)
-	before=$status
-	run "$pcap"
-	run "$pcap" -x 1-53,55-99999
-	if [ "$status" = "$before" ]; then
-		echo "  -c 1-8 on $name (all rules, rule 54 alone): 0 reports"
+	if [ ! -f "$LOGS/$name.all.log" ] || [ ! -f "$LOGS/$name.r54.log" ]; then
+		fail "no result for $pcap (its sweep job did not run?)"
+		continue
 	fi
+	runs=$((runs + 2))
+	if [ ! -f "$LOGS/$name.fail" ]; then
+		echo "  -c 1-8 on $name (all rules, rule 54 alone): 0 reports"
+		continue
+	fi
+	while read -r kind leg; do
+		if [ "$leg" = r54 ]; then args="-x 1-53,55-99999"; else args=""; fi
+		if [ "$kind" = tsan ]; then
+			fail "ThreadSanitizer reports on $pcap${args:+ ($args)}"
+			cat "$LOGS/$name.$leg.log"
+		else
+			fail "mmt_sec_standalone -c 1-8 $args exits ${kind#rc=} on $pcap under TSan"
+			tail -20 "$LOGS/$name.$leg.log"
+		fi
+	done < "$LOGS/$name.fail"
 done
 
 if [ "$status" -eq 0 ]; then

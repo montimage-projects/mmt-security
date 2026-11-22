@@ -4,7 +4,9 @@
 # not hang in the issue's measurements): a missing release fence in the SPSC
 # ring let a worker pop a stale message_t, corrupt the heap, abort, and the
 # abort's signal handler then deadlocked trying to join the workers. Each run
-# below must finish inside its timeout and give the alerts of the `-c 1` run.
+# below must finish inside its timeout and give the expected alert count: the
+# `-c 1` run of the same capture, or a committed expectation for the
+# generated flood (see below).
 #
 # Usage: check/check-smp.sh [path/to/mmt_sec_standalone]
 set -u
@@ -45,25 +47,39 @@ reference(){ # pcap
 }
 
 # a handful of -c runs; each must finish inside its bound with rc 0 and give
-# the alerts of the `-c 1` run of the same capture
-run(){ # cores pcap bound
+# the expected alert count: its `-c 1` run of the same capture, or $4 when a
+# committed expectation is given instead
+run(){ # cores pcap bound [expected]
 	local expected n rc
-	expected=$(reference "$2") || fail "mmt_sec_standalone -c 1 on $2 gives no alert (nonzero exit or no rules built?)"
+	if [ $# -ge 4 ]; then
+		expected=$4
+	else
+		expected=$(reference "$2") || fail "mmt_sec_standalone -c 1 on $2 gives no alert (nonzero exit or no rules built?)"
+	fi
 	rm -f "$TMP"/mmt-security*.csv
 	timeout -s KILL "$3" "$STANDALONE" -c "$1" -t "$2" -f "$TMP/" > "$TMP/log" 2>&1
 	rc=$?
 	n=$(cat "$TMP"/mmt-security*.csv 2>/dev/null | wc -l)
 	echo "  -c $1 on $(basename "$2") (bound ${3}s): rc=$rc, $n alert(s), expected $expected"
 	[ "$rc" -ne 0 ] && fail "mmt_sec_standalone -c $1 exits $rc on $2"
-	[ "$n" != "$expected" ] && fail "mmt_sec_standalone -c $1 gives $n alert(s) on $2, expected $expected (the -c 1 run)"
+	[ "$n" != "$expected" ] && fail "mmt_sec_standalone -c $1 gives $n alert(s) on $2, expected $expected"
 }
 
 run 1-4 check/pcap/56.57.syn_flood.pcap 60
 run 1-4 check/pcap/56.syn_flood_short_tail.pcap 60
 run 1-8 check/pcap/15.nikto.pcap 60
-#the flood takes ~75-120 s on a slow or loaded machine; the bound only needs
-#to be comfortably above the worst legit duration to catch the old infinite hang
-run 1-8 "$FLOOD" 240
+#the flood's `-c 1-8` leg takes ~75-120 s idle, and >240 s when the machine
+#is already loaded (several builds/checks at once); the bound only needs to
+#be comfortably above the worst legit duration to catch the old infinite
+#hang, so it is 600 s. Its expected count is committed in
+#check/smp_flood.expect, not measured by a `-c 1` reference run: that run
+#needs 400-525 s on a slow or loaded machine (rockylinux:9, aarch64) -
+#longer than the leg it references - so `make check` could not pass there
+#(fork #48 review, F1). The pcap is deterministic (fixed-seed generator,
+#check/gen/smp_flood_gen.c), so the count is stable; refresh it after a
+#change to rules 56/57 or to the generator with:
+#  ./mmt_sec_standalone -c 1 -t <flood> -f out/ && wc -l out/mmt-security*.csv
+run 1-8 "$FLOOD" 600 "$(cat check/smp_flood.expect)"
 
 # SIGTERM must stop a running instance (it used to deadlock inside the
 # handler): the generated flood runs several seconds under `-c 1-8`, so the
