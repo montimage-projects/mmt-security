@@ -19,11 +19,21 @@ echo "Testing the bounds checks of mmt_fsm.c"
 
 DPI="${MMT_BASE:-/opt/mmt}/dpi"
 # same recipe as the Makefile's test.% rule, minus the mmt-dpi header target:
-# link the test against the already checked library objects
+# link the test against the already checked library objects - except
+# mmt_fsm.o, the unit under test, which is rebuilt here in release mode
+# (no -DDEBUG_MODE): in a `make DEBUG=1` tree, e.g. CI, the bounds
+# checks are pre-empted by mmt_halt()s that exit() the process, so the
+# release path this check verifies would never run. DEBUG_MODE changes
+# no struct layout, so mixing the release object with the others is safe
 if ! gcc -O2 -fPIC -Wall -I/usr/include/libxml2 -I"$DPI/include" \
-	-o "$TMP/fsm_bounds" check/fsm_bounds.c src/lib/*.o \
+	-c -o "$TMP/mmt_fsm.o" src/lib/mmt_fsm.c 2> "$TMP/build.log"; then
+	cat "$TMP/build.log"
+	fail "cannot build src/lib/mmt_fsm.c in release mode"
+elif ! gcc -O2 -fPIC -Wall -I/usr/include/libxml2 -I"$DPI/include" \
+	-o "$TMP/fsm_bounds" check/fsm_bounds.c "$TMP/mmt_fsm.o" \
+	$(ls src/lib/*.o | grep -v '/mmt_fsm\.o$') \
 	-Wl,--export-dynamic -L"$DPI/lib" -L/usr/local/lib \
-	-ldl -lpthread -lxml2 -l:libmmt_tcpip.so -l:libmmt_core.so > "$TMP/build.log" 2>&1; then
+	-ldl -lpthread -lxml2 -l:libmmt_tcpip.so -l:libmmt_core.so >> "$TMP/build.log" 2>&1; then
 	cat "$TMP/build.log"
 	fail "cannot build check/fsm_bounds.c"
 elif ! "$TMP/fsm_bounds" > "$TMP/run.log" 2>&1; then
