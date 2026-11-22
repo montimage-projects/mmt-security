@@ -68,7 +68,7 @@ void usage(const char * prg_name) {
 	fprintf(stderr, "\t-v             : Verbose.\n");
 	fprintf(stderr, "\t-l             : Prints the available rules then exit.\n");
 	fprintf(stderr, "\t-h             : Prints this help.\n");
-	exit(1);
+	//does not exit: -h exits with success, a usage error with failure
 }
 
 size_t parse_options(int argc, char ** argv, char *filename, int *type, uint16_t *rules_id,
@@ -93,8 +93,10 @@ size_t parse_options(int argc, char ** argv, char *filename, int *type, uint16_t
 		case 'c':
 			optcount++;
 			*threads_count = expand_number_range( optarg, core_mask );
-			if( *threads_count == 0 )
+			if( *threads_count == 0 ){
 				usage(argv[0]);
+				exit(1);
+			}
 			break;
 		case 'i':
 			optcount++;
@@ -136,8 +138,11 @@ size_t parse_options(int argc, char ** argv, char *filename, int *type, uint16_t
 			is_enable_reassembly = true;
 			break;
 		case 'h':
+			usage(argv[0]);
+			exit(0);
 		default:
 			usage(argv[0]);
+			exit(1);
 		}
 	}
 
@@ -149,6 +154,7 @@ size_t parse_options(int argc, char ** argv, char *filename, int *type, uint16_t
 			fprintf(stderr, "Missing network interface name\n");
 		}
 		usage(argv[0]);
+		exit(1);
 	}
 
 	//do not need output

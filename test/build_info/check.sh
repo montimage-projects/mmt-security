@@ -39,6 +39,21 @@ MMT_SEC_BUILDER=check-build-info ./compile_rule "$T/new.so" "$RULE" > "$T/compil
 	|| { cat "$T/compile.log"; fail "compile_rule $RULE"; }
 ./compile_rule "$T/gen.c" "$RULE" -c > /dev/null 2>&1 || fail "compile_rule -c $RULE"
 
+# build.target reference: extract the MMT_SEC_RULE_ARCH/MMT_SEC_RULE_TARGET
+# chain gen.c carries and run it through /usr/bin/gcc — the compiler
+# compile_rule uses too (build.cflags). The result is the target triplet the
+# .so's compiler reports through its predefined macros. gcc -dumpmachine is
+# not the reference: on Red Hat/SUSE it carries a vendor part the predefined
+# macros have no equivalent for (aarch64-redhat-linux, where the macros and
+# the build info give aarch64-linux-gnu).
+awk '/^#if defined\(__x86_64__\)/ { f = 1 }
+     f { print; if (seen && /^#endif/) exit }
+     /MMT_SEC_RULE_TARGET MMT_SEC_RULE_ARCH "-unknown"/ { seen = 1 }' "$T/gen.c" > "$T/target.c"
+{ echo; echo 'int main( void ){ puts( MMT_SEC_RULE_TARGET ); return 0; }'; } >> "$T/target.c"
+{ echo '#include <stdio.h>'; cat "$T/target.c"; } > "$T/target_probe.c"
+/usr/bin/gcc "$T/target_probe.c" -o "$T/target_probe" || fail "compile the build.target probe"
+"$T/target_probe" > "$T/target.txt" || fail "run the build.target probe"
+
 nm -D --defined-only "$T/new.so" | grep -qw mmt_sec_get_rule_build_info \
 	|| fail "new.so does not export mmt_sec_get_rule_build_info"
 ./rule_info --build-info --json "$T/new.so" > "$T/info.json"
@@ -151,7 +166,14 @@ check(get("dpi.plugins") == ["libmmt_tcpip.so"], "dpi.plugins == [libmmt_tcpip.s
 run = lambda *a: subprocess.run(a, capture_output=True, text=True).stdout.strip()
 check(get("build.compiler") == "gcc " + run("gcc", "-dumpfullversion")
       or (get("build.compiler") or "").startswith("gcc " + run("gcc", "-dumpversion")), "build.compiler is gcc's version")
-check(get("build.target") == run("/usr/bin/gcc", "-dumpmachine"), "build.target is gcc -dumpmachine")
+# the target recorded is what the .so's compiler derives from its predefined
+# macros; the reference is the probe built from gen.c's own chain, because
+# gcc -dumpmachine can add a vendor part no macro provides (Red Hat, SUSE)
+check(get("build.target") == open(T + "/target.txt").read().strip(),
+      "build.target is the target triplet of the .so compiler's predefined macros")
+# the cpu part is gcc -dumpmachine's everywhere
+check((get("build.target") or "").split("-", 1)[0] == run("/usr/bin/gcc", "-dumpmachine").split("-", 1)[0],
+      "build.target's cpu is gcc -dumpmachine's cpu")
 check("#define MMT_SEC_RULE_TARGET" in c and '\\"target\\":\\"" MMT_SEC_RULE_TARGET "\\"' in c,
       "build.target comes from the predefined macros of the compiler of the .so")
 # the order compile_gen_code uses: the include dirs and the extra option after the source
