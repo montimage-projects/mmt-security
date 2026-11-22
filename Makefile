@@ -33,7 +33,7 @@ MIN_DPI_VERSION := 1.10.3
 CACHE_LINESIZE := 64 #$(shell getconf LEVEL1_DCACHE_LINESIZE)
 
 #set of library
-LIBS     += -ldl -lpthread -lxml2  -l:libmmt_tcpip.so   # -l:libmmt_http2.so
+LIBS     += -ldl -lpthread -lxml2   # -l:libmmt_http2.so
 
 CFLAGS   += -fPIC -Wall -DINSTALL_DIR=\"$(INSTALL_DIR)\" -DVERSION_NUMBER=\"$(VERSION)\" -DGIT_VERSION=\"$(GIT_VERSION)\" -DLEVEL1_DCACHE_LINESIZE=$(CACHE_LINESIZE) -Wno-unused-variable -Wno-unused-function -Wuninitialized -I/usr/include/libxml2/  -I$(MMT_DPI_DIR)/include    #-I/usr/include/nghttp2 -lnghttp2
 CLDFLAGS += -I$(MMT_DPI_DIR)/include -L$(MMT_DPI_DIR)/lib -L/usr/local/lib #-I/usr/include/nghttp2 -lnghttp2
@@ -290,64 +290,84 @@ deb: all lib sample_rules copy_files
 	$(QUIET) $(MV) $(TMP_DIR)/* $(DEB_NAME)/$(INSTALL_DIR)
 	$(QUIET) $(RM) $(TMP_DIR)
 	
-	$(QUIET) echo "Package: mmt-security \
-        \nVersion: $(VERSION) \
-        \nSection: base \
-        \nPriority: standard \
-        \nArchitecture: all \
-        \nMaintainer: Montimage <contact@montimage.com> \
-        \nDepends: mmt-dpi (>= $(MIN_DPI_VERSION)) \
-        \nDescription: MMT-Security: An intrusion detection system \
-        \n  Version id: $(GIT_VERSION). Build time: `date +"%Y-%m-%d %H:%M:%S"` \
-        \nHomepage: http://www.montimage.com" \
+	@#Depends: the packages of the shared libraries the packaged binaries are
+	@# linked to (the libxml2 soname differs by release), resolved by
+	@# dpkg-shlibdeps (dpkg-dev); its mmt-dpi entry is replaced by the
+	@# MIN_DPI_VERSION bound, which also covers an mmt-dpi installed without
+	@# a package (--ignore-missing-info). dpkg-shlibdeps wants a
+	@# debian/control in the current directory; a minimal one is lent to it
+	@# inside the package tree and removed before dpkg-deb runs.
+	$(QUIET) ( cd $(DEB_NAME) \
+		&& $(MKDIR) debian \
+		&& printf 'Source: mmt-security\nPackage: mmt-security\n' > debian/control \
+		&& dpkg-shlibdeps --ignore-missing-info -l$(MMT_DPI_DIR)/lib -O \
+			.$(INSTALL_DIR)/bin/* .$(INSTALL_DIR)/lib/$(LIB_NAME).so.$(VERSION); \
+		s=$$?; $(RM) debian; exit $$s ) > $(DEB_NAME).shlibs-deps
+	$(QUIET) shlibs=`sed -n 's/^shlibs:Depends=//p' $(DEB_NAME).shlibs-deps \
+		| sed 's/mmt-dpi ([^,]*)//g; s/, ,/,/g; s/^, //; s/, $$//'`; \
+	$(RM) $(DEB_NAME).shlibs-deps; \
+	printf '%s\n' \
+		'Package: mmt-security' \
+		'Version: $(VERSION)' \
+		'Section: base' \
+		'Priority: standard' \
+		'Architecture: $(shell dpkg --print-architecture)' \
+		'Maintainer: Montimage <contact@montimage.com>' \
+		"Depends: mmt-dpi (>= $(MIN_DPI_VERSION))$${shlibs:+, $$shlibs}" \
+		'Description: MMT-Security: An intrusion detection system' \
+		"  Version id: $(GIT_VERSION). Build time: `date +'%Y-%m-%d %H:%M:%S'`" \
+		'Homepage: http://www.montimage.com' \
 		> $(DEB_NAME)/DEBIAN/control
 		
 	$(QUIET) $(MKDIR) $(DEB_NAME)/etc/ld.so.conf.d/
 	@echo "$(INSTALL_DIR)/lib" > $(DEB_NAME)/etc/ld.so.conf.d/mmt-security.conf
 	
-	$(QUIET) dpkg-deb -b $(DEB_NAME)
+	@#--root-owner-group: the files are root's whatever user runs make deb
+	$(QUIET) dpkg-deb --root-owner-group -b $(DEB_NAME)
 	$(QUIET) $(RM) $(DEB_NAME)
 	
 	
 #create rpm file for RHEL
 rpm: all lib sample_rules copy_files
 	
-#create rpm structure
-	$(QUIET) $(MKDIR) ./rpmbuild/{RPMS,BUILD}
-	
-	$(QUIET) echo -e\
-      "Summary:  MMT-Security:  An intrusion detection system\
-      \nName: mmt-security\
-      \nVersion: $(VERSION)\
-      \nRelease: $(GIT_VERSION)\
-      \nLicense: proprietary\
-      \nGroup: Development/Libraries\
-      \nURL: http://montimage.com/\
-      \n\
-      \nRequires:  mmt-dpi >= $(MIN_DPI_VERSION)\
-      \nBuildRoot: %{_topdir}/BUILD/%{name}-%{version}-%{release}\
-      \n\
-      \n%description\
-      \nMMT-Security is a library using MMT-DPI to detect abnormalities in network.\
-      \nBuild date: `date +"%Y-%m-%d %H:%M:%S"`\
-      \n\
-      \n%prep\
-      \nrm -rf %{buildroot}\
-      \nmkdir -p %{buildroot}/$(INSTALL_DIR)\
-      \ncp -rL $(CURDIR)/$(TMP_DIR)/* %{buildroot}/$(INSTALL_DIR)\
-      \nmkdir -p %{buildroot}/etc/ld.so.conf.d/\
-      \necho "$(INSTALL_DIR)/lib" >> %{buildroot}/etc/ld.so.conf.d/mmt-security.conf\
-      \n\
-      \n%clean\
-      \nrm -rf %{buildroot}\
-      \n\
-      \n%files\
-      \n%defattr(-,root,root,-)\
-      \n$(INSTALL_DIR)/*\
-      \n/etc/ld.so.conf.d/mmt-security.conf\
-      \n%post\
-      \nldconfig\
-   " > ./mmt-security.spec
+#create rpm structure (no brace expansion: /bin/sh may be dash)
+	$(QUIET) $(MKDIR) ./rpmbuild/RPMS ./rpmbuild/BUILD
+
+	@#the spec is written with printf: echo -e is a bashism, dash does not
+	@# know it and would print "-e" as the spec's first line
+	$(QUIET) printf '%s\n' \
+		"Summary:  MMT-Security:  An intrusion detection system" \
+		"Name: mmt-security" \
+		"Version: $(VERSION)" \
+		"Release: $(GIT_VERSION)" \
+		"License: proprietary" \
+		"Group: Development/Libraries" \
+		"URL: http://montimage.com/" \
+		"" \
+		"Requires:  mmt-dpi >= $(MIN_DPI_VERSION)" \
+		"BuildRoot: %{_topdir}/BUILD/%{name}-%{version}-%{release}" \
+		"" \
+		"%description" \
+		"MMT-Security is a library using MMT-DPI to detect abnormalities in network." \
+		"Build date: `date +'%Y-%m-%d %H:%M:%S'`" \
+		"" \
+		"%prep" \
+		"rm -rf %{buildroot}" \
+		"mkdir -p %{buildroot}/$(INSTALL_DIR)" \
+		"cp -rL \"$(abspath $(TMP_DIR))\"/* %{buildroot}/$(INSTALL_DIR)" \
+		"mkdir -p %{buildroot}/etc/ld.so.conf.d/" \
+		"echo \"$(INSTALL_DIR)/lib\" >> %{buildroot}/etc/ld.so.conf.d/mmt-security.conf" \
+		"" \
+		"%clean" \
+		"rm -rf %{buildroot}" \
+		"" \
+		"%files" \
+		"%defattr(-,root,root,-)" \
+		"$(INSTALL_DIR)/*" \
+		"/etc/ld.so.conf.d/mmt-security.conf" \
+		"%post" \
+		"ldconfig" \
+		> ./mmt-security.spec
 	
 	$(QUIET) rpmbuild --quiet --rmspec --define "_topdir $(shell pwd)/rpmbuild" --define "_rpmfilename ../../$(DEB_NAME).rpm" -bb ./mmt-security.spec
 	$(QUIET) $(RM) $(TMP_DIR) rpmbuild
