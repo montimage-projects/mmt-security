@@ -27,6 +27,7 @@ fsm_t *fsm_init(const fsm_state_t *initial_state, const fsm_state_t *error_state
 	fsm->time_max        = fsm->time_min    = 0;
 //	fsm->counter_max     = fsm->counter_min = 0;
 	fsm->current_event_id= 0;
+	fsm->reg_nodes       = NULL;
 
 	return fsm;
 }

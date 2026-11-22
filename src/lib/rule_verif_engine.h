@@ -49,6 +49,15 @@ typedef struct rule_engine_struct{
 	//timestamp and counter of the last message being verified timeout
 	uint64_t last_msg_timestamp_timeout;
 	uint64_t last_msg_counter_timeout;
+
+	/**
+	 * Expecting-event nodes marked dead while the current message is being
+	 * verified. They stay in their lists until the message is done - so the
+	 * "next" pointers of the event loops remain valid across
+	 * _process_a_node() - and are then unlinked and freed in one pass by
+	 * _drain_dead_nodes(). It is NULL outside message processing.
+	 */
+	link_node_t *dead_nodes;
 } rule_engine_t __aligned;
 
 //max number of events in a rule
