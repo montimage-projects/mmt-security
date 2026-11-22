@@ -25,11 +25,15 @@ DPI="${MMT_BASE:-/opt/mmt}/dpi"
 # checks are pre-empted by mmt_halt()s that exit() the process, so the
 # release path this check verifies would never run. DEBUG_MODE changes
 # no struct layout, so mixing the release object with the others is safe
-if ! gcc -O2 -fPIC -Wall -I/usr/include/libxml2 -I"$DPI/include" \
+# if the tree was built with `make TSAN=1` the objects reference the TSan
+# runtime, so the test must compile and link with -fsanitize=thread too
+san=
+nm src/lib/*.o 2>/dev/null | grep -q ' __tsan_' && san=-fsanitize=thread
+if ! gcc -O2 -fPIC -Wall -I/usr/include/libxml2 -I"$DPI/include" $san \
 	-c -o "$TMP/mmt_fsm.o" src/lib/mmt_fsm.c 2> "$TMP/build.log"; then
 	cat "$TMP/build.log"
 	fail "cannot build src/lib/mmt_fsm.c in release mode"
-elif ! gcc -O2 -fPIC -Wall -I/usr/include/libxml2 -I"$DPI/include" \
+elif ! gcc -O2 -fPIC -Wall -I/usr/include/libxml2 -I"$DPI/include" $san \
 	-o "$TMP/fsm_bounds" check/fsm_bounds.c "$TMP/mmt_fsm.o" \
 	$(ls src/lib/*.o | grep -v '/mmt_fsm\.o$') \
 	-Wl,--export-dynamic -L"$DPI/lib" -L/usr/local/lib \
