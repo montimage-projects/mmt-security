@@ -39,6 +39,27 @@ MMT_SEC_BUILDER=check-build-info ./compile_rule "$T/new.so" "$RULE" > "$T/compil
 	|| { cat "$T/compile.log"; fail "compile_rule $RULE"; }
 ./compile_rule "$T/gen.c" "$RULE" -c > /dev/null 2>&1 || fail "compile_rule -c $RULE"
 
+# build.target is checked against this static allowlist of the triplets the
+# MMT_SEC_RULE_ARCH/MMT_SEC_RULE_TARGET chain of the generated C can produce
+# (src/lib/gen_code.c): <arch>-<os>-<abi>, where -linux-gnueabi* is arm only
+# and -linux-gnux32 is x86_64 only. The probe below is derived from the same
+# macros as the .so, so a wrong non-cpu part — an added vendor part, or a
+# changed suffix — would pass the probe comparison; only this list catches
+# it (fork #47)
+BUILD_TARGET_ALLOWLIST="\
+x86_64-linux-gnu x86_64-linux-gnux32 x86_64-linux x86_64-unknown \
+i686-linux-gnu i686-linux i686-unknown \
+aarch64_be-linux-gnu aarch64_be-linux aarch64_be-unknown \
+aarch64-linux-gnu aarch64-linux aarch64-unknown \
+arm-linux-gnueabihf arm-linux-gnueabi arm-linux arm-unknown \
+riscv64-linux-gnu riscv64-linux riscv64-unknown \
+powerpc64le-linux-gnu powerpc64le-linux powerpc64le-unknown \
+powerpc64-linux-gnu powerpc64-linux powerpc64-unknown \
+s390x-linux-gnu s390x-linux s390x-unknown \
+loongarch64-linux-gnu loongarch64-linux loongarch64-unknown \
+unknown-linux-gnu unknown-linux unknown-unknown"
+export BUILD_TARGET_ALLOWLIST
+
 # build.target reference: extract the MMT_SEC_RULE_ARCH/MMT_SEC_RULE_TARGET
 # chain gen.c carries and run it through /usr/bin/gcc — the compiler
 # compile_rule uses too (build.cflags). The result is the target triplet the
@@ -96,7 +117,7 @@ diff "$T/new.alerts.csv" "$T/old.alerts.csv" > /dev/null || fail "new.so and old
 
 # ---- the fields --------------------------------------------------------------
 python3 -I - "$T" "$RULE" "$RULE_ID" "$VERSION" "$GIT_VERSION" <<'EOF'
-import hashlib, json, re, struct, subprocess, sys
+import hashlib, json, os, re, struct, subprocess, sys
 T, xml, rule_id, version, git = sys.argv[1:6]
 info = json.load(open(T + "/info.json"))
 errors = []
@@ -171,6 +192,10 @@ check(get("build.compiler") == "gcc " + run("gcc", "-dumpfullversion")
 # gcc -dumpmachine can add a vendor part no macro provides (Red Hat, SUSE)
 check(get("build.target") == open(T + "/target.txt").read().strip(),
       "build.target is the target triplet of the .so compiler's predefined macros")
+# a wrong non-cpu part lands identically in the .so and the probe, so only
+# the static allowlist catches it (fork #47)
+check(get("build.target") in os.environ["BUILD_TARGET_ALLOWLIST"].split(),
+      "build.target %r is not in the static allowlist" % get("build.target"))
 # the cpu part is gcc -dumpmachine's everywhere
 check((get("build.target") or "").split("-", 1)[0] == run("/usr/bin/gcc", "-dumpmachine").split("-", 1)[0],
       "build.target's cpu is gcc -dumpmachine's cpu")
