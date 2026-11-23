@@ -392,10 +392,17 @@ enum verdict_type _process_a_node( link_node_t *node, uint16_t event_id, message
  * Public API
  */
 enum verdict_type rule_engine_process( rule_engine_t *engine, message_t *message ){
+	size_t i;
 #ifdef DEBUG_MODE
 	mmt_assert( engine != NULL,  "engine cannot be null" );
 	mmt_assert( message != NULL, "message cannot be null" );
 #endif
+	//resolve once per message the data pointers of the rule's proto_atts:
+	//every guard and every fsm instance then reads them from #msg_values
+	//instead of re-walking message->elements. The message is only read;
+	//its content does not change while being verified.
+	for( i=0; i<engine->rule_info->proto_atts_count; i++ )
+		engine->msg_values[i] = get_element_data_message_t( message, engine->msg_values_idx[i] );
 	return engine->processing_packets( engine, message );
 }
 
@@ -623,6 +630,25 @@ rule_engine_t* rule_engine_init( const rule_info_t *rule_info, size_t max_instan
 	_calculate_hash_number( _engine );
 	fsm_set_user_data( _engine->fsm_bootstrap, _engine );
 
+	//per-message workspace guards read their current-message variables
+	//from (see the fields' comment in rule_verif_engine.h)
+	if( rule_info->proto_atts_count == 0 ){
+		_engine->msg_values     = NULL;
+		_engine->msg_values_idx = NULL;
+	}else{
+		int index;
+		_engine->msg_values     = mmt_mem_alloc( rule_info->proto_atts_count * sizeof( const void * ));
+		_engine->msg_values_idx = mmt_mem_alloc( rule_info->proto_atts_count * sizeof( uint16_t ));
+		for( i=0; i<rule_info->proto_atts_count; i++ ){
+#ifdef MODULE_ADD_OR_RM_RULES_RUNTIME
+			index = _mmt_sec_hash_proto_attribute_without_lock( rule_info->proto_atts[i].proto_id, rule_info->proto_atts[i].att_id );
+#else
+			index = mmt_sec_hash_proto_attribute( rule_info->proto_atts[i].proto_id, rule_info->proto_atts[i].att_id );
+#endif
+			_engine->msg_values_idx[i] = index;
+		}
+	}
+
 	_engine->last_msg_counter_timeout = 0;
 	_engine->last_msg_timestamp_timeout    = 0;
 	_engine->dead_nodes                   = NULL;
@@ -660,6 +686,8 @@ void rule_engine_free( rule_engine_t *_engine ){
 
 	mmt_mem_free( _engine->fsm_by_instance_id );
 	mmt_mem_free( _engine->events_hash );
+	mmt_mem_free( _engine->msg_values );
+	mmt_mem_free( _engine->msg_values_idx );
 
 	if( _engine->valid_execution_trace != NULL )
 		mmt_array_free( _engine->valid_execution_trace, (void *)free_message_t );

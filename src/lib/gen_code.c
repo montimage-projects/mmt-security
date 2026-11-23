@@ -51,34 +51,70 @@ static void _iterate_variable( void *key, void *data, void *user_data, size_t in
 	if( size == 0 ) return;
 
 
-	if( var->ref_index != (uint16_t)UNKNOWN ){
-		fprintf(fd, "\n\t his_msg = fsm_get_history( fsm, %d );", var->ref_index );
-		//TODO: not need to check ?
-		fprintf(fd, "\n\t if( unlikely( his_msg == NULL )) return 0;");
-	}
-
 	_gen_code_line( fd );
 
-	fprintf( fd, "\n\n\t data = get_element_data_message_t( %s, _m%"PRIu32"._%s_%s );",
-					( var->ref_index == (uint16_t)UNKNOWN )? "msg" : "his_msg",
-					rule_id,
-					var->proto, var->att
-	);
+	if( var->ref_index == (uint16_t)UNKNOWN ){
+		//variable of the message being verified: its data was resolved once
+		//per message into the engine's #msg_values, so every fsm instance
+		//and every guard of that message reuses the same pointer
+		int val = mmt_map_get_index( _u_data->map, var );
+		mmt_assert( val >= 0, "Variable %s.%s must be defined before!", var->proto, var->att );
 
-	switch( var->data_type ){
-	case MMT_SEC_MSG_DATA_TYPE_STRING:
-		fprintf( fd, "\n\t const char *%s = (char *) data;", str );
-		break;
-	case MMT_SEC_MSG_DATA_TYPE_NUMERIC:
-		fprintf( fd, "\n\t double %s = 0;", str );
-		fprintf( fd, "\n\t if (data != NULL)  %s = *(double*) data;", str );
-		break;
-	default:
-		fprintf( fd, "\n\t const void *%s = data;", str );
-		break;
+		switch( var->data_type ){
+		case MMT_SEC_MSG_DATA_TYPE_STRING:
+			fprintf( fd, "\n\t const char *%s = (const char *) _mv[ %d ];", str, val );
+			break;
+		case MMT_SEC_MSG_DATA_TYPE_NUMERIC:
+			fprintf( fd, "\n\t double %s = 0;", str );
+			fprintf( fd, "\n\t if (_mv[ %d ] != NULL)  %s = *(const double *) _mv[ %d ];", val, str, val );
+			break;
+		default:
+			fprintf( fd, "\n\t const void *%s = _mv[ %d ];", str, val );
+			break;
+		}
+	}else{
+		fprintf( fd, "\n\n\t data = get_element_data_message_t( his_msg_%d, _m%"PRIu32"._%s_%s );",
+						var->ref_index,
+						rule_id,
+						var->proto, var->att
+		);
+
+		switch( var->data_type ){
+		case MMT_SEC_MSG_DATA_TYPE_STRING:
+			fprintf( fd, "\n\t const char *%s = (char *) data;", str );
+			break;
+		case MMT_SEC_MSG_DATA_TYPE_NUMERIC:
+			fprintf( fd, "\n\t double %s = 0;", str );
+			fprintf( fd, "\n\t if (data != NULL)  %s = *(double*) data;", str );
+			break;
+		default:
+			fprintf( fd, "\n\t const void *%s = data;", str );
+			break;
+		}
 	}
 
 	mmt_mem_free( str );
+}
+
+/**
+ * Count variables that read the message being verified - i.e. those not
+ * referring to a previous event of the instance - into #uint16_val of
+ * #_user_data.
+ */
+static void _count_current_message_variable( void *key, void *data, void *user_data, size_t index, size_t total ){
+	variable_t *var = (variable_t *) data;
+	if( var->ref_index == (uint16_t)UNKNOWN )
+		((struct _user_data *)user_data)->uint16_val ++;
+}
+
+/**
+ * Collect the history indexes the variables refer to (bit i of #mask set
+ * when a variable refers to event i). A rule has at most 64 events.
+ */
+static void _collect_referenced_indexes( void *key, void *data, void *user_data, size_t index, size_t total ){
+	variable_t *var = (variable_t *) data;
+	if( var->ref_index != (uint16_t)UNKNOWN && var->ref_index < 64 )
+		*(uint64_t *)user_data |= 1ULL << var->ref_index;
 }
 
 
@@ -110,9 +146,33 @@ static void _iterate_event_to_gen_guards( void *key, void *data, void *user_data
 	fprintf(fd, "static inline int %s( const message_t *msg, const fsm_t *fsm ){",
 			guard_fun_name );
 	if( var_count != 0 ){
+		uint64_t refs_mask = 0;
+		size_t r;
+
 		fprintf(fd, "\n\t if( unlikely( msg == NULL || fsm == NULL )) return 0;" );
-		fprintf(fd, "\n\t const message_t *his_msg;");
-		fprintf(fd, "\n\t const void *data;");
+
+		//does this guard read attributes of the message being verified?
+		_u_data->uint16_val = 0;
+		mmt_map_iterate( map, _count_current_message_variable, _u_data );
+		if( _u_data->uint16_val > 0 ){
+			//#msg_values was resolved once per message in rule_engine_process;
+			//the guard reaches the engine through fsm->user_data
+			fprintf(fd, "\n\t const rule_engine_t *_engine = (const rule_engine_t *) fsm_get_user_data( fsm );");
+			fprintf(fd, "\n\t if( unlikely( _engine == NULL || _engine->msg_values == NULL )) return 0;");
+			fprintf(fd, "\n\t const void * const *_mv = _engine->msg_values;");
+		}
+
+		//fetch once each distinct history message the variables refer to,
+		//instead of once per variable occurrence
+		mmt_map_iterate( map, _collect_referenced_indexes, &refs_mask );
+		if( refs_mask != 0 ){
+			fprintf(fd, "\n\t const void *data;");
+			for( r=0; r<64; r++ )
+				if( refs_mask & ( 1ULL << r )){
+					fprintf(fd, "\n\t const message_t *his_msg_%zu = fsm_get_history( fsm, %zu );", r, r);
+					fprintf(fd, "\n\t if( unlikely( his_msg_%zu == NULL )) return 0;", r);
+				}
+		}
 		mmt_map_iterate( map, _iterate_variable, user_data );
 	}
 	fprintf(fd, "\n\n\t return %s;\n }\n ",  str);
@@ -896,6 +956,7 @@ static inline void _gen_fsm_for_a_rule( FILE *fd, const rule_t *rule ){
 	else
 		fprintf( fd, "\n void _allocate_msg_t_%d(const char* proto, const char* att, uint16_t index){ }", rule->id );
 
+	_u_data.map = variables_map;
 	mmt_map_iterate(events_map, _iterate_event_to_gen_guards, &_u_data );
 
 	_gen_fsm_state_for_a_rule( fd, rule );
@@ -1061,7 +1122,7 @@ int generate_fsm_with_build_options( const char* file_name, rule_t *const* rules
 	mmt_mem_free( str_ptr );
 
 	//include
-	fprintf( fd, "#include <string.h>\n #include <stdio.h>\n #include <stdlib.h>\n #include \"plugin_header.h\"\n #include \"mmt_fsm.h\"\n #include \"mmt_lib.h\"\n #include \"pre_embedded_functions.h\"\n");
+	fprintf( fd, "#include <string.h>\n #include <stdio.h>\n #include <stdlib.h>\n #include \"plugin_header.h\"\n #include \"mmt_fsm.h\"\n #include \"mmt_lib.h\"\n #include \"rule_verif_engine.h\"\n #include \"pre_embedded_functions.h\"\n");
 
 	//this part allows user add a suffix when compile rule.
 	//This will be helpful when linking statically rules into a program.
