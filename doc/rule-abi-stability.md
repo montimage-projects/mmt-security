@@ -723,4 +723,14 @@ v1.2.17  4e1647eaf219 REQUIRE_PLUGIN=1.2.7
 v1.2.18  4e1647eaf219 REQUIRE_PLUGIN=1.2.7
 v1.2.19  4e1647eaf219 REQUIRE_PLUGIN=1.2.7
 v1.2.20  4e1647eaf219 REQUIRE_PLUGIN=1.2.7
+1.2.21   d349efdf8661 REQUIRE_PLUGIN=1.2.21
+    < rule_info_t 96 id@0:4 type_id@4:4 type_string@8:8 description@16:8 if_satisfied@24:8 if_not_satisfied@32:8 proto_atts_count@40:1 events_count@41:1 proto_atts@48:8 proto_atts_events@56:8 excluded_filter@64:8 create_instance@72:8 hash_message@80:8 version@88:8
+    > rule_info_t 104 id@0:4 type_id@4:4 type_string@8:8 description@16:8 if_satisfied@24:8 if_not_satisfied@32:8 proto_atts_count@40:1 events_count@41:1 proto_atts@48:8 proto_atts_events@56:8 excluded_filter@64:8 create_instance@72:8 hash_message@80:8 version@88:8
 ```
+
+1.2.21 is not a tag: it is the fork tree after the #51 instance index
+(PR #55), probed the same way. The probe measures `sizeof( rule_info_t )`
+but not the `instance_keys` field, and does not cover `rule_engine_t`, whose
+`msg_values` the generated guards also read (section "`rule_engine_t` is
+part of the plugin ABI" above). Before this change the tree stamped 1.2.20
+with the v1.2.20 layout (4e1647eaf219).
