@@ -144,6 +144,9 @@ Option:
    -c <string>    : Gives the range of logical cores to run on, e.g., "1,3-8,16"
    -x <string>    : Gives the range of rules id to be excluded, e.g., "99,107-1010".
    -m <string>    : Attributes special rules to special threads using format (lcore:range) e.g., "(1:1-8,10-13)(2:50)(4:1007-1010)".
+                    A value of 100000 or more in a -c, -x or -m mask is rejected with an error:
+                    the mask parser uses a table of 100000 entries; before, a range reaching
+                    that bound could write past it.
    -f <string>    : Output results to file, e.g., "/home/tata/:5" => output to folder /home/tata and each file contains reports during 5 seconds 
    -r <string>    : Output results to redis, e.g., "localhost:6379"
    -g             : Ignore the rest of a flow when an alert was detetected on the flow.
@@ -190,6 +193,9 @@ Option:
    -c <string> : Gives the range of logical cores to run on, e.g., "1,3-8,16"
    -x <string> : Gives the range of rules id to be excluded from verification, e.g., "1,3-8,16"
    -m <string> : Attributes special rules to special threads e.g., "(1:10-13)(2:50)(4:1007-1010)"
+               : A value of 100000 or more in a -c, -x or -m mask is rejected with an error:
+                 the mask parser uses a table of 100000 entries; before, a range reaching
+                 that bound could write past it.
    -f <string> : Output results to file, e.g., "/home/tata/:5" => output to folder /home/tata and each file contains reports during 5 seconds 
    -r <string> : Output results to redis, e.g., "localhost:6379"
    -v          : Verbose.
