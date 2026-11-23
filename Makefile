@@ -157,11 +157,14 @@ perf.%: $(LIB_OBJS) test/perf/%.o
 # generator that runs inside the build; it exits while a few small
 # allocations are still live, so an ASan build of it is failed by
 # LeakSanitizer at the first rules/%.so recipe, and `make ASAN=1` could not
-# build the rules from a clean tree. Under ASAN it is therefore compiled and
-# linked without the sanitizer flags, from a separate set of objects
-# (*.gen.o) - the engine, the library and the rule plugins keep them.
+# build the rules from a clean tree. A TSan build has the same problem:
+# where the TSan runtime cannot start (e.g. aarch64: "unexpected memory
+# mapping"), an instrumented compile_rule aborts and no rule is generated.
+# Under ASAN or TSAN it is therefore compiled and linked without the
+# sanitizer flags, from a separate set of objects (*.gen.o) - the engine,
+# the library and the rule plugins keep them.
 # In a default build it links the normal objects, as before.
-ifdef ASAN
+ifneq ($(strip $(ASAN) $(TSAN)),)
   GEN_CFLAGS   := $(filter-out -fsanitize=address -fsanitize=thread,$(CFLAGS))
   GEN_CLDFLAGS := $(filter-out -fsanitize=address -fsanitize=thread,$(CLDFLAGS))
   GEN_OBJS     := $(patsubst %.o,%.gen.o,$(LIB_OBJS) $(SRCDIR)/main_gen_plugin.o)
