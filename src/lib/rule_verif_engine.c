@@ -776,6 +776,19 @@ static enum verdict_type _process_expired_timeouts( rule_engine_t *engine, messa
 		e       = expired[ i ];
 		fsm_ind = e->node;
 
+		//the processing of an earlier entry of this message may have
+		//unregistered this node (#48: never touch a dead node). It is not
+		//drained before the message is done, so fsm_ind is still valid;
+		//_remove_fsm_from_expecting_events marked its entry dead too, and
+		//no other pointer to the entry is left: free it here and only here
+		//(the `e->dead || fsm_ind->dead` branch below is not reached)
+		if( unlikely( fsm_ind->dead )){
+			if( fsm_ind->timeout_entry == e )
+				fsm_ind->timeout_entry = NULL;
+			mmt_mem_force_free( e );
+			continue;
+		}
+
 		if( fsm_ind->counter == message->counter ){
 			//a node created while this message was being verified is not
 			//processed on it - the same skip the counter performs in the
