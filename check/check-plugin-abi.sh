@@ -21,7 +21,10 @@
 # exit 0 on a capture; rule_info must refuse them too. A control leg with
 # this tree's rules must alert, so the capture does exercise the rules.
 # 6.SYNFUL.so holds two rules: the loader must not index an array of
-# another layout beyond its first rule.
+# another layout beyond its first rule. Each refused leg also holds 9101
+# (check/timeout) built by this tree: a rule of the right version in the
+# same rules/ must still load (and an engine built with DEBUG=1 halts when
+# no rule at all is loaded: a 0-size allocation in mmt_single_sec_register).
 #
 # Usage: check/check-plugin-abi.sh [compile_rule] [mmt_sec_standalone] [rule_info]
 set -u
@@ -81,12 +84,15 @@ run_engine(){ # dir log
 	done
 	return $rc
 }
-alerts(){ cat "$1"/out/*.csv 2>/dev/null | wc -l; }
+# alerts of the rules under test (9101, the rule of this tree, may alert)
+alerts(){ cat "$1"/out/*.csv 2>/dev/null | awk -F, '$5 == 1 || $5 == 6 || $5 == 84 || $5 == 26' | wc -l; }
 
 # expect every rule of $1/rules refused with message $2, no rule loaded,
 # exit 0 on the capture, rule_info refusing each .so as well
 check_refused(){ # dir pattern what
 	local d=$1 pat=$2 what=$3 rc=0 id n x
+	( cd "$ROOT" && "$COMPILE_RULE" "$d/rules/9101.so" check/timeout/9101.xml ) > "$d/9101.log" 2>&1 \
+		|| { fail "$what: rule 9101 of this tree does not compile"; return; }
 	run_engine "$d" "$d/run.log" || rc=$?
 	if [ $rc -ne 0 ]; then
 		tail -5 "$d/run.log" | sed 's/^/    | /'
@@ -104,6 +110,8 @@ check_refused(){ # dir pattern what
 	done
 	grep -q "Ignored the 1 other rule(s) of the same plugin" "$d/run.log" \
 		|| fail "$what: rule 84 (second rule of 6.SYNFUL.so) not refused with its plugin"
+	! grep -q "Ignored rule 9101\|no security rules" "$d/run.log" \
+		|| fail "$what: rule 9101 of this tree was not loaded"
 	for x in $RULES; do
 		rc=0
 		( cd "$d" && timeout -s KILL 60 "$RULE_INFO" "rules/$x.so" ) > "$d/info-$x.log" 2>&1 || rc=$?
