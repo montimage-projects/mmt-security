@@ -575,8 +575,8 @@ check-instance-keys: compile_rule
 # the loader refuses rule .so files of another plugin ABI, older or newer,
 # with a warning instead of loading them (fork #51, PR #55)
 check: check-plugin-abi
-check-plugin-abi: _prepare
-	@./check/check-plugin-abi.sh ./$(MAIN_GEN_PLUGIN) ./$(MAIN_STAND_ALONE)
+check-plugin-abi: _prepare rule_info
+	@./check/check-plugin-abi.sh ./$(MAIN_GEN_PLUGIN) ./$(MAIN_STAND_ALONE) ./$(MAIN_PLUGIN_INFO)
 
 # ThreadSanitizer on the SMP message hand-off (fork #45): a TSan build in a
 # scratch copy (the normal build is untouched), then `-c 1-8` on every

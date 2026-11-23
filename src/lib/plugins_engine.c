@@ -325,6 +325,11 @@ size_t load_mmt_sec_rules( rule_info_t const*const**ret_array ){
 
 /**
  * PUBLIC API
+ * Used by rule_info. It reads only prefix fields of rule_info_t, but it
+ * indexes the plugin's array with this engine's sizeof( rule_info_t ):
+ * for a plugin of another layout, the second rule is not where it looks
+ * (fork #51: an old 6.SYNFUL.so, two rules, crashed rule_info). So it
+ * goes through the same version gate as the engine's loader.
  */
 size_t load_mmt_sec_rule( rule_info_t const*const**rules_array, const char *plugin_path_name ){
 	void *lib = dlopen( plugin_path_name, RTLD_NOW );
@@ -333,21 +338,19 @@ size_t load_mmt_sec_rule( rule_info_t const*const**rules_array, const char *plug
 
 	mmt_sec_get_plugin_info_fn_t mmt_sec_get_plugin_info = dlsym ( lib, "mmt_sec_get_plugin_info" );
 
+	mmt_assert( mmt_sec_get_plugin_info != NULL, "File %s is incorrect!", plugin_path_name );
+
 	rule_info_t const* tmp_array;
 
-	size_t size, i;
+	size_t size;
 
 	size = mmt_sec_get_plugin_info( &tmp_array );
 
-	const rule_info_t **rules = malloc( sizeof( void*) *  size );
+	const rule_info_t **rules = malloc( sizeof( void*) * ( size == 0 ? 1 : size ));
 	mmt_assert( rules != NULL, "Not enough memory");
 
-	for( i=0; i<size; i++ ){
-		//set of rules of this plugin
-		rules[ i ] = &tmp_array[i];
-	}
 	*rules_array = rules;
-	return size;
+	return _filter_rules_by_version( tmp_array, size, rules );
 }
 
 /**

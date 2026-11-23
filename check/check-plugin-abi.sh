@@ -18,17 +18,18 @@
 #  - newer: rules built by this tree's compile_rule stamped one patch
 #    version above the engine (a scratch copy built with VERSION=x.y.z+1).
 # In both legs the engine must load no rule, name each refused rule, and
-# exit 0 on a capture. A control leg with
+# exit 0 on a capture; rule_info must refuse them too. A control leg with
 # this tree's rules must alert, so the capture does exercise the rules.
 # 6.SYNFUL.so holds two rules: the loader must not index an array of
 # another layout beyond its first rule.
 #
-# Usage: check/check-plugin-abi.sh [compile_rule] [mmt_sec_standalone]
+# Usage: check/check-plugin-abi.sh [compile_rule] [mmt_sec_standalone] [rule_info]
 set -u
 cd "$(dirname "$0")/.."
 ROOT=$PWD
 COMPILE_RULE=$(realpath "${1:-./compile_rule}")
 STANDALONE=$(realpath "${2:-./mmt_sec_standalone}")
+RULE_INFO=$(realpath "${3:-./rule_info}")
 BASE=${MMT_SEC_ABI_BASE:-97441d79}
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
@@ -81,9 +82,9 @@ run_engine(){ # dir log
 alerts(){ cat "$1"/out/*.csv 2>/dev/null | wc -l; }
 
 # expect every rule of $1/rules refused with message $2, no rule loaded,
-# exit 0 on the capture
+# exit 0 on the capture, rule_info refusing each .so as well
 check_refused(){ # dir pattern what
-	local d=$1 pat=$2 what=$3 rc=0 id n
+	local d=$1 pat=$2 what=$3 rc=0 id n x
 	run_engine "$d" "$d/run.log" || rc=$?
 	if [ $rc -ne 0 ]; then
 		tail -5 "$d/run.log" | sed 's/^/    | /'
@@ -100,6 +101,16 @@ check_refused(){ # dir pattern what
 	done
 	grep -q "Ignored the 1 other rule(s) of the same plugin" "$d/run.log" \
 		|| fail "$what: rule 84 (second rule of 6.SYNFUL.so) not refused with its plugin"
+	for x in $RULES; do
+		rc=0
+		( cd "$d" && timeout -s KILL 60 "$RULE_INFO" "rules/$x.so" ) > "$d/info-$x.log" 2>&1 || rc=$?
+		if [ $rc -ne 0 ]; then
+			tail -3 "$d/info-$x.log" | sed 's/^/    | /'
+			fail "$what: rule_info rules/$x.so exited $rc"
+		elif ! grep -q "^Found 0 rule" "$d/info-$x.log"; then
+			fail "$what: rule_info lists the rules of rules/$x.so"
+		fi
+	done
 	[ $status -eq 0 ] && echo "  $what: refused, no alert, exit 0"
 }
 
