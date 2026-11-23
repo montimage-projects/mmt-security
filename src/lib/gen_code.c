@@ -29,6 +29,7 @@ struct _user_data{
 	uint32_t uint32_val;
 	mmt_map_t *map;
 	FILE *file;
+	void *ptr;
 };
 
 
@@ -703,6 +704,7 @@ static inline void _gen_rule_information( FILE *fd, rule_t *const* rules, size_t
 		fprintf( fd, "\n\t\t\t .create_instance  = &create_new_fsm_%d,", rules[i]->id );
 		fprintf( fd, "\n\t\t\t .hash_message     = &_allocate_msg_t_%d,", rules[i]->id );
 		fprintf( fd, "\n\t\t\t .version          = &version,");
+		fprintf( fd, "\n\t\t\t .instance_keys    = instance_keys_%d,", rules[i]->id );
 
 
 		if( i < count -1 )
@@ -714,6 +716,123 @@ static inline void _gen_rule_information( FILE *fd, rule_t *const* rules, size_t
 	fprintf( fd, "\n\t return %zu;\n }", count);
 }
 
+
+/**
+ * An equality `cur_att == his_att.event_id` collected from an event's
+ * guard: one component of the key identifying the instances the awaited
+ * event can match (fsm_instance_key_component_t in the generated code).
+ */
+typedef struct{
+	const variable_t *msg_var; //attribute of the message being verified
+	const variable_t *his_var; //attribute of the message that validated the referenced event
+}_instance_key_pair_t;
+
+/**
+ * Collect the pairs of #instance_keys of an event: every equality
+ * `att == att.event_id` the event's guard must satisfy to return non-NO.
+ * These are exactly the EQ nodes having one current-message variable and
+ * one history variable as parameters, reachable through ANDs from the
+ * root of the expression (a disjunction makes none of its members
+ * necessary, so OR operands are not descended into).
+ * A pair is dropped when the two sides have different data types: such a
+ * comparison does not have a stable equality semantics to key on.
+ */
+static void _collect_instance_key_pairs( const expression_t *expr, _instance_key_pair_t *pairs, size_t *pairs_count ){
+	const operation_t *op;
+	const expression_t *p1, *p2;
+	const variable_t *cur, *his;
+	const link_node_t *node;
+	size_t i;
+
+	if( expr == NULL || expr->type != OPERATION )
+		return;
+
+	op = expr->operation;
+	if( op->operator == AND ){
+		for( node = op->params_list; node != NULL; node = node->next )
+			_collect_instance_key_pairs( (expression_t *) node->data, pairs, pairs_count );
+		return;
+	}
+
+	if( op->operator != EQ || op->params_size != 2 )
+		return;
+
+	p1 = (expression_t *) op->params_list->data;
+	p2 = (expression_t *) op->params_list->next->data;
+	if( p1->type != VARIABLE || p2->type != VARIABLE )
+		return;
+	if( (p1->variable->ref_index == (uint16_t) UNKNOWN) == (p2->variable->ref_index == (uint16_t) UNKNOWN ))
+		return;
+
+	cur = p1->variable->ref_index == (uint16_t) UNKNOWN ? p1->variable : p2->variable;
+	his = cur == p1->variable ? p2->variable : p1->variable;
+	if( cur->data_type != his->data_type )
+		return;
+
+	//the same pair may repeat ( e.g., a == a.1 && a == a.1 ): keep one
+	for( i=0; i<*pairs_count; i++ )
+		if( pairs[i].msg_var == cur && pairs[i].his_var == his )
+			return;
+	pairs[ (*pairs_count) ++ ] = (_instance_key_pair_t){ cur, his };
+}
+
+/**
+ * Iterate an event: collect its instance-key pairs, sort them in a
+ * canonical order and print their component array when there is at least
+ * one. user_data->map is the rule's variables_map (proto_atts order) and
+ * user_data->ptr is a bool[] indexed by event id recording which events
+ * got a component array, so the instance_keys_ table can be emitted.
+ */
+static void _iterate_event_to_gen_instance_keys( void *key, void *data, void *user_data, size_t index, size_t total ){
+	struct _user_data *_u_data = (struct _user_data *)user_data;
+	uint32_t rule_id  = _u_data->uint32_val;
+	rule_event_t *ev  = (rule_event_t *)data;
+	uint16_t event_id = * (uint16_t *)key;
+	_instance_key_pair_t *pairs;
+	size_t pairs_count = 0, i, j;
+	int msg_idx, his_idx;
+
+	//a rule has at most 64 events: no expression can hold more pairs
+	pairs = mmt_mem_alloc( 64 * sizeof( _instance_key_pair_t ));
+	_collect_instance_key_pairs( ev->expression, pairs, &pairs_count );
+
+	if( pairs_count == 0 ){
+		mmt_mem_free( pairs );
+		return;
+	}
+	((uint8_t *)_u_data->ptr)[ event_id ] = pairs_count;
+
+	//canonical order (msg_att_index, his_event_id, his_att_index): the
+	//engine hashes the components in the same sequence for both sides
+	for( i=1; i<pairs_count; i++ ){
+		_instance_key_pair_t p = pairs[i];
+		int mi = mmt_map_get_index( _u_data->map, (void *)p.msg_var );
+		for( j=i; j>0; j-- ){
+			int mj = mmt_map_get_index( _u_data->map, (void *)pairs[j-1].msg_var );
+			if( mj > mi || ( mj == mi && ( pairs[j-1].his_var->ref_index > p.his_var->ref_index
+					|| ( pairs[j-1].his_var->ref_index == p.his_var->ref_index
+							&& compare_variable_name( pairs[j-1].his_var, p.his_var ) > 0 ))))
+				pairs[j] = pairs[j-1];
+			else
+				break;
+		}
+		pairs[j] = p;
+	}
+
+	fprintf( _u_data->file, "\n static const fsm_instance_key_component_t instance_key_cmp_%"PRIu32"_%d[] = {",
+			rule_id, event_id );
+	for( i=0; i<pairs_count; i++ ){
+		msg_idx = mmt_map_get_index( _u_data->map, (void *)pairs[i].msg_var );
+		his_idx = mmt_map_get_index( _u_data->map, (void *)pairs[i].his_var );
+		mmt_assert( msg_idx >= 0 && his_idx >= 0, "Variable %s.%s must be defined before!",
+				pairs[i].msg_var->proto, pairs[i].msg_var->att );
+		fprintf( _u_data->file, "\n\t { .msg_att_index = %d, .his_event_id = %d, .his_att_index = %d, .data_type = %d },",
+				msg_idx, pairs[i].his_var->ref_index, his_idx, pairs[i].his_var->data_type );
+	}
+	fprintf( _u_data->file, "\n };\n" );
+
+	mmt_mem_free( pairs );
+}
 
 static inline void _iterate_variable_to_add_to_a_new_map( void *key, void *data, void *user_data, size_t index, size_t total ){
 	mmt_map_set_data((mmt_map_t *)user_data, data, data, NO );
@@ -958,6 +1077,27 @@ static inline void _gen_fsm_for_a_rule( FILE *fd, const rule_t *rule ){
 
 	_u_data.map = variables_map;
 	mmt_map_iterate(events_map, _iterate_event_to_gen_guards, &_u_data );
+
+	//the key identifying which instances an event can match: one
+	//component per `att == att.event_id` the event's guard requires
+	{
+		uint8_t *keyed = mmt_mem_alloc( events_count + 1 );
+		size_t i;
+		memset( keyed, 0, events_count + 1 );
+		_u_data.ptr = keyed;
+		mmt_map_iterate( events_map, _iterate_event_to_gen_instance_keys, &_u_data );
+
+		fprintf( fd, "\n static const fsm_instance_key_t instance_keys_%d[ EVENTS_COUNT_%d + 1 ] = {",
+				rule->id, rule->id );
+		for( i=0; i<=events_count; i++ )
+			if( keyed[i] == 0 )
+				fprintf( fd, "\n\t { .components_count = 0, .components = NULL }, //event_%zu", i );
+			else
+				fprintf( fd, "\n\t { .components_count = %d, .components = instance_key_cmp_%d_%zu },",
+						keyed[i], rule->id, i );
+		fprintf( fd, "\n };\n" );
+		mmt_mem_free( keyed );
+	}
 
 	_gen_fsm_state_for_a_rule( fd, rule );
 
