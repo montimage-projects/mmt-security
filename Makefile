@@ -141,7 +141,7 @@ gen_dpi $(MMT_DPI_HEADER): $(MMT_DPI_DIR)
 	$(QUIET) echo ">>> Generate list of protocols and their attributes to $(MMT_DPI_HEADER)"
 	$(QUIET) ./$(MAIN_DPI) $(MMT_DPI_HEADER)
 
-%.o: %.c
+%.o: %.c | $(MMT_DPI_HEADER)
 	@echo "[COMPILE] $(notdir $@)"
 	$(QUIET) $(CC) $(CFLAGS) $(CLDFLAGS) -c -o $@ $<
 	
@@ -157,11 +157,14 @@ perf.%: $(LIB_OBJS) test/perf/%.o
 # generator that runs inside the build; it exits while a few small
 # allocations are still live, so an ASan build of it is failed by
 # LeakSanitizer at the first rules/%.so recipe, and `make ASAN=1` could not
-# build the rules from a clean tree. Under ASAN it is therefore compiled and
-# linked without the sanitizer flags, from a separate set of objects
-# (*.gen.o) - the engine, the library and the rule plugins keep them.
+# build the rules from a clean tree. A TSan build has the same problem:
+# where the TSan runtime cannot start (e.g. aarch64: "unexpected memory
+# mapping"), an instrumented compile_rule aborts and no rule is generated.
+# Under ASAN or TSAN it is therefore compiled and linked without the
+# sanitizer flags, from a separate set of objects (*.gen.o) - the engine,
+# the library and the rule plugins keep them.
 # In a default build it links the normal objects, as before.
-ifdef ASAN
+ifneq ($(strip $(ASAN) $(TSAN)),)
   GEN_CFLAGS   := $(filter-out -fsanitize=address -fsanitize=thread,$(CFLAGS))
   GEN_CLDFLAGS := $(filter-out -fsanitize=address -fsanitize=thread,$(CLDFLAGS))
   GEN_OBJS     := $(patsubst %.o,%.gen.o,$(LIB_OBJS) $(SRCDIR)/main_gen_plugin.o)
@@ -170,7 +173,7 @@ else
   GEN_OBJS     := $(LIB_OBJS) $(SRCDIR)/main_gen_plugin.o
 endif
 
-%.gen.o: %.c
+%.gen.o: %.c | $(MMT_DPI_HEADER)
 	@echo "[COMPILE] $(notdir $@)"
 	$(QUIET) $(CC) $(GEN_CFLAGS) $(GEN_CLDFLAGS) -c -o $@ $<
 
@@ -242,13 +245,15 @@ endif
 
 # RULE_OBJS is a list of .o files of rules
 #   This list is empty if we compile without STATIC_LINK option
-$(LIB_NAME).a:
+# The object lists must be prerequisites, otherwise -j may archive or link
+# the library before every object exists (missing-file error from ar/ld).
+$(LIB_NAME).a: $(LIB_OBJS) $(RULE_OBJS)
 	$(QUIET) echo "[ARCHIVE] $(notdir $@)"
 	$(QUIET) $(AR) $(LIB_NAME).a  $(LIB_OBJS) $(RULE_OBJS)
-	
+
 	@#$(QUIET) $(RM) $(RULE_OBJS) #we do not need rules/*.o anymore
 
-$(LIB_NAME).so:
+$(LIB_NAME).so: $(LIB_OBJS) $(RULE_OBJS)
 	@echo "[LIBRARY] $(notdir $@)"
 	$(QUIET) $(CC)  -fPIC -shared -O3 -o $(LIB_NAME).so $(LIB_OBJS)  $(RULE_OBJS)
 	

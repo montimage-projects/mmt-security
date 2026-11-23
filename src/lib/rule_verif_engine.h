@@ -58,6 +58,23 @@ typedef struct rule_engine_struct{
 	 * _drain_dead_nodes(). It is NULL outside message processing.
 	 */
 	link_node_t *dead_nodes;
+
+	/**
+	 * Once per message, before any guard runs on it, the data pointer of
+	 * each proto.att of the rule is resolved from the message being
+	 * verified into #msg_values. A generated guard reads its
+	 * current-message variables from here (reaching the engine through
+	 * fsm->user_data) instead of re-walking message->elements for every
+	 * fsm instance; history (.N) variables still fetch the per-instance
+	 * trace message.
+	 * #msg_values_idx[i] is the element index of proto_atts[i] in
+	 * message->elements - the (proto,att)->element hash computed once at
+	 * engine init, so filling is a flat array walk.
+	 * Both are NULL when the rule has no proto_atts. Only the thread
+	 * owning this engine reads or writes them - no synchronisation needed.
+	 */
+	const void **msg_values;
+	uint16_t    *msg_values_idx;
 } rule_engine_t __aligned;
 
 //max number of events in a rule
