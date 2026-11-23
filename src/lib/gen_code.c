@@ -722,6 +722,14 @@ static inline void _gen_rule_information( FILE *fd, rule_t *const* rules, size_t
  * guard: one component of the key identifying the instances the awaited
  * event can match (fsm_instance_key_component_t in the generated code).
  */
+/**
+ * Most components of an instance key: the size of the pairs buffer of
+ * _iterate_event_to_gen_instance_keys, checked at each write by
+ * _collect_instance_key_pairs (fsm_instance_key_t.components_count is a
+ * uint8_t). A rule beyond it fails to compile, with an error.
+ */
+#define MAX_INSTANCE_KEY_PAIRS 64
+
 typedef struct{
 	const variable_t *msg_var; //attribute of the message being verified
 	const variable_t *his_var; //attribute of the message that validated the referenced event
@@ -808,6 +816,11 @@ static void _collect_instance_key_pairs( const expression_t *expr, _instance_key
 
 	if( *fn_seen )
 		*fn_before_key = true;
+	//#pairs holds MAX_INSTANCE_KEY_PAIRS (see the caller): the number of
+	//distinct `att == att.N` conjuncts is not bounded by the events count
+	mmt_assert( *pairs_count < MAX_INSTANCE_KEY_PAIRS,
+			"Error: an event expression has more than %d equalities `att == att.N` under its top-level ANDs",
+			MAX_INSTANCE_KEY_PAIRS );
 	pairs[ (*pairs_count) ++ ] = (_instance_key_pair_t){ cur, his };
 	return;
 
@@ -833,8 +846,7 @@ static void _iterate_event_to_gen_instance_keys( void *key, void *data, void *us
 	int msg_idx, his_idx;
 	bool fn_seen = false, fn_before_key = false;
 
-	//a rule has at most 64 events: no expression can hold more pairs
-	pairs = mmt_mem_alloc( 64 * sizeof( _instance_key_pair_t ));
+	pairs = mmt_mem_alloc( MAX_INSTANCE_KEY_PAIRS * sizeof( _instance_key_pair_t ));
 	_collect_instance_key_pairs( ev->expression, pairs, &pairs_count, &fn_seen, &fn_before_key );
 
 	if( pairs_count > 0 && fn_before_key ){
