@@ -256,6 +256,7 @@ const char *mmt_sec_get_rule_abi_layout( void ){
 	_F(rule_info_t, proto_atts_count); _F(rule_info_t, events_count); _F(rule_info_t, proto_atts);
 	_F(rule_info_t, proto_atts_events); _F(rule_info_t, excluded_filter);
 	_F(rule_info_t, create_instance); _F(rule_info_t, hash_message); _F(rule_info_t, version);
+	_F(rule_info_t, instance_keys);
 	_E();
 	_S(message_element_t);
 	_F(message_element_t, proto_id); _F(message_element_t, att_id);

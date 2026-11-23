@@ -1,0 +1,15 @@
+<beginning>
+<!-- Test rule of check/check-instance-keys.sh: the function hides in an OR
+     conjunct, between the two equalities of the key of event 2; a message
+     matching ip.src but not ip.dst would call it. Not keyed.
+     expect-keyed: none -->
+<property value="THEN" delay_units="s" delay_min="0" delay_max="1" property_id="9203" type_property="ATTACK"
+          description="function in an OR between two key equalities: not keyed">
+    <event value="COMPUTE" event_id="1"
+           description="a"
+           boolean_expression="(udp.dest_port == 2000)"/>
+    <event value="COMPUTE" event_id="2"
+           description="b"
+           boolean_expression="((ip.src == ip.src.1) &amp;&amp; (((udp.len == 1) || (#strstr(http.user_agent, 'x') != 0)) &amp;&amp; (ip.dst == ip.dst.1)))"/>
+</property>
+</beginning>

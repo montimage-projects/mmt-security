@@ -1,0 +1,16 @@
+<beginning>
+<!-- Test rule of check/check-instance-keys.sh: event 2 calls the embedded
+     function after the key equality (ip.src == ip.src.1): on a key miss the
+     equality fails first and the function is not called, so the event is
+     indexed.
+     expect-keyed: 2 -->
+<property value="THEN" delay_units="s" delay_min="0" delay_max="1" property_id="9202" type_property="ATTACK"
+          description="function after the key equality: keyed">
+    <event value="COMPUTE" event_id="1"
+           description="a"
+           boolean_expression="(udp.dest_port == 2000)"/>
+    <event value="COMPUTE" event_id="2"
+           description="b"
+           boolean_expression="((ip.src == ip.src.1) &amp;&amp; (#strstr(http.user_agent, 'x') != 0))"/>
+</property>
+</beginning>

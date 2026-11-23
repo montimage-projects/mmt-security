@@ -189,14 +189,15 @@ struct fsm_struct{
 
    mmt_array_t *execution_trace;
 
-   //this is for internal usage. It points to _rule_engine_t
+   //this is for internal usage. During verification it is owned by the
+   //engine and points to the rule_engine_t verifying this fsm.
    void *user_data;
 
    /**
     * Engine-private: head of the chain of this fsm's expecting-event nodes
-    * (the link_node_t list in rule_verif_engine.c, threaded through
-    * _fsm_tran_index_t.next_in_fsm). It lets the engine remove every node
-    * an fsm registered without scanning all the event lists.
+    * (the _fsm_tran_index_t nodes in rule_verif_engine.c, threaded through
+    * their next_in_fsm). It lets the engine remove every node an fsm
+    * registered without scanning all the event lists.
     */
    void *reg_nodes;
 } __aligned;

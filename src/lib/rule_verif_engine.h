@@ -15,15 +15,29 @@
 #include "plugin_header.h"
 #include "mmt_fsm.h"
 
+struct _fsm_tran_index_struct;
+struct _fsm_event_index_struct;
+struct _fsm_timeout_heap_struct;
+
 typedef struct rule_engine_struct{
 	const rule_info_t *rule_info;
 	//this fsm is used for execution the first event
 	fsm_t *fsm_bootstrap;
 
-	//event_id - fsm_instance
+	//event_id - fsm_instance: only the nodes whose event has no usable
+	//instance key, or whose key cannot be computed for their fsm; keyed
+	//nodes live in #event_index buckets instead
 	link_node_t **fsm_by_expecting_event_id;
+	//event_id - index of the keyed fsm instances awaiting that event
+	struct _fsm_event_index_struct **event_index;
 	//instance_id - fsm_sub_instance
 	link_node_t **fsm_by_instance_id;
+
+	//registration sequence: expecting-event nodes of a same list are
+	//verified newest-first, the order the list held them in
+	uint64_t next_reg_seq;
+	//the timeout nodes of every live instance, ordered by fsm->time_max
+	struct _fsm_timeout_heap_struct *timeout_heap;
 
 	mmt_array_t *valid_execution_trace;
 
@@ -52,12 +66,13 @@ typedef struct rule_engine_struct{
 
 	/**
 	 * Expecting-event nodes marked dead while the current message is being
-	 * verified. They stay in their lists until the message is done - so the
-	 * "next" pointers of the event loops remain valid across
-	 * _process_a_node() - and are then unlinked and freed in one pass by
-	 * _drain_dead_nodes(). It is NULL outside message processing.
+	 * verified, chained by _fsm_tran_index_struct.next_dead. They stay in
+	 * their lists until the message is done - so the "next" pointers of
+	 * the event loops remain valid across _process_a_node() - and are
+	 * then unlinked and freed in one pass by _drain_dead_nodes(). It is
+	 * NULL outside message processing.
 	 */
-	link_node_t *dead_nodes;
+	struct _fsm_tran_index_struct *dead_nodes;
 
 	/**
 	 * Once per message, before any guard runs on it, the data pointer of

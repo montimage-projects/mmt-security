@@ -321,6 +321,7 @@ also shares `message_t` and `message_element_t` (`src/lib/message_t.h`, read by
 | v1.2.0 - v1.2.5 | unchanged | 64 bytes, `elements@16`, `hash` u64 | 1.2.0 |
 | v1.2.6 - v1.2.12 | unchanged | 128 bytes, `flow_id` and `user_data` added, `elements@24` | 1.2.7 |
 | v1.2.13 - v1.2.20 | unchanged | `hash` becomes `mmt_bit_t` (32 bytes, at 34) | 1.2.7 |
+| 1.2.21 (unreleased, fork #51) | `rule_info_t` 104 bytes: `instance_keys@96` appended; `rule_engine_t` changed too (below) | unchanged | 1.2.21 |
 
 - `rule_info_t` (96 bytes on LP64), `proto_attribute_t` (32) and
   `rule_version_info_t` (40) did not change from v1.2.0 to v1.2.20.
@@ -332,6 +333,68 @@ also shares `message_t` and `message_element_t` (`src/lib/message_t.h`, read by
   read `message_t.hash` (it reads `elements` and `elements_count`, whose offsets
   did not move), so v1.2.6+ `.so` files stay compatible. A struct hash would
   still have flagged it. Only the bump discipline protects the ABI today.
+
+### `rule_engine_t` is part of the plugin ABI (1.2.21)
+
+The layout probe above covers the structs of `plugin_header.h`,
+`message_t.h`, `mmt_array_t.h` and `mmt_fsm.h`. It misses one: the guards
+that `compile_rule` generates `#include "rule_verif_engine.h"`
+(`src/lib/gen_code.c`, the includes of the generated code) and read the
+per-message attribute values as `_engine->msg_values`, where `_engine` is
+the `rule_engine_t` of the fsm (`fsm_get_user_data`). The offset of
+`msg_values` is therefore compiled into every rule `.so`. So
+`rule_engine_t`, an engine-private struct, is in effect part of the plugin
+ABI since `msg_values` was added (fork #51, PR #53).
+
+The fork #51 instance index (PR #55) changed both structs:
+
+| struct | before (97441d79, stamped 1.2.20) | after (1.2.21) |
+|---|---|---|
+| `rule_info_t` | 96 bytes, `version@88` last | 104 bytes, `instance_keys@96` appended |
+| `rule_engine_t` | 112 bytes, `msg_values@96` | 136 bytes, `msg_values@120` (`event_index`, `next_reg_seq` and `timeout_heap` inserted before it) |
+
+(LP64, aarch64 and x86_64.) Both directions crash without a gate: an engine
+of the new layout reads `instance_keys` past the end of an old rule's
+`rule_info_t` (SIGSEGV in `rule_engine_init`), and an engine of the old
+layout running a new rule makes its guard read the wrong `rule_engine_t`
+slot (SIGSEGV inside the generated guard).
+
+`VERSION` 1.2.20 was stamped by `compile_rule` both before and after the
+change, so `REQUIRE_PLUGIN` could not stay at 1.2.20: rules of the old
+layout would pass a `>= 1.2.20` check. The fix:
+
+- `VERSION` and `REQUIRE_PLUGIN` are 1.2.21, a stamp that no `compile_rule`
+  of the old layout wrote;
+- the loader (`_filter_rules_by_version`, `src/lib/plugins_engine.c`) also
+  refuses a rule stamped **newer** than the engine, with the warning
+  "Ignored rule N as it was built for a newer engine". A rule is loaded
+  only if `REQUIRE_PLUGIN <= stamp <= engine version`;
+- the loader reads only the `rule_info_t` prefix (`id`, `description`,
+  `version`) before the check, and the first rule of a plugin decides for
+  the whole plugin: the rules array of another layout has another stride,
+  so its second element cannot be located;
+- `check/check-plugin-abi.sh` (`make check`) loads rules built by the
+  `compile_rule` of 97441d79 and rules stamped one patch version above the
+  engine, and expects both refused, with a warning and exit 0.
+
+Two limits remain:
+
+- **Engines already deployed cannot be protected.** An engine of
+  `REQUIRE_PLUGIN` 1.2.7 (v1.2.7 to v1.2.20, and the fork before this
+  change) has no upper bound: it accepts a 1.2.21 rule, whose guards then
+  read its `rule_engine_t` at the wrong offset. Nothing in a new rule `.so`
+  can make an old engine refuse it.
+- **The upper bound is strict.** A 1.2.21 engine also refuses a rule built
+  by a later `compile_rule` whose layout did not change.
+
+**Rule: rebuild the rules with the engine.** Install a rule `.so` only with
+the mmt-security it was compiled by (same `VERSION`), and recompile every
+third-party rule when mmt-security is upgraded. `rule_info --build-info`
+prints the stamp of a rule `.so` (`mmt_security.version`).
+
+The long-term fix (not done): generated guards reach the message values
+through an accessor exported by the engine, not through the struct offset,
+so that `rule_engine_t` leaves the plugin ABI.
 
 ## Recommendations
 
@@ -660,4 +723,14 @@ v1.2.17  4e1647eaf219 REQUIRE_PLUGIN=1.2.7
 v1.2.18  4e1647eaf219 REQUIRE_PLUGIN=1.2.7
 v1.2.19  4e1647eaf219 REQUIRE_PLUGIN=1.2.7
 v1.2.20  4e1647eaf219 REQUIRE_PLUGIN=1.2.7
+1.2.21   d349efdf8661 REQUIRE_PLUGIN=1.2.21
+    < rule_info_t 96 id@0:4 type_id@4:4 type_string@8:8 description@16:8 if_satisfied@24:8 if_not_satisfied@32:8 proto_atts_count@40:1 events_count@41:1 proto_atts@48:8 proto_atts_events@56:8 excluded_filter@64:8 create_instance@72:8 hash_message@80:8 version@88:8
+    > rule_info_t 104 id@0:4 type_id@4:4 type_string@8:8 description@16:8 if_satisfied@24:8 if_not_satisfied@32:8 proto_atts_count@40:1 events_count@41:1 proto_atts@48:8 proto_atts_events@56:8 excluded_filter@64:8 create_instance@72:8 hash_message@80:8 version@88:8
 ```
+
+1.2.21 is not a tag: it is the fork tree after the #51 instance index
+(PR #55), probed the same way. The probe measures `sizeof( rule_info_t )`
+but not the `instance_keys` field, and does not cover `rule_engine_t`, whose
+`msg_values` the generated guards also read (section "`rule_engine_t` is
+part of the plugin ABI" above). Before this change the tree stamped 1.2.20
+with the v1.2.20 layout (4e1647eaf219).

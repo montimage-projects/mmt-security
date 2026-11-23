@@ -85,6 +85,39 @@ typedef void (*mmt_rule_satisfied_callback)(
 );
 
 /**
+ * One component of the key identifying the fsm instances a message may fire.
+ *
+ * The rule compiler emits one component for each necessary equality
+ * `att == att.event_id` found under the top-level ANDs of an event's
+ * guard: for the guard to return non-NO, the attribute of the message
+ * being verified must equal the attribute stored in the message that
+ * validated event #his_event_id of the instance. The engine hashes all
+ * the components of an event into one uint64 per instance (at instance
+ * registration) and per message (at dispatch), so a message is verified
+ * only against the instances whose key it shares.
+ */
+typedef struct fsm_instance_key_component_struct{
+	/** index into rule_info_t.proto_atts of the attribute read on the message being verified */
+	uint16_t msg_att_index;
+	/** id of the event whose validating message holds the attribute the instance is keyed on */
+	uint16_t his_event_id;
+	/** index into rule_info_t.proto_atts of the attribute read on that history message */
+	uint16_t his_att_index;
+	/** MMT_SEC_MSG_DATA_TYPE_*: selects the equality semantics the generated guard applies */
+	int32_t  data_type;
+}fsm_instance_key_component_t;
+
+/**
+ * The key of the fsm instances awaiting one event of a rule:
+ * #components_count components, or 0 when the event's guard has no
+ * usable current-vs-history equality - such instances stay unindexed.
+ */
+typedef struct fsm_instance_key_struct{
+	uint8_t components_count;
+	const fsm_instance_key_component_t *components;
+}fsm_instance_key_t;
+
+/**
  * Information of a rule in generated lib
  */
 typedef struct rule_info_struct{
@@ -145,6 +178,15 @@ typedef struct rule_info_struct{
 	 * Information at the moment the rule was created
 	 */
 	const rule_version_info_t *version;
+
+	/**
+	 * Per-event instance keys, #events_count + 1 entries indexed by
+	 * event id (entry 0, the timeout event, is unused): a message is
+	 * verified against an fsm instance awaiting event e only when their
+	 * instance_keys[e] components evaluate equal. Entries with
+	 * components_count == 0 mark events that stay unindexed.
+	 */
+	const fsm_instance_key_t *instance_keys;
 }rule_info_t;
 
 /**
