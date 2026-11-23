@@ -728,6 +728,21 @@ typedef struct{
 }_instance_key_pair_t;
 
 /**
+ * Does #expr hold an embedded function call (a FUNCTION node), at any depth?
+ */
+static bool _expr_has_function( const expression_t *expr ){
+	const link_node_t *node;
+	if( expr == NULL || expr->type != OPERATION )
+		return false;
+	if( expr->operation->operator == FUNCTION )
+		return true;
+	for( node = expr->operation->params_list; node != NULL; node = node->next )
+		if( _expr_has_function( (expression_t *) node->data ))
+			return true;
+	return false;
+}
+
+/**
  * Collect the pairs of #instance_keys of an event: every equality
  * `att == att.event_id` the event's guard must satisfy to return non-NO.
  * These are exactly the EQ nodes having one current-message variable and
@@ -736,8 +751,22 @@ typedef struct{
  * necessary, so OR operands are not descended into).
  * A pair is dropped when the two sides have different data types: such a
  * comparison does not have a stable equality semantics to key on.
+ *
+ * Purity invariant. The engine does not call the guard of an instance
+ * whose key differs from the message's: it relies on that call being
+ * unobservable, i.e. on the guard having no side effect before the
+ * equality that fails. The generated guard is the expression in C, its
+ * conjuncts evaluated left to right with `&&` short-circuit, so this holds
+ * when no conjunct evaluated before a collected equality calls an
+ * embedded function (`#name(...)`, which may have side effects, e.g.
+ * `#em` functions updating a state). Conjuncts are walked here in that
+ * same order: #fn_seen is set once a conjunct holding a FUNCTION node has
+ * been met, and #fn_before_key when a collected equality comes after one.
+ * The caller then leaves the event unindexed. Every other node of a guard
+ * (comparisons, arithmetic, variables, constants) is pure.
  */
-static void _collect_instance_key_pairs( const expression_t *expr, _instance_key_pair_t *pairs, size_t *pairs_count ){
+static void _collect_instance_key_pairs( const expression_t *expr, _instance_key_pair_t *pairs, size_t *pairs_count,
+		bool *fn_seen, bool *fn_before_key ){
 	const operation_t *op;
 	const expression_t *p1, *p2;
 	const variable_t *cur, *his;
@@ -750,19 +779,21 @@ static void _collect_instance_key_pairs( const expression_t *expr, _instance_key
 	op = expr->operation;
 	if( op->operator == AND ){
 		for( node = op->params_list; node != NULL; node = node->next )
-			_collect_instance_key_pairs( (expression_t *) node->data, pairs, pairs_count );
+			_collect_instance_key_pairs( (expression_t *) node->data, pairs, pairs_count, fn_seen, fn_before_key );
 		return;
 	}
 
+	//a conjunct that is not a collected equality: it is evaluated before
+	//the conjuncts that follow it
 	if( op->operator != EQ || op->params_size != 2 )
-		return;
+		goto not_a_key;
 
 	p1 = (expression_t *) op->params_list->data;
 	p2 = (expression_t *) op->params_list->next->data;
 	if( p1->type != VARIABLE || p2->type != VARIABLE )
-		return;
+		goto not_a_key;
 	if( (p1->variable->ref_index == (uint16_t) UNKNOWN) == (p2->variable->ref_index == (uint16_t) UNKNOWN ))
-		return;
+		return; //two variables: no function call
 
 	cur = p1->variable->ref_index == (uint16_t) UNKNOWN ? p1->variable : p2->variable;
 	his = cur == p1->variable ? p2->variable : p1->variable;
@@ -770,10 +801,19 @@ static void _collect_instance_key_pairs( const expression_t *expr, _instance_key
 		return;
 
 	//the same pair may repeat ( e.g., a == a.1 && a == a.1 ): keep one
+	//(its first occurrence fails first on a key miss)
 	for( i=0; i<*pairs_count; i++ )
 		if( pairs[i].msg_var == cur && pairs[i].his_var == his )
 			return;
+
+	if( *fn_seen )
+		*fn_before_key = true;
 	pairs[ (*pairs_count) ++ ] = (_instance_key_pair_t){ cur, his };
+	return;
+
+not_a_key:
+	if( _expr_has_function( expr ))
+		*fn_seen = true;
 }
 
 /**
@@ -791,10 +831,20 @@ static void _iterate_event_to_gen_instance_keys( void *key, void *data, void *us
 	_instance_key_pair_t *pairs;
 	size_t pairs_count = 0, i, j;
 	int msg_idx, his_idx;
+	bool fn_seen = false, fn_before_key = false;
 
 	//a rule has at most 64 events: no expression can hold more pairs
 	pairs = mmt_mem_alloc( 64 * sizeof( _instance_key_pair_t ));
-	_collect_instance_key_pairs( ev->expression, pairs, &pairs_count );
+	_collect_instance_key_pairs( ev->expression, pairs, &pairs_count, &fn_seen, &fn_before_key );
+
+	if( pairs_count > 0 && fn_before_key ){
+		//see the purity invariant of _collect_instance_key_pairs
+		mmt_info( "Rule %"PRIu32", event %d: not indexed by instance key, as its expression calls an embedded function before an equality `att == att.N` of the key",
+				rule_id, event_id );
+		fprintf( _u_data->file, "\n //event_%d: not indexed by instance key (an embedded function is called before an equality of its key)\n",
+				event_id );
+		pairs_count = 0;
+	}
 
 	if( pairs_count == 0 ){
 		mmt_mem_free( pairs );

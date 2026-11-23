@@ -566,6 +566,12 @@ check: check-help
 check-help: _prepare sec_server rule_info
 	@./check/check-help.sh ./$(MAIN_STAND_ALONE) ./$(MAIN_SEC_SERVER) ./$(MAIN_PLUGIN_INFO) ./$(MAIN_GEN_PLUGIN)
 
+# compile_rule keys no event whose expression calls an embedded function
+# before an equality of the key (fork #51, PR #55)
+check: check-instance-keys
+check-instance-keys: compile_rule
+	@./check/check-instance-keys.sh ./$(MAIN_GEN_PLUGIN)
+
 # the loader refuses rule .so files of another plugin ABI, older or newer,
 # with a warning instead of loading them (fork #51, PR #55)
 check: check-plugin-abi
