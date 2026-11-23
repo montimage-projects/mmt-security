@@ -178,11 +178,15 @@ size_t index_of( uint32_t val, const uint32_t *array, size_t array_size){
  * 	+ size of the output array
  */
 static inline size_t expand_number_range( const char *mask, uint32_t **result ){
-	const char *cur, *prv;
-	size_t size = 0, i, j;
+	const char *cur;
+	size_t size = 0, i;
 	uint32_t num;
 	//TODO this can handle maximally only 100K rules in rules-mask (lcores in core-mask)
 	uint32_t array[ 100000 ] = { 0 }; //init all elements to 0. This is not necessary but used to  pass PVS studio check
+	//membership bitmap for the deduplication below: one bit per possible
+	//value, so inserting n values is O(n) instead of an O(n) index_of scan
+	//per value (O(n^2) in total, ~10 s for a mask ending in -99999).
+	uint8_t seen[ 100000 / 8 + 1 ] = { 0 };
 
 	*result = NULL;
 	if( mask == NULL ) return 0;
@@ -196,8 +200,14 @@ static inline size_t expand_number_range( const char *mask, uint32_t **result ){
 		}
 
 		num = atoi( cur );
-		if( index_of( num, array, size ) == size )
+		if( num >= sizeof( array ) / sizeof( array[0] )){
+			mmt_error( "Mask: Value %d is too big (max %zu)", num, sizeof( array ) / sizeof( array[0] ) - 1 );
+			return 0;
+		}
+		if( !( seen[ num >> 3 ] & ( 1 << ( num & 7 )) )){
+			seen[ num >> 3 ] |= 1 << ( num & 7 );
 			array[ size++ ] = num;
+		}
 
 		while( isdigit( *cur ) ) cur ++;
 
@@ -217,6 +227,11 @@ static inline size_t expand_number_range( const char *mask, uint32_t **result ){
 			num = atoi( cur );
 			while( isdigit( *cur ) ) cur ++; //jump over the end of range
 
+			if( num >= sizeof( array ) / sizeof( array[0] )){
+				mmt_error( "Mask: Value %d is too big (max %zu)", num, sizeof( array ) / sizeof( array[0] ) - 1 );
+				return 0;
+			}
+
 			i=array[ size-1 ] + 1; //second number in the range
 
 			if( i > num ){
@@ -225,8 +240,10 @@ static inline size_t expand_number_range( const char *mask, uint32_t **result ){
 			}
 
 			for(  ; i<=num; i++ )
-				if( index_of( i, array, size ) == size )
+				if( !( seen[ i >> 3 ] & ( 1 << ( i & 7 )) )){
+					seen[ i >> 3 ] |= 1 << ( i & 7 );
 					array[ size ++ ] = i;
+				}
 
 			//after the second number must be ',' or '\n'
 			if( *cur == '\0' )

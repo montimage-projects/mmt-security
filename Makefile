@@ -57,8 +57,17 @@ ifdef VALGRIND
   CFLAGS += -DVALGRIND_MODE
 endif
 
-# ThreadSanitizer build of the engine and the rules (fork #45): `make TSAN=1`.
-# check/check-tsan.sh sweeps every check/pcap with -c under such a build.
+# AddressSanitizer build of the engine, the library and the rules:
+# `make ASAN=1`. The only exception is compile_rule, the build-time rule
+# generator: it is kept uninstrumented (see its target below), otherwise
+# LeakSanitizer would fail it at exit and no rule could be compiled.
+ifdef ASAN
+  CFLAGS        += -fsanitize=address -g
+  CLDFLAGS      += -fsanitize=address
+  RULE_GCC_ARGS := -fsanitize=address
+  LIBS          += -l:libmmt_core.so
+endif
+
 ifdef TSAN
   CFLAGS        += -fsanitize=thread
   CLDFLAGS      += -fsanitize=thread
@@ -144,9 +153,30 @@ perf.%: $(LIB_OBJS) test/perf/%.o
 	@echo "[COMPILE] $@"
 	$(QUIET) $(CC) -Wl,--export-dynamic -o $@ $(CLDFLAGS)  $^ $(LIBS)
 
-compile_rule: $(LIB_OBJS) $(SRCDIR)/main_gen_plugin.o
+# Objects that compile_rule is linked from. compile_rule is a host-side code
+# generator that runs inside the build; it exits while a few small
+# allocations are still live, so an ASan build of it is failed by
+# LeakSanitizer at the first rules/%.so recipe, and `make ASAN=1` could not
+# build the rules from a clean tree. Under ASAN it is therefore compiled and
+# linked without the sanitizer flags, from a separate set of objects
+# (*.gen.o) - the engine, the library and the rule plugins keep them.
+# In a default build it links the normal objects, as before.
+ifdef ASAN
+  GEN_CFLAGS   := $(filter-out -fsanitize=address -fsanitize=thread,$(CFLAGS))
+  GEN_CLDFLAGS := $(filter-out -fsanitize=address -fsanitize=thread,$(CLDFLAGS))
+  GEN_OBJS     := $(patsubst %.o,%.gen.o,$(LIB_OBJS) $(SRCDIR)/main_gen_plugin.o)
+else
+  GEN_CLDFLAGS := $(CLDFLAGS)
+  GEN_OBJS     := $(LIB_OBJS) $(SRCDIR)/main_gen_plugin.o
+endif
+
+%.gen.o: %.c
+	@echo "[COMPILE] $(notdir $@)"
+	$(QUIET) $(CC) $(GEN_CFLAGS) $(GEN_CLDFLAGS) -c -o $@ $<
+
+compile_rule: $(GEN_OBJS)
 	@echo "[COMPILE] $(MAIN_GEN_PLUGIN)"
-	$(QUIET) $(CC) -o $(MAIN_GEN_PLUGIN) $(CLDFLAGS) $^ $(LIBS) 
+	$(QUIET) $(CC) -o $(MAIN_GEN_PLUGIN) $(GEN_CLDFLAGS) $^ $(LIBS) 
 	
 sec_server: $(LIB_OBJS)  $(SRCDIR)/main_sec_server.o
 	@echo "[COMPILE] $@"
@@ -392,6 +422,7 @@ clean-rules:
 	$(QUIET) $(RM) rules/*.so rules/*.o rules/*.c
 clean: clean-rules
 	$(QUIET) $(RM) $(LIB_NAME).* $(MAIN_OBJS) $(LIB_OBJS) $(OUTPUT) test.* \
+			$(SRCDIR)/lib/*.gen.o $(SRCDIR)/*.gen.o \
 			$(MAIN_DPI) $(MAIN_GEN_PLUGIN) $(MAIN_PLUGIN_INFO) $(MAIN_STAND_ALONE) $(MAIN_SEC_SERVER)\
 			$(RULE_OBJS) $(TMP_DIR)
 	

@@ -16,14 +16,22 @@ typedef struct _fsm_tran_index_struct{
 	uint64_t counter;     //index of the last verified message
 	size_t index;         //index of the transition of the current state of #fsm to be verified
 	fsm_t *fsm;           //fsm to be verified
+	uint16_t event_id;    //id of the fsm_by_expecting_event_id list holding this node
+	uint8_t dead;         //1 once unregistered: unlinked and freed by _drain_dead_nodes
+	link_node_t *next_in_fsm;  //next node registered by the same fsm (see fsm_t.reg_nodes)
+	link_node_t *next_dead;    //next dead node in rule_engine_t.dead_nodes
 } __aligned _fsm_tran_index_t ;
 
-static inline _fsm_tran_index_t* _create_fsm_tran_index_t( rule_engine_t *_engine, size_t index, fsm_t *fsm, uint64_t counter){
+static inline _fsm_tran_index_t* _create_fsm_tran_index_t( rule_engine_t *_engine, size_t index, fsm_t *fsm, uint64_t counter, uint16_t event_id ){
 
 	_fsm_tran_index_t *ret = mmt_mem_alloc( sizeof( _fsm_tran_index_t));
-	ret->index   = index;
-	ret->fsm     = fsm;
-	ret->counter = counter;
+	ret->index       = index;
+	ret->fsm         = fsm;
+	ret->counter     = counter;
+	ret->event_id    = event_id;
+	ret->dead        = 0;
+	ret->next_in_fsm = NULL;
+	ret->next_dead   = NULL;
 	return ret;
 }
 
@@ -34,6 +42,7 @@ static inline
 void _set_expecting_events_id( rule_engine_t *_engine, fsm_t *fsm, bool is_add_timeout, uint64_t counter ){
 	size_t i;
 	uint16_t event_id;
+	link_node_t *node;
 	const fsm_transition_t *tran;
 	const fsm_state_t *state = fsm_get_current_state( fsm );
 	_fsm_tran_index_t *fsm_ind;
@@ -65,10 +74,15 @@ void _set_expecting_events_id( rule_engine_t *_engine, fsm_t *fsm, bool is_add_t
 
 		//if event having #event_id occurs,
 		// then #fsm will fire the i-th transition from its current state
-		fsm_ind = _create_fsm_tran_index_t( _engine, i, fsm, counter );
+		fsm_ind = _create_fsm_tran_index_t( _engine, i, fsm, counter, event_id );
 
-		_engine->fsm_by_expecting_event_id[ event_id ] =
-				insert_node_to_link_list( _engine->fsm_by_expecting_event_id[ event_id], fsm_ind );
+		node = insert_node_to_link_list( _engine->fsm_by_expecting_event_id[ event_id], fsm_ind );
+		_engine->fsm_by_expecting_event_id[ event_id ] = node;
+
+		//chain the node on its fsm, so _remove_fsm_from_expecting_events
+		//finds every node of #fsm without scanning all the event lists
+		fsm_ind->next_in_fsm = (link_node_t *) fsm->reg_nodes;
+		fsm->reg_nodes       = node;
 	}
 }
 
@@ -150,41 +164,81 @@ const mmt_array_t* rule_engine_get_valide_trace( const rule_engine_t *engine ){
 
 
 /**
+ * Remove all nodes referencing #fsm from the lists #fsm_by_expecting_event_id.
+ * A node registered for a state becomes obsolete once the fsm moves to another
+ * state: keeping it would fire its transition index against the wrong state.
+ *
+ * The nodes are chained on #fsm (fsm_t.reg_nodes, populated by
+ * _set_expecting_events_id), so only this fsm's own nodes are visited. They
+ * are marked dead, not unlinked: the event loops processing the current
+ * message may still hold a pointer to one of them. _drain_dead_nodes()
+ * unlinks and frees them once the message is done.
+ */
+static inline
+void _remove_fsm_from_expecting_events( rule_engine_t *_engine, fsm_t *fsm ){
+	link_node_t *node = (link_node_t *) fsm->reg_nodes, *next;
+	_fsm_tran_index_t *fsm_ind;
+
+	while( node != NULL ){
+		fsm_ind = (_fsm_tran_index_t *) node->data;
+		next    = fsm_ind->next_in_fsm;
+
+		if( !fsm_ind->dead ){
+			fsm_ind->dead      = 1;
+			fsm_ind->next_dead = _engine->dead_nodes;
+			_engine->dead_nodes = node;
+		}
+		node = next;
+	}
+
+	fsm->reg_nodes = NULL;
+}
+
+/**
+ * Unlink and free every expecting-event node marked dead while the current
+ * message was being verified. Runs once per message; each node unlinks in
+ * O(1) as it records its event_id and the lists are doubly-linked.
+ */
+static inline
+void _drain_dead_nodes( rule_engine_t *_engine ){
+	link_node_t *node = _engine->dead_nodes, *next;
+	_fsm_tran_index_t *fsm_ind;
+
+	while( node != NULL ){
+		fsm_ind = (_fsm_tran_index_t *) node->data;
+		next    = fsm_ind->next_dead;
+
+		//unlink the node from its expecting-event list
+		if( node->prev != NULL )
+			node->prev->next = node->next;
+		else
+			_engine->fsm_by_expecting_event_id[ fsm_ind->event_id ] = node->next;
+		if( node->next != NULL )
+			node->next->prev = node->prev;
+
+		mmt_mem_force_free( fsm_ind );//node->data
+		mmt_mem_force_free( node );
+
+		node = next;
+	}
+	_engine->dead_nodes = NULL;
+}
+
+/**
  * Remove all instances (fsm) having same id with #fsm
  */
 static inline
 void _reset_engine_for_fsm( rule_engine_t *_engine, fsm_t *fsm ){
-	size_t i;
-	link_node_t *node, *ptr;
-	_fsm_tran_index_t *fsm_ind;
+	link_node_t *node;
 	uint16_t fsm_id = fsm_get_id( fsm );
-	//remove all fsm having #fsm_id from the list #fsm_by_expecting_event_id
-	for( i=0; i<_engine->events_count; i++ ){
-		node = _engine->fsm_by_expecting_event_id[ i ];
-		while( node != NULL ){
-			ptr = node->next;
-//			prefetch2( ptr );
-			fsm_ind = (_fsm_tran_index_t *) node->data;
 
-			//found a node containing fsm having id = #fsm_id
-			if( fsm_get_id( fsm_ind->fsm ) == fsm_id ){
+	//mark dead the nodes of every fsm having #fsm_id: each fsm carries the
+	//chain of its own nodes (fsm_t.reg_nodes), so there is no need to scan
+	//all the event lists. The nodes are unlinked by _drain_dead_nodes once
+	//the current message is done.
+	for( node = _engine->fsm_by_instance_id[ fsm_id ]; node != NULL; node = node->next )
+		_remove_fsm_from_expecting_events( _engine, (fsm_t *) node->data );
 
-				//head?
-				if( node == _engine->fsm_by_expecting_event_id[ i ] ){
-					if( ptr != NULL ) ptr->prev = NULL;
-					_engine->fsm_by_expecting_event_id[ i ] = ptr;
-				}else{
-					node->prev->next = ptr;
-					if( ptr != NULL )
-						ptr->prev = node->prev;
-				}
-				mmt_mem_force_free( fsm_ind );//node->data
-
-				mmt_mem_force_free( node );
-			}
-			node = ptr;
-		}
-	}
 	//remove all fsm having id == #fsm_id and free them
 	//TODO: refine
 //	_engine->total_instances_count -= count_nodes_from_link_list( _engine->fsm_by_instance_id[ fsm_id ] );
@@ -196,45 +250,6 @@ void _reset_engine_for_fsm( rule_engine_t *_engine, fsm_t *fsm ){
 
 	//fsm_id become avaiable for other
 	_engine->avail_fsm_id = fsm_id;
-}
-/**
- * Remove all nodes referencing #fsm from the lists #fsm_by_expecting_event_id.
- * A node registered for a state becomes obsolete once the fsm moves to another
- * state: keeping it would fire its transition index against the wrong state.
- */
-static inline
-void _remove_fsm_from_expecting_events( rule_engine_t *_engine, fsm_t *fsm ){
-	size_t i;
-	link_node_t *node, *ptr;
-	_fsm_tran_index_t *fsm_ind;
-
-	//for each entry (that is a list) of expecting event i
-	for( i=0; i<_engine->events_count; i++ ){
-		node = _engine->fsm_by_expecting_event_id[ i ];
-		while( node != NULL ){
-			ptr     = node->next;
-//			prefetch2( ptr );
-			fsm_ind = (_fsm_tran_index_t *) node->data;
-
-			//found a node containing #fsm
-			if( fsm_ind->fsm == fsm ){
-
-				//head?
-				if( node == _engine->fsm_by_expecting_event_id[ i ] ){
-					if( ptr != NULL ) ptr->prev = NULL;
-					_engine->fsm_by_expecting_event_id[ i ] = ptr;
-				}else{
-					node->prev->next = ptr;
-					if( ptr != NULL )
-						ptr->prev = node->prev;
-				}
-				mmt_mem_force_free( fsm_ind );//node->data
-
-				mmt_mem_force_free( node );
-			}
-			node = ptr;
-		}
-	}
 }
 
 /**
@@ -293,6 +308,10 @@ enum verdict_type _process_a_node( link_node_t *node, uint16_t event_id, message
 
 	//if the execution of the transition having index = fsm_ind->index creates a new fsm
 	if( new_fsm != NULL ){
+		//a clone inherits its parent's reg_nodes: clear it before the new
+		//fsm registers nodes of its own, or they would chain onto the parent
+		new_fsm->reg_nodes = NULL;
+
 		//the new fsm being created is an instance of #fsm_bootstrap
 		//=> put the new one to a new class
 		if( fsm == _engine->fsm_bootstrap ){
@@ -434,13 +453,13 @@ enum verdict_type _process_multi_packets( rule_engine_t *engine, message_t *mess
 	uint8_t event_id;
 	link_node_t *node;
 	_fsm_tran_index_t *fsm_ind;
-	enum verdict_type ret;
+	enum verdict_type ret = VERDICT_UNKNOWN;
 
 	//mmt_debug( "Verify message counter: %"PRIu64", ts: %"PRIu64, message->counter, message->timestamp );
 	//mmt_debug( "===Verify Rule %d=== %zu", _engine->rule_info->id, _engine->max_events_count );
 
 	//get from hash table the list of events to be verified
-	for( event_id=0; event_id<engine->events_count; event_id++ ){
+	for( event_id=0; event_id<engine->events_count && ret == VERDICT_UNKNOWN; event_id++ ){
 
 		//message does not contain enough data required by this event
 		if( !mmt_bit_is_contain( &message->hash, &engine->events_hash[ event_id ] ))
@@ -448,41 +467,42 @@ enum verdict_type _process_multi_packets( rule_engine_t *engine, message_t *mess
 
 //		mmt_debug( "Event_id : %d", event_id );
 
-		//for each instance waiting for #event_id.
-		//#_process_a_node may free any node(s) in this list (fsm reset on a
-		//final/inconclusive state, or the removal of the other nodes of an
-		//fsm that changed state), so a "next" pointer cannot be kept across
-		//the call. Rescan from the head each round instead: nodes already
-		//processed carry message->counter and are skipped, while nodes
-		//inserted during processing are created with message->counter so
-		//they do not fire on this message - the same set of firings as
-		//before, but without ever dereferencing a freed node.
-		for(;;){
-			node = engine->fsm_by_expecting_event_id[ event_id ];
-			while( node != NULL
-					&& (fsm_ind = (_fsm_tran_index_t *)node->data)->counter == message->counter )
-				node = node->next;
+		//for each instance waiting for #event_id, one pass in list order.
+		//#_process_a_node never frees a node: nodes unregistered while the
+		//message is processed are marked dead and removed afterwards by
+		//_drain_dead_nodes, so node->next is still valid after the call.
+		//Nodes inserted during processing go to the head of their list -
+		//before the current position - and are created with
+		//message->counter, so they are skipped this round: the same set of
+		//firings as the rescan-from-head loop this replaces, without its
+		//quadratic cost when a list holds many instances.
+		for( node = engine->fsm_by_expecting_event_id[ event_id ]; node != NULL; node = node->next ){
+			fsm_ind = (_fsm_tran_index_t *)node->data;
 
-			if( node == NULL )
-				break;
+			//dead nodes were unregistered by #_process_a_node while this
+			//message was being processed; nodes already processed carry
+			//message->counter
+			if( fsm_ind->dead || fsm_ind->counter == message->counter )
+				continue;
 
 			//the message will be processed by this fsm_ind
 			fsm_ind->counter = message->counter;
 
-			ret = _process_a_node( node, event_id, message, engine );
-
 			//get only one verdict per packet
-			if( ret != VERDICT_UNKNOWN ){
-				return ret;
-			}
+			ret = _process_a_node( node, event_id, message, engine );
+			if( ret != VERDICT_UNKNOWN )
+				break;
 		}
 	}
 
 	//verify timeout event for each 10 messages or an interval of 100000 usec (0.1s)
 
-	if( message->counter < engine->last_msg_counter_timeout + 10
-			&& message->timestamp < engine->last_msg_timestamp_timeout + 100000 )
-		return VERDICT_UNKNOWN;
+	if( ret != VERDICT_UNKNOWN
+			|| ( message->counter < engine->last_msg_counter_timeout + 10
+					&& message->timestamp < engine->last_msg_timestamp_timeout + 100000 )){
+		_drain_dead_nodes( engine );
+		return ret;
+	}
 
 	engine->last_msg_counter_timeout   = message->counter;
 	engine->last_msg_timestamp_timeout = message->timestamp;
@@ -492,17 +512,14 @@ enum verdict_type _process_multi_packets( rule_engine_t *engine, message_t *mess
 	//verify instances that are waiting for timeout
 	//mmt_debug( "Zero-nodes count: %zu", count_nodes_from_link_list(node));
 
-	//same rescan discipline as the loop above: _process_a_node may free
-	//any node in the list, so the next node to try is always re-searched
-	//from the head using message->counter as the "already verified" mark.
-	for(;;){
-		node = engine->fsm_by_expecting_event_id[ FSM_EVENT_TYPE_TIMEOUT ];
-		while( node != NULL
-				&& (fsm_ind = (_fsm_tran_index_t *)node->data)->counter == message->counter )
-			node = node->next;
+	//same single-pass discipline as the event loop above: dead nodes are
+	//skipped and unlinked by the drain below, and nodes inserted during
+	//processing carry message->counter so they do not fire on this message.
+	for( node = engine->fsm_by_expecting_event_id[ FSM_EVENT_TYPE_TIMEOUT ]; node != NULL; node = node->next ){
+		fsm_ind = (_fsm_tran_index_t *)node->data;
 
-		if( node == NULL )
-			break;
+		if( fsm_ind->dead || fsm_ind->counter == message->counter )
+			continue;
 
 		//the message will be processed by the machine fsm_ind->fsm
 		fsm_ind->counter = message->counter;
@@ -510,12 +527,12 @@ enum verdict_type _process_multi_packets( rule_engine_t *engine, message_t *mess
 		ret = _process_a_node( node, FSM_EVENT_TYPE_TIMEOUT, message, engine );
 
 		//get only one verdict per packet
-		if( ret != VERDICT_UNKNOWN ){
-			return ret;
-		}
+		if( ret != VERDICT_UNKNOWN )
+			break;
 	}
 
-	return VERDICT_UNKNOWN;
+	_drain_dead_nodes( engine );
+	return ret;
 }
 
 //this is defined in mmt_security.c
@@ -608,6 +625,7 @@ rule_engine_t* rule_engine_init( const rule_info_t *rule_info, size_t max_instan
 
 	_engine->last_msg_counter_timeout = 0;
 	_engine->last_msg_timestamp_timeout    = 0;
+	_engine->dead_nodes                   = NULL;
 
 	if( fsm_is_verifying_single_packet( _engine->fsm_bootstrap) ){
 		_engine->processing_packets = _process_single_packet;
@@ -626,6 +644,10 @@ void rule_engine_free( rule_engine_t *_engine ){
 	size_t i;
 
 	__check_null( _engine, );
+
+	//normally empty: dead nodes are drained at the end of every message;
+	//unlink and free any left if the engine is dropped mid-processing
+	_drain_dead_nodes( _engine );
 
 	for( i=0; i<_engine->events_count; i++ )
 		free_link_list(_engine->fsm_by_expecting_event_id[ i ], YES );

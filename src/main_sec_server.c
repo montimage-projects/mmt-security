@@ -75,6 +75,9 @@ void usage(const char * prg_name) {
 	fprintf(stderr, "\t-c <string> : Gives the range of logical cores to run on, e.g., \"1,3-8,16\"\n");
 	fprintf(stderr, "\t-x <string> : Gives the range of rules id to be excluded from verification, e.g., \"1,3-8,16\"\n");
 	fprintf(stderr, "\t-m <string> : Attributes special rules to special threads e.g., \"(1:10-13)(2:50)(4:1007-1010)\"\n");
+	fprintf(stderr, "\t            : A value of 100000 or more in a -c, -x or -m mask is rejected with an error:\n");
+	fprintf(stderr, "\t              the mask parser uses a table of 100000 entries; before, a range reaching\n");
+	fprintf(stderr, "\t              that bound could write past it.\n");
 	fprintf(stderr, "\t-f <string> : Output results to file, e.g., \"/home/tata/:5\" => output to folder /home/tata and each file contains reports during 5 seconds \n");
 	fprintf(stderr, "\t-r <string> : Output results to redis, e.g., \"localhost:6379\"\n");
 	fprintf(stderr, "\t-v          : Verbose.\n");
