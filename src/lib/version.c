@@ -12,8 +12,15 @@
   #error("Not found VERSION_NUMBER")
 #endif
 
-//update this number when structure of plugin has been changed
-#define REQUIRE_PLUGIN "1.2.20"
+//update this number when structure of plugin has been changed: the rule
+//.so share rule_info_t (plugin_header.h) and, through the generated guards
+//that include rule_verif_engine.h, rule_engine_t with the engine.
+//It must be greater than every version stamp a compile_rule of the old
+//layout could have written: 1.2.20 was stamped both before and after the
+//instance_keys change, so the bump is to 1.2.21 (VERSION in the Makefile).
+//The loader also refuses rules stamped newer than this engine
+//(plugins_engine.c), so a rule must be rebuilt with its engine.
+#define REQUIRE_PLUGIN "1.2.21"
 
 
 #define __NOW__   __DATE__ " " __TIME__

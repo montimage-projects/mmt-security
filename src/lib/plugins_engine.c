@@ -75,6 +75,56 @@ static inline int _find_plugin_by_name( const char *lib_path ){
 }
 
 
+/**
+ * The plugin ABI gate: copy into #out the rules of #array (the #size
+ * rules of a plugin, as given by its mmt_sec_get_plugin_info) that this
+ * engine can use, and return their number. A rule is refused, with a
+ * warning, when its version stamp (the version of the compile_rule that
+ * built it) is:
+ * - older than REQUIRE_PLUGIN: built against an older layout of the
+ *   structures a rule shares with the engine;
+ * - newer than this engine: built against a layout this engine may not
+ *   have (e.g. new rule_info_t fields, or the rule_engine_t offsets that
+ *   the generated guards read, see doc/rule-abi-stability.md).
+ * Only the fields every layout has in common are read before the check
+ * (id, description, version: the prefix of rule_info_t).
+ * Every loader of rule .so files must go through this function.
+ */
+static size_t _filter_rules_by_version( const rule_info_t *array, size_t size, const rule_info_t **out ){
+	uint32_t required_plugin = mmt_sec_get_required_plugin_version_number();
+	uint32_t engine_version  = mmt_sec_get_version_index();
+	size_t i, count = 0;
+
+	for( i=0; i<size; i++ ){
+		if( array[i].version->index < required_plugin )
+			mmt_warn( "Ignored rule %d as it is not up to date (built by version %s, this engine needs %s or later).\nRule description: %s",
+					array[i].id,
+					array[i].version->number,
+					mmt_sec_get_required_plugin_version(),
+					array[i].description );
+		else if( array[i].version->index > engine_version )
+			mmt_warn( "Ignored rule %d as it was built for a newer engine (built by version %s, this engine is %s).\nRule description: %s",
+					array[i].id,
+					array[i].version->number,
+					mmt_sec_get_version_number(),
+					array[i].description );
+		else{
+			out[ count++ ] = &array[i];
+			continue;
+		}
+		//the array was built by another compile_rule: sizeof( rule_info_t )
+		//of that layout may differ from this one, so array[i+1] would not
+		//be the next rule. All rules of one plugin come from the same
+		//compile_rule: the first one decides for the whole plugin
+		if( i == 0 ){
+			if( size > 1 )
+				mmt_warn( "Ignored the %zu other rule(s) of the same plugin, built by the same compile_rule", size - 1 );
+			break;
+		}
+	}
+	return count;
+}
+
 static inline bool _load_plugin_by_functions(
 		plugin_t *plugin,
 		mmt_sec_get_plugin_info_fn_t mmt_sec_get_plugin_info,
@@ -91,18 +141,9 @@ static inline bool _load_plugin_by_functions(
 	if( size == 0 )
 		return false;
 
-	uint32_t required_plugin = mmt_sec_get_required_plugin_version_number();
 	original_rules_array = malloc( sizeof( rule_info_t *) * size );
-
-	//filter out the rules that are not satisfied the requirement version
-	for( i=0; i<size; i++ ){
-		if( tmp_array[i].version->index < required_plugin )
-			mmt_warn( "Ignored rule %d as it is not up to date.\nRule description: %s",
-					tmp_array[i].id,
-					tmp_array[i].description );
-		else
-			original_rules_array[ index++ ] = &tmp_array[i];
-	}
+	mmt_assert( original_rules_array != NULL, "Not enough memory");
+	index = _filter_rules_by_version( tmp_array, size, original_rules_array );
 
 	plugin->original_rules       = original_rules_array;
 	plugin->original_rules_count = index;

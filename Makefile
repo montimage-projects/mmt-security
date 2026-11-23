@@ -30,7 +30,7 @@ GIT_VERSION := $(shell git log --format="%h" -n 1 2>/dev/null)
 ifeq ($(GIT_VERSION),)
   GIT_VERSION := nogit
 endif
-VERSION     := 1.2.20
+VERSION     := 1.2.21
 # minimum MMT-DPI version required by the deb and rpm packages (readme.md):
 # the latest release, the one CI tests (DPI_VERSION in .github/workflows/c-cpp.yml)
 MIN_DPI_VERSION := 1.10.3
@@ -565,6 +565,12 @@ check-fsm-bounds: _prepare
 check: check-help
 check-help: _prepare sec_server rule_info
 	@./check/check-help.sh ./$(MAIN_STAND_ALONE) ./$(MAIN_SEC_SERVER) ./$(MAIN_PLUGIN_INFO) ./$(MAIN_GEN_PLUGIN)
+
+# the loader refuses rule .so files of another plugin ABI, older or newer,
+# with a warning instead of loading them (fork #51, PR #55)
+check: check-plugin-abi
+check-plugin-abi: _prepare
+	@./check/check-plugin-abi.sh ./$(MAIN_GEN_PLUGIN) ./$(MAIN_STAND_ALONE)
 
 # ThreadSanitizer on the SMP message hand-off (fork #45): a TSan build in a
 # scratch copy (the normal build is untouched), then `-c 1-8` on every
