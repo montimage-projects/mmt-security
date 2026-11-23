@@ -34,7 +34,9 @@ BASE=${MMT_SEC_ABI_BASE:-97441d79}
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 status=0
-fail(){ echo "  => FAILED: $*"; status=1; }
+# leg: failures of the current leg, which stops it; the next leg still runs
+fail(){ echo "  => FAILED: $*"; status=1; leg=1; }
+leg=0
 
 RULES="1.ssh 6.SYNFUL 26.proto_scan"
 # rules alerting on $PCAPS in the control leg (rule 1 does not: its .so
@@ -88,7 +90,8 @@ check_refused(){ # dir pattern what
 	run_engine "$d" "$d/run.log" || rc=$?
 	if [ $rc -ne 0 ]; then
 		tail -5 "$d/run.log" | sed 's/^/    | /'
-		fail "$what: mmt_sec_standalone exited $rc (signal $((rc > 128 ? rc - 128 : 0)))"
+		# the engine's fault handler exits with the signal number (11: SIGSEGV)
+		fail "$what: mmt_sec_standalone exited $rc"
 		return
 	fi
 	n=$(alerts "$d")
@@ -111,7 +114,7 @@ check_refused(){ # dir pattern what
 			fail "$what: rule_info lists the rules of rules/$x.so"
 		fi
 	done
-	[ $status -eq 0 ] && echo "  $what: refused, no alert, exit 0"
+	[ $leg -eq 0 ] && echo "  $what: refused, no alert, exit 0"
 }
 
 # control: this tree's rules load and alert on the same captures
@@ -126,6 +129,7 @@ done
 echo "  control (this tree's rules): $n alert(s)"
 
 # older: rules of the layout before instance_keys
+leg=0
 O=$TMP/older
 if git -C "$ROOT" cat-file -e "$BASE^{commit}" 2>/dev/null; then
 	mkdir -p "$O/tree"
@@ -139,18 +143,19 @@ else
 	what="older (stamped 1.2.20, this layout)"
 	build_compile_rule "$O/tree" VERSION=1.2.20 || fail "older: compile_rule VERSION=1.2.20 does not build"
 fi
-if [ $status -eq 0 ]; then
+if [ $leg -eq 0 ]; then
 	compile_rules "$O/tree" "$O/rules" || fail "$what: compile_rule failed"
-	[ $status -eq 0 ] && check_refused "$O" "it is not up to date" "$what"
+	[ $leg -eq 0 ] && check_refused "$O" "it is not up to date" "$what"
 fi
 
 # newer: rules stamped one patch version above this engine
+leg=0
 N=$TMP/newer
 copy_tree "$N/tree" || fail "newer: copy failed"
 what="newer (stamped $NEWER)"
 if build_compile_rule "$N/tree" VERSION="$NEWER"; then
 	compile_rules "$N/tree" "$N/rules" || fail "$what: compile_rule failed"
-	[ $status -eq 0 ] && check_refused "$N" "it was built for a newer engine" "$what"
+	[ $leg -eq 0 ] && check_refused "$N" "it was built for a newer engine" "$what"
 else
 	fail "$what: compile_rule does not build"
 fi
