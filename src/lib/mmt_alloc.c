@@ -11,23 +11,57 @@
 ////memory
 ///////////////////////////////////////////////////////////////////////////////
 
+/* Alignment the returned data must satisfy: types declared __aligned -
+ * message_t, aligned on a cache line (base.h) - are stored in mmt blocks.
+ * It is the cache-line size when that attribute is compiled in, 16
+ * (malloc's own alignment) otherwise. */
+#if defined( LEVEL1_DCACHE_LINESIZE ) && LEVEL1_DCACHE_LINESIZE > 16
+	#define MMT_MEM_ALIGNMENT LEVEL1_DCACHE_LINESIZE
+#else
+	#define MMT_MEM_ALIGNMENT 16
+#endif
+
+/* Offset of the mmt_memory_t header inside the allocation.  A block is laid
+ * out as
+ *
+ *   base                base + MMT_MEM_PAD       base + MMT_MEM_ALIGNMENT
+ *   |                   |                      |
+ *   +--- MMT_MEM_PAD ---+--- mmt_memory_t -----+--- data ---+-- '\0'
+ *
+ * so the data the caller sees lands exactly MMT_MEM_ALIGNMENT bytes after
+ * the allocation base: it is MMT_MEM_ALIGNMENT-aligned iff the base is,
+ * while the header still sits at data - SIZE_OF_MMT_MEMORY_T.  The
+ * mmt_mem_revert() contract is unchanged, and the matching frees recover
+ * the base by subtracting the same constant pad.  With
+ * MMT_MEM_ALIGNMENT == 16 the pad is 0 and this is the old layout exactly.
+ */
+#define MMT_MEM_PAD ( MMT_MEM_ALIGNMENT - SIZE_OF_MMT_MEMORY_T )
 
 
 static inline void *_mem_alloc(size_t size){
-	mmt_memory_t *mem = malloc( SIZE_OF_MMT_MEMORY_T + size + 1 );
+	void *base;
+	/* posix_memalign takes no rounding requirement on the size, so each
+	 * block costs exactly MMT_MEM_PAD bytes more than before */
+	int ret = posix_memalign( &base, MMT_MEM_ALIGNMENT,
+				MMT_MEM_PAD + SIZE_OF_MMT_MEMORY_T + size + 1 );
 
 	//quit if not enough
-	mmt_assert( mem != NULL, "Not enough memory to allocate %zu bytes", size);
-	//remember size of memory being allocated
-	//allocated_memory_size += size;
+	mmt_assert( ret == 0 && base != NULL, "Not enough memory to allocate %zu bytes", size);
 
+	mmt_memory_t *mem = (mmt_memory_t *)( (uint8_t *) base + MMT_MEM_PAD );
 	mmt_mem_reset( mem, size );
 
+#ifdef DEBUG_MODE
+	//by construction above; aborts if MMT_MEM_ALIGNMENT is not a power of 2
+	mmt_assert( ((uintptr_t) mem->data % MMT_MEM_ALIGNMENT) == 0,
+			"mmt_mem_alloc data %p is not %u-byte aligned",
+			mem->data, MMT_MEM_ALIGNMENT );
+#endif
 	return mem->data;
 }
 
 static inline void _mem_force_free( void *x ){
-   free( mmt_mem_revert( x ) );
+   free( (uint8_t *)mmt_mem_revert( x ) - MMT_MEM_PAD );
 }
 ///end memory
 ///////////////////////////////////////////////////////////////////////////////
@@ -215,7 +249,7 @@ static inline void _pools_free( void *elem ){
 
 	//total pools is full => free memory
 	if( unlikely( mem_pools.bytes_count >= mmt_sec_get_config( MMT_SEC__CONFIG__MEMPOOL__MAX_BYTES ) )){
-		free( mem );
+		free( (uint8_t *)mem - MMT_MEM_PAD );
 		return;
 	}
 
@@ -239,7 +273,7 @@ static inline void _pools_free( void *elem ){
 	//its ring is full => free the memory
 	if( unlikely( ! ret )){
 //		mmt_debug("Pool %p is full for block %"PRIu32, ring, mem->size );
-		free( mem );
+		free( (uint8_t *)mem - MMT_MEM_PAD );
 	}
 }
 
