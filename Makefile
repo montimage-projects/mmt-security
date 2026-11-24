@@ -320,7 +320,7 @@ $(LIB_NAME).a: $(LIB_OBJS) $(RULE_OBJS)
 
 $(LIB_NAME).so: $(LIB_OBJS) $(RULE_OBJS)
 	@echo "[LIBRARY] $(notdir $@)"
-	$(QUIET) $(CC)  -fPIC -shared -O3 -o $(LIB_NAME).so $(LIB_OBJS)  $(RULE_OBJS)
+	$(QUIET) $(CC)  -fPIC -shared -O3 -o $(LIB_NAME).so $(CLDFLAGS) $(LIB_OBJS)  $(RULE_OBJS)
 	
 lib:  $(LIB_OBJS)  $(RULE_OBJS) --refresh-plugin-engine $(LIB_NAME).a $(LIB_NAME).so
 	
