@@ -85,7 +85,9 @@ static inline int _find_plugin_by_name( const char *lib_path ){
  *   structures a rule shares with the engine;
  * - newer than this engine: built against a layout this engine may not
  *   have (e.g. new rule_info_t fields, or the rule_engine_t offsets that
- *   the generated guards read, see doc/rule-abi-stability.md).
+ *   the guards of a 1.2.21 rule read, see doc/rule-abi-stability.md);
+ * - missing (a NULL version pointer): not built by compile_rule, which
+ *   always sets it, so of no known layout.
  * Only the fields every layout has in common are read before the check
  * (id, description, version: the prefix of rule_info_t).
  * Every loader of rule .so files must go through this function.
@@ -96,7 +98,11 @@ static size_t _filter_rules_by_version( const rule_info_t *array, size_t size, c
 	size_t i, count = 0;
 
 	for( i=0; i<size; i++ ){
-		if( array[i].version->index < required_plugin )
+		if( array[i].version == NULL )
+			mmt_warn( "Ignored rule %d as it has no version stamp (not built by compile_rule).\nRule description: %s",
+					array[i].id,
+					array[i].description );
+		else if( array[i].version->index < required_plugin )
 			mmt_warn( "Ignored rule %d as it is not up to date (built by version %s, this engine needs %s or later).\nRule description: %s",
 					array[i].id,
 					array[i].version->number,
@@ -144,6 +150,11 @@ static inline bool _load_plugin_by_functions(
 	original_rules_array = malloc( sizeof( rule_info_t *) * size );
 	mmt_assert( original_rules_array != NULL, "Not enough memory");
 	index = _filter_rules_by_version( tmp_array, size, original_rules_array );
+	//every rule refused: nothing to keep (and no 0-size allocation below)
+	if( index == 0 ){
+		free( original_rules_array );
+		return false;
+	}
 
 	plugin->original_rules       = original_rules_array;
 	plugin->original_rules_count = index;
