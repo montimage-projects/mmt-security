@@ -56,9 +56,11 @@ int mmt_sec_sha256_file_hex( const char *path, char out[65] );
 /**
  * Canonical description of the layout of the structures a rule .so shares
  * with the engine (rule_info_t, proto_attribute_t, rule_version_info_t, the
- * message_t fields read by rule code, mmt_array_t) and of the required plugin
- * version (REQUIRE_PLUGIN). Two builds whose layouts differ get different
- * strings. The string is static: do not free it.
+ * message_t fields read by rule code, mmt_array_t, the instance-key and fsm
+ * structs the generated code initialises or reads, mmt_memory_t), of the
+ * accessor through which it reads rule_engine_t (opaque to the rules), and
+ * of the required plugin version (REQUIRE_PLUGIN). Two builds whose layouts
+ * differ get different strings. The string is static: do not free it.
  */
 const char *mmt_sec_get_rule_abi_layout( void );
 

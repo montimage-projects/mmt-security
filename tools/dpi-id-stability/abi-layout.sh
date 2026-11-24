@@ -1,6 +1,7 @@
 #!/bin/bash
 # abi-layout.sh - layout of the rule ABI structs (rule_info_t, proto_attribute_t,
-# rule_version_info_t, message_t) at each mmt-security tag (issue #5, A0).
+# rule_version_info_t, message_t, the fsm and instance-key structs, and what
+# the guards read of rule_engine_t) at each mmt-security tag (issue #5, A0).
 #
 # Usage: tools/dpi-id-stability/abi-layout.sh [-w WORKDIR] [-i IMAGE] [TAG...]
 #   default TAGs: every v1.2.* tag. Runs one ubuntu container, no sudo.
@@ -34,6 +35,9 @@ docker run --rm -e OUT_UID="$(id -u)" -e OUT_GID="$(id -g)" -v "$WORK/abi:/abi" 
 	for d in /abi/src/*/; do
 		t=$(basename "$d"); def=
 		grep -q rule_version_info_t "$d/src/lib/plugin_header.h" && def=-DHAS_VERSION_INFO
+		grep -q fsm_instance_key_t "$d/src/lib/plugin_header.h" && def="$def -DHAS_INSTANCE_KEYS"
+		if grep -q mmt_sec_rule_engine_get_msg_values "$d/src/lib/gen_code.c"; then def="$def -DHAS_MSG_VALUES_ACCESSOR"
+		elif grep -q "_engine->msg_values" "$d/src/lib/gen_code.c"; then def="$def -DHAS_MSG_VALUES_FIELD"; fi
 		gcc -w $def -I"$d/src/lib" -I"$d/src/dpi" -o /abi/probe-$t /abi/abi_layout.c
 		/abi/probe-$t > /abi/layout-$t.txt
 	done' 2>&1
