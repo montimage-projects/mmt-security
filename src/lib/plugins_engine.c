@@ -68,7 +68,8 @@ static inline int _find_plugin_by_name( const char *lib_path ){
 	int i;
 	for( i=0; i<plugins_count; i++ )
 		//found a path existing in #dl_libs_path
-		if( strcmp( lib_path, plugins[i].path ) == 0 )
+		//(a plugin loaded by functions, mmt_sec_load_plugin, has no path)
+		if( plugins[i].path != NULL && strcmp( lib_path, plugins[i].path ) == 0 )
 			return i;
 
 	return plugins_count;
@@ -148,6 +149,9 @@ static inline bool _load_plugin_by_functions(
 
 	size_t size, i, index = 0, p_index, r_index;
 
+	//the slot may be reused after an unload: no field of it is still valid
+	memset( plugin, 0, sizeof( plugin_t ));
+
 	size = mmt_sec_get_plugin_info( &tmp_array );
 	if( size == 0 )
 		return false;
@@ -189,6 +193,9 @@ static inline bool _load_plugin_by_functions(
 	if( plugin->rules_count == 0 ){
 		free( plugin->original_rules );
 		free( plugin->rules );
+		plugin->original_rules       = NULL;
+		plugin->original_rules_count = 0;
+		plugin->rules                = NULL;
 		return false;
 	}
 
@@ -400,12 +407,24 @@ static inline int _close_plugin( plugin_t *plugin ){
  *
  */
 static inline bool _unload_mmt_sec_rule( uint32_t rule_id ){
-	size_t rule_index, plugin_index;
+	size_t i, rule_index, plugin_index;
+	const rule_info_t *rule;
 	__check_bool( (plugins_count == 0), NO );
 
 	//does not found any rule having id = rule_id
 	if( _find_plugin_has_rule_id(rule_id, &plugin_index, &rule_index) == NO )
 		return NO;
+
+	//the rule leaves the global rules set: nothing may keep a pointer to a
+	//rule of a plugin that can be dlclose()d below
+	rule = plugins[ plugin_index ].rules[ rule_index ];
+	for( i=0; i<rules_count; i++ )
+		if( rules[i] == rule ){
+			rules_count --;
+			rules[i]           = rules[ rules_count ];
+			rules[rules_count] = NULL;
+			break;
+		}
 
 	//there is only one rule in this plugin => remove the plugin
 	if( plugins[ plugin_index ].rules_count <= 1 ){
@@ -415,6 +434,9 @@ static inline bool _unload_mmt_sec_rule( uint32_t rule_id ){
 		//then remove it from array by overriding it by the last element in the array
 		plugins_count --;
 		plugins[ plugin_index ] = plugins[ plugins_count ];
+		//clear the vacated slot: its plugin_t lives only at plugins[plugin_index]
+		//now; a later load reuses this slot from scratch
+		memset( &plugins[ plugins_count ], 0, sizeof( plugin_t ));
 
 		return YES;
 	}
@@ -422,6 +444,8 @@ static inline bool _unload_mmt_sec_rule( uint32_t rule_id ){
 	plugins[ plugin_index ].rules_count --;
 	//remove this rule by replacing it by the last rule then remove the last rule
 	plugins[ plugin_index ].rules[ rule_index ] = plugins[ plugin_index ].rules[ plugins[ plugin_index ].rules_count ];
+	//clear the vacated slot too: it must not keep a copy of the moved rule
+	plugins[ plugin_index ].rules[ plugins[ plugin_index ].rules_count ] = NULL;
 	return YES;
 }
 
@@ -447,4 +471,5 @@ void unload_mmt_sec_all_rules() {
 		mmt_warn("Cannot close properly mmt-security .so rules");
 
 	plugins_count = 0;
+	rules_count   = 0;
 }
