@@ -101,10 +101,12 @@ endif
 # The write happens here, while the makefile is read, only when the content
 # differs, and never under -n/-t/-q, where no command runs and a new stamp
 # would lie about the objects' flavor.
-# $(file ...) exists only since GNU make 4.0: on make 3.x it expands to
-# nothing, the stamp would never be written and the flavor bug would
-# persist silently. Fail loudly instead.
-$(if $(filter 3.%,$(MAKE_VERSION)),$(error .build-flavor stamp needs GNU make >= 4.0 ($(MAKE_VERSION) found)))
+# $(file ...) exists only since GNU make 4.0, and its $(file <...) read
+# operator only since 4.1: on make 3.x it expands to nothing, so the
+# stamp would never be written and the flavor bug would persist
+# silently, and on exactly 4.0 the read below dies with make's own
+# cryptic "Invalid file operation: <". Fail loudly instead.
+$(if $(filter 3.% 4.0,$(MAKE_VERSION)),$(error .build-flavor stamp needs GNU make >= 4.1 ($(MAKE_VERSION) found)))
 FLAVOR_STAMP := .build-flavor
 # GIT_VERSION is filtered out: it changes with every commit and a new HEAD
 # alone must not rebuild the tree (and never did). The signature is
