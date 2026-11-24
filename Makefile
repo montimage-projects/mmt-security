@@ -77,6 +77,15 @@ ifdef TSAN
   LIBS          += -l:libmmt_core.so
 endif
 
+# UndefinedBehaviorSanitizer build of the engine, the library and the rules:
+# `make UBSAN=1` (or combined with ASAN: `make ASAN=1 UBSAN=1`). Like ASAN and
+# TSAN, compile_rule stays uninstrumented (see its target below).
+ifdef UBSAN
+  CFLAGS        += -fsanitize=undefined -g
+  CLDFLAGS      += -fsanitize=undefined
+  RULE_GCC_ARGS := -fsanitize=undefined
+endif
+
 ifdef REDIS
   CFLAGS += -DMODULE_REDIS_OUTPUT
   LIBS   += -lhiredis
@@ -220,9 +229,9 @@ perf.%: $(LIB_OBJS) test/perf/%.o
 # sanitizer flags, from a separate set of objects (*.gen.o) - the engine,
 # the library and the rule plugins keep them.
 # In a default build it links the normal objects, as before.
-ifneq ($(strip $(ASAN) $(TSAN)),)
-  GEN_CFLAGS   := $(filter-out -fsanitize=address -fsanitize=thread,$(CFLAGS))
-  GEN_CLDFLAGS := $(filter-out -fsanitize=address -fsanitize=thread,$(CLDFLAGS))
+ifneq ($(strip $(ASAN) $(TSAN) $(UBSAN)),)
+  GEN_CFLAGS   := $(filter-out -fsanitize=address -fsanitize=thread -fsanitize=undefined,$(CFLAGS))
+  GEN_CLDFLAGS := $(filter-out -fsanitize=address -fsanitize=thread -fsanitize=undefined,$(CLDFLAGS))
   GEN_OBJS     := $(patsubst %.o,%.gen.o,$(LIB_OBJS) $(SRCDIR)/main_gen_plugin.o)
 else
   GEN_CLDFLAGS := $(CLDFLAGS)
@@ -639,6 +648,12 @@ check-instance-keys: compile_rule
 check: check-plugin-abi
 check-plugin-abi: _prepare rule_info
 	@./check/check-plugin-abi.sh ./$(MAIN_GEN_PLUGIN) ./$(MAIN_STAND_ALONE) ./$(MAIN_PLUGIN_INFO)
+
+# message_t alignment (issue #64): check/message_align.c run under
+# ASan+UBSan asserts every message_t block is _Alignof(message_t)-aligned
+check: check-message-align
+check-message-align: _prepare
+	@./check/check-message-align.sh
 
 # ThreadSanitizer on the SMP message hand-off (fork #45): a TSan build in a
 # scratch copy (the normal build is untouched), then `-c 1-8` on every
