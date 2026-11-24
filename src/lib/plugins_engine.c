@@ -92,6 +92,11 @@ static inline int _find_plugin_by_name( const char *lib_path ){
  * (id, description, version: the prefix of rule_info_t).
  * Every loader of rule .so files must go through this function.
  */
+//a hand-made rule may have no description either
+static inline const char *_rule_description( const rule_info_t *rule ){
+	return rule->description == NULL ? "" : rule->description;
+}
+
 static size_t _filter_rules_by_version( const rule_info_t *array, size_t size, const rule_info_t **out ){
 	uint32_t required_plugin = mmt_sec_get_required_plugin_version_number();
 	uint32_t engine_version  = mmt_sec_get_version_index();
@@ -101,19 +106,19 @@ static size_t _filter_rules_by_version( const rule_info_t *array, size_t size, c
 		if( array[i].version == NULL )
 			mmt_warn( "Ignored rule %d as it has no version stamp (not built by compile_rule).\nRule description: %s",
 					array[i].id,
-					array[i].description );
+					_rule_description( &array[i] ));
 		else if( array[i].version->index < required_plugin )
 			mmt_warn( "Ignored rule %d as it is not up to date (built by version %s, this engine needs %s or later).\nRule description: %s",
 					array[i].id,
 					array[i].version->number,
 					mmt_sec_get_required_plugin_version(),
-					array[i].description );
+					_rule_description( &array[i] ));
 		else if( array[i].version->index > engine_version )
 			mmt_warn( "Ignored rule %d as it was built for a newer engine (built by version %s, this engine is %s).\nRule description: %s",
 					array[i].id,
 					array[i].version->number,
 					mmt_sec_get_version_number(),
-					array[i].description );
+					_rule_description( &array[i] ));
 		else{
 			out[ count++ ] = &array[i];
 			continue;

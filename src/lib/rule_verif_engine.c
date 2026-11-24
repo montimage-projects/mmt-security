@@ -1118,7 +1118,7 @@ rule_engine_t* rule_engine_init( const rule_info_t *rule_info, size_t max_instan
 	fsm_set_user_data( _engine->fsm_bootstrap, _engine );
 
 	//per-message workspace guards read their current-message variables
-	//from (see the fields' comment in rule_verif_engine.h)
+	//from (see the fields' comment in rule_verif_engine_internal.h)
 	if( rule_info->proto_atts_count == 0 ){
 		_engine->msg_values     = NULL;
 		_engine->msg_values_idx = NULL;
