@@ -83,7 +83,7 @@ endif
 ifdef UBSAN
   CFLAGS        += -fsanitize=undefined -g
   CLDFLAGS      += -fsanitize=undefined
-  RULE_GCC_ARGS := -fsanitize=undefined
+  RULE_GCC_ARGS += -fsanitize=undefined
 endif
 
 ifdef REDIS
@@ -320,7 +320,7 @@ $(LIB_NAME).a: $(LIB_OBJS) $(RULE_OBJS)
 
 $(LIB_NAME).so: $(LIB_OBJS) $(RULE_OBJS)
 	@echo "[LIBRARY] $(notdir $@)"
-	$(QUIET) $(CC)  -fPIC -shared -O3 -o $(LIB_NAME).so $(LIB_OBJS)  $(RULE_OBJS)
+	$(QUIET) $(CC)  -fPIC -shared -O3 -o $(LIB_NAME).so $(CLDFLAGS) $(LIB_OBJS)  $(RULE_OBJS)
 	
 lib:  $(LIB_OBJS)  $(RULE_OBJS) --refresh-plugin-engine $(LIB_NAME).a $(LIB_NAME).so
 	
@@ -332,8 +332,14 @@ ifdef NEED_ROOT_PERMISSION
 endif
 
 
+# RULE_GCC_ARGS is one option string that compile_rule appends verbatim to
+# the gcc command line; it takes a single optional argument (argc <= 4).
+# It is quoted so several flags - an ASAN+UBSAN build passes
+# '-fsanitize=address -fsanitize=undefined' - still reach it as one shell
+# word, and left absent entirely when empty (an "" would add a stray
+# argument and a trailing space in the recorded cflags).
 rules/%.so: compile_rule $(FLAVOR_DEP)
-	$(QUIET) ./$(MAIN_GEN_PLUGIN) rules/$*.so rules/$*.xml $(RULE_GCC_ARGS)
+	$(QUIET) ./$(MAIN_GEN_PLUGIN) rules/$*.so rules/$*.xml $(if $(RULE_GCC_ARGS),"$(RULE_GCC_ARGS)")
 	
 sample_rules: $(SAMPLE_RULES)
 
