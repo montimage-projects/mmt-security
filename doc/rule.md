@@ -281,7 +281,7 @@ Example (rule 13, built in ubuntu:24.04 with mmt-dpi 1.10.3 installed):
   "schema": 1,
   "rule_ids": [13],
   "xml": {"file": "13.datainSYN.xml", "sha256": "ee66f765...2225"},
-  "rule_abi": {"hash": "sha256:dfa8de4b...1b44", "plugin_version": "1.2.22"},
+  "rule_abi": {"hash": "sha256:4710cdd2...32f0", "plugin_version": "1.2.22"},
   "mmt_security": {"version": "1.2.22", "git": "0e2f9cb", "index": 1022200},
   "dpi": {
     "ids_from": "1.7.10 (fd93012d)", "ids_from_commit": "fd93012d",
@@ -306,7 +306,7 @@ Example (rule 13, built in ubuntu:24.04 with mmt-dpi 1.10.3 installed):
 | `schema` | version of this layout (1). It is bumped when a field changes meaning. |
 | `rule_ids` | ids of the rules in the `.so` |
 | `xml.file`, `xml.sha256` | name of the rule XML, and the SHA-256 of its bytes |
-| `rule_abi.hash` | `sha256:` of the layout (`sizeof`/`offsetof`) of the structures a rule shares with the engine: `rule_info_t`, `proto_attribute_t`, `rule_version_info_t`, `message_t`, `message_element_t`, `mmt_array_t`, the instance-key structs (`fsm_instance_key_t`, `fsm_instance_key_component_t`), the fsm structs the generated code initialises or reads (`fsm_delay_t`, `fsm_transition_t`, `fsm_state_t`, the `execution_trace` and `user_data` fields of `fsm_t`), `mmt_memory_t`, the accessor through which the guards read the opaque `rule_engine_t` (`mmt_sec_rule_engine_get_msg_values`), plus `REQUIRE_PLUGIN`. `rule_info --abi` prints the engine's layout and hash. |
+| `rule_abi.hash` | `sha256:` of the layout (`sizeof`/`offsetof`) of the structures a rule shares with the engine: `rule_info_t`, `proto_attribute_t`, `rule_version_info_t`, `message_t`, `message_element_t`, `mmt_array_t`, the instance-key structs (`fsm_instance_key_t`, `fsm_instance_key_component_t`), the fsm structs the generated code initialises or reads (`fsm_delay_t`, `fsm_transition_t`, `fsm_state_t`, the `execution_trace` and `user_data` fields of `fsm_t`), `mmt_memory_t`, the enum values the generated code compiles in (`FSM_EVENT_TYPE_TIMEOUT`, `FSM_ACTION_*`, `MMT_SEC_MSG_DATA_TYPE_*`, `RULE_TYPE_*`), the accessor through which the guards read the opaque `rule_engine_t` (`mmt_sec_rule_engine_get_msg_values`), plus `REQUIRE_PLUGIN`. `rule_info --abi` prints the engine's layout and hash. |
 | `rule_abi.plugin_version` | `REQUIRE_PLUGIN`: the oldest rule version this mmt-security loads; the newest is its own version (`mmt_security.version`), so rules must be rebuilt with the engine (doc/rule-abi-stability.md) |
 | `mmt_security.version`, `.git`, `.index` | the mmt-security that compiled the rule (same as `rule_version_info_t`) |
 | `dpi.ids_from`, `.ids_from_commit` | the label (`mmt_version()`) of the DPI header compiled into `compile_rule`, and its commit. `compile_rule` takes the ids from that header's table, compiled in with it, not from the installed mmt-dpi. It is neither the `src/dpi/mmt_dpi.h` on disk nor the installed mmt-dpi: `make` can regenerate that file without rebuilding `compile_rule`, and the label can be wrong about the table (the committed header says `fd93012d` and holds 6b1c9f53's table). See [rule-abi-stability.md](rule-abi-stability.md#how-the-ids-get-into-a-rule-so). The ids themselves are `dpi.ids`. |
