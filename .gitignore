@@ -8,6 +8,7 @@ rule_info
 mmt_sec_standalone
 mmt_sec_server
 gen_dpi_header
+.build-flavor
 .settings
 .project
 .cproject

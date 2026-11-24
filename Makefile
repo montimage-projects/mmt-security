@@ -91,6 +91,62 @@ else
   endif
 endif
 
+# Build-flavor stamp (fork #54): the object rules carry no mark of the flag
+# set they were compiled with, so `make ASAN=1` on a tree last built plain
+# (or the reverse) reused the old objects and linked a partly instrumented
+# binary. The expanded flag set is recorded in $(FLAVOR_STAMP); when it
+# changes the stamp is rewritten - newer than every object - and make
+# rebuilds them all. An unchanged flavor costs nothing: the objects are
+# newer than the stamp and stay up to date.
+# The write happens here, while the makefile is read, only when the content
+# differs, and never under -n/-t/-q, where no command runs and a new stamp
+# would lie about the objects' flavor.
+# $(file ...) exists only since GNU make 4.0, and its $(file <...) read
+# operator only since 4.1: on make 3.x it expands to nothing, so the
+# stamp would never be written and the flavor bug would persist
+# silently, and on exactly 4.0 the read below dies with make's own
+# cryptic "Invalid file operation: <". Fail loudly instead.
+$(if $(filter 3.% 4.0,$(MAKE_VERSION)),$(error .build-flavor stamp needs GNU make >= 4.1 ($(MAKE_VERSION) found)))
+FLAVOR_STAMP := .build-flavor
+# GIT_VERSION is filtered out: it changes with every commit and a new HEAD
+# alone must not rebuild the tree (and never did). The signature is
+# normalized once with $(strip): the content read back from the stamp file
+# is in $(strip) form too, while an un-stripped signature keeps whitespace
+# runs (the padding before the '#' comments of LIBS and CLDFLAGS, the '+='
+# joins) that would never match and would rewrite the stamp on every
+# parse.
+# CFLAGS-$(@) per-target additions and CFLAG-PLUGINS-ENGINE (the
+# STATIC_RULES_SUFFIX_LIST accumulated while the rule objects compile) are
+# not part of the signature: no CFLAGS-* variable is defined today and the
+# suffix list is derived from the same rules/*.xml set.
+FLAVOR_SIG := $(strip $(CC)|$(AR)|STATIC_LINK=$(STATIC_LINK)|$(filter-out -DGIT_VERSION=%,$(CFLAGS))|$(CLDFLAGS)|$(RULE_GCC_ARGS)|$(LIBS))
+# -n/-t/-q come bundled as letters in the first MAKEFLAGS word
+FLAVOR_FLAGS := $(filter-out --%,$(firstword $(MAKEFLAGS)))
+# The stamp matters only to goals that compile objects (an empty
+# MAKECMDGOALS is the default goal `all`); the clean and uninstall goals
+# get no stray write - `clean` deletes the stamp right away anyway.
+ifneq ($(if $(MAKECMDGOALS),$(filter-out clean clean-all clean-rules dist-clean uninstall,$(MAKECMDGOALS)),all),)
+ifneq ($(strip $(file <$(FLAVOR_STAMP))),$(FLAVOR_SIG))
+  ifeq ($(findstring n,$(FLAVOR_FLAGS))$(findstring t,$(FLAVOR_FLAGS))$(findstring q,$(FLAVOR_FLAGS)),)
+    $(file >$(FLAVOR_STAMP),$(FLAVOR_SIG))
+  endif
+endif
+endif
+# FLAVOR_DEP rides inside the object and rule recipes' prerequisite lists
+# when the stamp exists; an explicit `x.o: $(FLAVOR_DEP)` rule instead would
+# exempt the absolute-path objects from implicit rules (they would be
+# "remade" without ever compiling).
+FLAVOR_DEP := $(wildcard $(FLAVOR_STAMP))
+# The stamp needs a rule of its own: a pattern-rule prerequisite that does
+# not exist yet (the stamp was just written above, so make has not seen it)
+# and cannot be made disqualifies the whole pattern rule - `%.o` would
+# silently fall back to the built-in rule and `rules/%.so` would fail with
+# "No rule to make target" on the first build of a fresh tree. The `;` ends
+# an empty recipe: it makes the stamp "makable" without ever running or
+# printing anything, so `make -nB` still prints exactly the lines it did
+# before.
+$(FLAVOR_STAMP): ;
+
 #folders containing source files
 SRCDIR := $(abspath ./src )
 
@@ -141,7 +197,7 @@ gen_dpi $(MMT_DPI_HEADER): $(MMT_DPI_DIR)
 	$(QUIET) echo ">>> Generate list of protocols and their attributes to $(MMT_DPI_HEADER)"
 	$(QUIET) ./$(MAIN_DPI) $(MMT_DPI_HEADER)
 
-%.o: %.c | $(MMT_DPI_HEADER)
+%.o: %.c $(FLAVOR_DEP) | $(MMT_DPI_HEADER)
 	@echo "[COMPILE] $(notdir $@)"
 	$(QUIET) $(CC) $(CFLAGS) $(CLDFLAGS) -c -o $@ $<
 	
@@ -173,7 +229,7 @@ else
   GEN_OBJS     := $(LIB_OBJS) $(SRCDIR)/main_gen_plugin.o
 endif
 
-%.gen.o: %.c | $(MMT_DPI_HEADER)
+%.gen.o: %.c $(FLAVOR_DEP) | $(MMT_DPI_HEADER)
 	@echo "[COMPILE] $(notdir $@)"
 	$(QUIET) $(CC) $(GEN_CFLAGS) $(GEN_CLDFLAGS) -c -o $@ $<
 
@@ -209,7 +265,7 @@ rules/%.c: compile_rule
 
 #Compile code C of a rule and add a RULE_SUFFIX is the name of the rule
 # (we replace the non-alphanumeric characters by underscores)
-rules/%.o: rules/%.c
+rules/%.o: rules/%.c $(FLAVOR_DEP)
 	@#replace non-alphanumeric characters in the file name of rule(s) by underscores
 	$(eval RULE_SUFFIX=$(shell echo $* | sed "s/[^[:alnum:]]/_/g"))
 	
@@ -267,7 +323,7 @@ ifdef NEED_ROOT_PERMISSION
 endif
 
 
-rules/%.so: compile_rule
+rules/%.so: compile_rule $(FLAVOR_DEP)
 	$(QUIET) ./$(MAIN_GEN_PLUGIN) rules/$*.so rules/$*.xml $(RULE_GCC_ARGS)
 	
 sample_rules: $(SAMPLE_RULES)
@@ -429,8 +485,8 @@ clean: clean-rules
 	$(QUIET) $(RM) $(LIB_NAME).* $(MAIN_OBJS) $(LIB_OBJS) $(OUTPUT) test.* \
 			$(SRCDIR)/lib/*.gen.o $(SRCDIR)/*.gen.o \
 			$(MAIN_DPI) $(MAIN_GEN_PLUGIN) $(MAIN_PLUGIN_INFO) $(MAIN_STAND_ALONE) $(MAIN_SEC_SERVER)\
-			$(RULE_OBJS) $(TMP_DIR)
-	
+			$(RULE_OBJS) $(TMP_DIR) $(FLAVOR_STAMP)
+
 clean-all: clean
 	$(QUIET) $(RM) $(MMT_DPI_HEADER)
 	
@@ -591,6 +647,15 @@ check-plugin-abi: _prepare rule_info
 check: check-tsan
 check-tsan:
 	@./check/check-tsan.sh
+
+# build-flavor stamp (fork #54): plain, then TSAN=1, then ASAN=1 in a scratch
+# copy, and nm asserts every object linked into mmt_sec_standalone,
+# libmmt_security2 and the rules/*.so carries the flavor's marker - except
+# the uninstrumented compile_rule objects. Fails when a flavor switch links
+# objects of another flavor.
+check: check-flavor
+check-flavor:
+	@./check/check-flavor.sh
 
 _csv.%: _prepare
 	$(QUIET) $(RM) /tmp/mmt-security*.csv
