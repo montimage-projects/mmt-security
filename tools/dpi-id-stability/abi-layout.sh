@@ -36,6 +36,7 @@ docker run --rm -e OUT_UID="$(id -u)" -e OUT_GID="$(id -g)" -v "$WORK/abi:/abi" 
 		t=$(basename "$d"); def=
 		grep -q rule_version_info_t "$d/src/lib/plugin_header.h" && def=-DHAS_VERSION_INFO
 		grep -q fsm_instance_key_t "$d/src/lib/plugin_header.h" && def="$def -DHAS_INSTANCE_KEYS"
+		grep -q MMT_SEC_MSG_DATA_TYPE_NUMERIC "$d/src/lib/message_t.h" && def="$def -DHAS_MSG_DATA_TYPE_PREFIX"
 		if grep -q mmt_sec_rule_engine_get_msg_values "$d/src/lib/gen_code.c"; then def="$def -DHAS_MSG_VALUES_ACCESSOR"
 		elif grep -q "_engine->msg_values" "$d/src/lib/gen_code.c"; then def="$def -DHAS_MSG_VALUES_FIELD"; fi
 		gcc -w $def -I"$d/src/lib" -I"$d/src/dpi" -o /abi/probe-$t /abi/abi_layout.c
