@@ -23,6 +23,20 @@
  *  - P5: mmt_sec_init() + an engine run on the 6.SYNFUL pcap: the reloaded
  *        rules 6 and 84 must still alert.
  *
+ * Then, after mmt_sec_close - the window the precondition of
+ * unload_mmt_sec_rules (plugins_engine.h) allows again:
+ *
+ *  - P6: a batch asks for rule 26 twice and for an id no plugin has: only the
+ *        first 26 counts, 26.proto_scan.so is closed    => {1,6,11,84,9101}
+ *  - P7: unload rule 84, the last slot of the rules[] of 6.SYNFUL.so
+ *        (self-assign then NULL)                         => {1,6,11,9101}
+ *  - P8: unload rule 9101, the plugin of the last plugins[] slot (self-assign
+ *        then memset of the vacated slot)                => {1,6,11}
+ *  - P9: the last two plugins go in one batch, then the only plugin left:
+ *        plugins_count reaches 0                         => {}
+ *  - P10: the .so files are back: a rescan loads everything into the emptied
+ *        plugins[] and rules[] arrays                    => {1,6,11,26,84}
+ *
  * Before the fix, P1 already kept rule 6 in the global rules set; the reuse
  * of a vacated slot at P3 started plugin->rules_count from its stale value
  * and wrote past the freshly allocated plugin->rules array.
@@ -36,13 +50,6 @@
 #include "../src/lib/plugins_engine.h"
 #include "../src/lib/mmt_security.h"
 #include "../src/lib/dpi_message_t.h"
-
-/* mmt_sec_load_plugin is a public function of plugins_engine.c but is not
- * declared in plugins_engine.h */
-size_t mmt_sec_load_plugin(
-		size_t ( *mmt_sec_get_plugin_info ) ( const rule_info_t ** ),
-		void (*on_load)(),
-		void (*on_unload)() );
 
 static int fails = 0;
 static void fail( const char *phase, const char *msg ){
@@ -88,6 +95,12 @@ static void unload_one( const char *phase, uint32_t rule_id ){
 	size_t ret = unload_mmt_sec_rules( 1, &rule_id );
 	printf( "  %s: unload rule %u => %zu removed\n", phase, rule_id, ret );
 	if( ret != 1 ) fail( phase, "rule not removed" );
+}
+
+static void unload_batch( const char *phase, const uint32_t *rule_ids, size_t count, size_t expect ){
+	size_t ret = unload_mmt_sec_rules( count, rule_ids );
+	printf( "  %s: unload %zu rule id(s) => %zu removed\n", phase, count, ret );
+	if( ret != expect ) fail( phase, "unexpected number of removed rules" );
 }
 
 static void move( const char *src, const char *dst, const char *phase ){
@@ -232,6 +245,51 @@ int main( int argc, char **argv ){
 
 	/* P5: the reloaded rules still alert on the pcap */
 	engine_run( pcap_path );
+
+	/* the phases below run after mmt_sec_close: the precondition of
+	 * unload_mmt_sec_rules (no live handler, plugins_engine.h) holds again */
+
+	/* P6: a batch asks for rule 26 twice and for an id no plugin has: only
+	 * the first 26 counts; its .so is moved aside first so the rescan does
+	 * not load it again */
+	move( "rules/26.proto_scan.so", "staging/26.proto_scan.so", "P6" );
+	{ const uint32_t ids[] = {26, 26, 9999};
+	  unload_batch( "P6", ids, 3, 1 ); }
+	{ const uint32_t want[] = {1,6,11,84,9101};
+	  check_ids( "P6 same id twice + nonexistent id", want, 5 ); }
+
+	/* P7: rule 84 is the last slot of the rules[] of 6.SYNFUL.so: the
+	 * self-assign then NULL path */
+	unload_one( "P7", 84 );
+	{ const uint32_t want[] = {1,6,11,9101};
+	  check_ids( "P7 last slot of plugin->rules[]", want, 4 ); }
+
+	/* P8: 9101.so sits in the last slot of plugins[]: the close does a
+	 * self-assign of the slot then memsets it */
+	unload_one( "P8", 9101 );
+	{ const uint32_t want[] = {1,6,11};
+	  check_ids( "P8 plugin of the last plugins[] slot", want, 3 ); }
+
+	/* P9: the last two plugins go in one batch, then the only plugin left:
+	 * plugins_count reaches 0 (the .so files are moved aside first) */
+	move( "rules/1.ssh.so",      "staging/1.ssh.so",      "P9" );
+	move( "rules/11.ip_size.so", "staging/11.ip_size.so", "P9" );
+	move( "rules/6.SYNFUL.so",   "staging/6.SYNFUL.so",   "P9" );
+	{ const uint32_t ids[] = {1, 6};
+	  unload_batch( "P9", ids, 2, 2 ); }
+	{ const uint32_t want[] = {11};
+	  check_ids( "P9 batch of the last two plugins", want, 1 ); }
+	unload_one( "P9", 11 );
+	check_ids( "P9 the only plugin left (plugins_count to 0)", NULL, 0 );
+
+	/* P10: the .so files are back: a rescan loads everything into the
+	 * emptied plugins[] and rules[] arrays */
+	move( "staging/1.ssh.so",         "rules/1.ssh.so",         "P10" );
+	move( "staging/11.ip_size.so",    "rules/11.ip_size.so",    "P10" );
+	move( "staging/6.SYNFUL.so",      "rules/6.SYNFUL.so",      "P10" );
+	move( "staging/26.proto_scan.so", "rules/26.proto_scan.so", "P10" );
+	{ const uint32_t want[] = {1,6,11,26,84};
+	  check_ids( "P10 rescan after plugins_count reached 0", want, 5 ); }
 
 	if( fails ) fprintf( stderr, "  => %d check(s) failed\n", fails );
 	return fails ? 1 : 0;

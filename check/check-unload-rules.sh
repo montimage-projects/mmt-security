@@ -7,6 +7,10 @@
 #    mmt_sec_load_plugin) - checking the counts and the loaded rule ids after
 #    each step, then runs the engine on check/pcap/6.SYNFUL.pcap where the
 #    reloaded rules 6 and 84 must still alert.
+#  - then unloads down to plugins_count == 0 through the edge cases of the
+#    unload paths (same id twice and a nonexistent id, the last slot of a
+#    plugin's rules[] and the last slot of plugins[]), and lets a rescan
+#    load the rules folder back into the emptied arrays.
 # Before the fix, the vacated slot of plugins[] kept its stale rules_count,
 # so the reload wrote past the new plugin->rules array (ASan reports a
 # heap-buffer-overflow; valgrind an invalid write), and the global rules
