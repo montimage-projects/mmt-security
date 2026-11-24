@@ -101,16 +101,34 @@ endif
 # The write happens here, while the makefile is read, only when the content
 # differs, and never under -n/-t/-q, where no command runs and a new stamp
 # would lie about the objects' flavor.
+# $(file ...) exists only since GNU make 4.0: on make 3.x it expands to
+# nothing, the stamp would never be written and the flavor bug would
+# persist silently. Fail loudly instead.
+$(if $(filter 3.%,$(MAKE_VERSION)),$(error .build-flavor stamp needs GNU make >= 4.0 ($(MAKE_VERSION) found)))
 FLAVOR_STAMP := .build-flavor
 # GIT_VERSION is filtered out: it changes with every commit and a new HEAD
-# alone must not rebuild the tree (and never did).
-FLAVOR_SIG := $(CC)|$(AR)|STATIC_LINK=$(STATIC_LINK)|$(filter-out -DGIT_VERSION=%,$(CFLAGS))|$(CLDFLAGS)|$(RULE_GCC_ARGS)|$(LIBS)
+# alone must not rebuild the tree (and never did). The signature is
+# normalized once with $(strip): the content read back from the stamp file
+# is in $(strip) form too, while an un-stripped signature keeps whitespace
+# runs (the padding before the '#' comments of LIBS and CLDFLAGS, the '+='
+# joins) that would never match and would rewrite the stamp on every
+# parse.
+# CFLAGS-$(@) per-target additions and CFLAG-PLUGINS-ENGINE (the
+# STATIC_RULES_SUFFIX_LIST accumulated while the rule objects compile) are
+# not part of the signature: no CFLAGS-* variable is defined today and the
+# suffix list is derived from the same rules/*.xml set.
+FLAVOR_SIG := $(strip $(CC)|$(AR)|STATIC_LINK=$(STATIC_LINK)|$(filter-out -DGIT_VERSION=%,$(CFLAGS))|$(CLDFLAGS)|$(RULE_GCC_ARGS)|$(LIBS))
 # -n/-t/-q come bundled as letters in the first MAKEFLAGS word
 FLAVOR_FLAGS := $(filter-out --%,$(firstword $(MAKEFLAGS)))
+# The stamp matters only to goals that compile objects (an empty
+# MAKECMDGOALS is the default goal `all`); the clean and uninstall goals
+# get no stray write - `clean` deletes the stamp right away anyway.
+ifneq ($(if $(MAKECMDGOALS),$(filter-out clean clean-all clean-rules dist-clean uninstall,$(MAKECMDGOALS)),all),)
 ifneq ($(strip $(file <$(FLAVOR_STAMP))),$(FLAVOR_SIG))
   ifeq ($(findstring n,$(FLAVOR_FLAGS))$(findstring t,$(FLAVOR_FLAGS))$(findstring q,$(FLAVOR_FLAGS)),)
     $(file >$(FLAVOR_STAMP),$(FLAVOR_SIG))
   endif
+endif
 endif
 # FLAVOR_DEP rides inside the object and rule recipes' prerequisite lists
 # when the stamp exists; an explicit `x.o: $(FLAVOR_DEP)` rule instead would

@@ -12,6 +12,18 @@
 # On a Makefile with no flavor stamp the second build links the previous
 # flavor's objects, and this script fails.
 #
+# After each leg a second `make` of the same flavor must be the pre-stamp
+# no-op of a0f63108: only the --refresh-plugin-engine recompile and the
+# relinks it triggers - and .build-flavor must not be rewritten. A stamp
+# rewritten on every parse (a signature that never matches) shows up here
+# as a full rebuild and a newer stamp.
+#
+# A sanitizer leg is skipped, not failed, on a platform whose toolchain
+# cannot compile and link the sanitizer's probe (e.g. gcc without libtsan
+# cannot link a TSan binary at all) - the same skip-not-fail platform
+# limitation as check-tsan.sh, so `make check` does not regress where it
+# passed before the stamp existed.
+#
 # Usage: check/check-flavor.sh
 set -u
 cd "$(dirname "$0")/.." || exit 1
@@ -83,12 +95,63 @@ check_tree(){ # marker-regex|none  leg-name
 	[ "$missing" -eq 0 ] && [ "$extra" -eq 0 ] && [ "$n" -gt 0 ]
 }
 
+# probe that the toolchain can compile and link a binary with the given
+# sanitizer flag: a leg needs nothing more - it builds uninstrumented tools
+# (compile_rule, gen_dpi_header) and only inspects objects with nm, never
+# runs an instrumented binary
+probe_san(){ # flag probe-name
+	printf 'int main(void){return 0;}\n' > "$TMP/probe.$2.c"
+	gcc "$1" "$TMP/probe.$2.c" -o "$TMP/probe.$2" > "$TMP/probe.$2.log" 2>&1
+}
+
+# a second `make` of the same flavor must be the no-op of a0f63108: nothing
+# compiles and .build-flavor keeps its content and mtime. The only action
+# lines allowed are the --refresh-plugin-engine recompile and the relinks
+# it races (at most 7, measured at a0f63108; under -j that target runs
+# parallel to the downstream relinks, so the no-op emits 3-7 lines; the
+# sanitizer legs cap at 6 because compile_rule is linked from the separate
+# *.gen.o objects that the refresh never touches). A stamp rewritten on
+# every parse (a signature that never matches) shows up here as a full
+# rebuild and a newer stamp.
+noop_leg(){ # leg-name max-action-lines make-args...
+	local name=$1 max=$2; shift 2
+	local stamp="$B/.build-flavor" before after n objn ok=0
+	before=$(stat -c %y "$stamp" 2>/dev/null; sha256sum "$stamp" 2>/dev/null)
+	( cd "$B" && make -j"$JOBS" "$@" lib _prepare sec_server rule_info ) > "$TMP/make.$name.noop.log" 2>&1 || {
+		cat "$TMP/make.$name.noop.log"; fail "$name: second same-flavor make failed"; return 1; }
+	after=$(stat -c %y "$stamp" 2>/dev/null; sha256sum "$stamp" 2>/dev/null)
+	[ "$before" = "$after" ] || { ok=1; \
+		fail "$name: second same-flavor make rewrote .build-flavor"; }
+	objn=$(grep -cE '^\[COMPILE\] (.*\.o|rules/)' "$TMP/make.$name.noop.log")
+	[ "$objn" -eq 0 ] || { ok=1; \
+		fail "$name: second same-flavor make recompiled $objn objects or rules"; }
+	n=$(grep -cE '^\[(COMPILE|ARCHIVE|LIBRARY|RE-COMPILE)\]' "$TMP/make.$name.noop.log")
+	[ "$n" -le "$max" ] || { ok=1; \
+		fail "$name: second same-flavor make ran $n build actions, expected at most the a0f63108 no-op set ($max)"; }
+	return $ok
+}
+
 build plain
 check_tree none plain || true
-build tsan TSAN=1
-check_tree '__tsan_' tsan || true
-build asan ASAN=1
-check_tree '__asan_' asan || true
+noop_leg plain 7 || true
+
+if probe_san -fsanitize=thread tsan; then
+	build tsan TSAN=1
+	check_tree '__tsan_' tsan || true
+	noop_leg tsan 6 TSAN=1 || true
+else
+	echo "  => SKIPPED: no working TSan toolchain:"
+	head -3 "$TMP/probe.tsan.log"
+fi
+
+if probe_san -fsanitize=address asan; then
+	build asan ASAN=1
+	check_tree '__asan_' asan || true
+	noop_leg asan 6 ASAN=1 || true
+else
+	echo "  => SKIPPED: no working ASan toolchain:"
+	head -3 "$TMP/probe.asan.log"
+fi
 
 if [ "$status" -eq 0 ]; then
 	echo "  => OK: every flavor switch rebuilt all of its objects"
