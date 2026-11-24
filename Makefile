@@ -561,6 +561,12 @@ check: check-fsm-bounds
 check-fsm-bounds: _prepare
 	@./check/check-fsm-bounds.sh
 
+# unload then load of rule plugins: vacated plugin slots, counts and ids,
+# and an alert run on the reloaded rules (issue #58)
+check: check-unload-rules
+check-unload-rules: _prepare
+	@./check/check-unload-rules.sh
+
 # -h/--help exits 0 and a bad option exits 1 for every tool (fork #47)
 check: check-help
 check-help: _prepare sec_server rule_info
