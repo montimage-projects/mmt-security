@@ -287,7 +287,7 @@ endif
 	$(QUIET) $(CP)    mmt-security.conf  $(TMP_DIR)/
 	
 	$(QUIET) $(MKDIR) $(TMP_DIR)/include
-	$(QUIET) $(CP)    $(SRCDIR)/dpi/* $(SRCDIR)/lib/*.h $(TMP_DIR)/include/
+	$(QUIET) $(CP)    $(SRCDIR)/dpi/* $(filter-out $(SRCDIR)/lib/rule_verif_engine_internal.h,$(wildcard $(SRCDIR)/lib/*.h)) $(TMP_DIR)/include/
 	
 	$(QUIET) $(MKDIR) $(TMP_DIR)/bin
 	$(QUIET) $(CP)    $(MAIN_GEN_PLUGIN)  $(MAIN_PLUGIN_INFO)  $(TMP_DIR)/bin
