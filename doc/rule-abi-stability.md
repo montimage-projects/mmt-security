@@ -421,8 +421,9 @@ engine:
   (`typedef struct rule_engine_struct rule_engine_t;`). The struct is defined
   in `rule_verif_engine_internal.h`, which only the engine's own files
   (`rule_verif_engine.c`, `mmt_single_security.c`) include (`make install`
-  installs it with the other headers of `src/lib`, but no header that the
-  generated code includes reaches it). A guard that read a field of
+  and the deb and rpm packages no longer ship it — fork #60, decision 5
+  of fork #57 — and no header that the generated code includes reaches
+  it). A guard that read a field of
   `rule_engine_t`, or its `sizeof`, would no longer compile;
 - no other field of `rule_engine_t` is read by generated code. The generated
   C of every rule of `rules/`, `rules/properties_all/` and `check/timeout/`
