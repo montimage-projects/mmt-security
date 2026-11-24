@@ -59,9 +59,16 @@ int main( void ){
 	S(fsm_state_t); F(fsm_state_t, delay); F(fsm_state_t, is_temporary); F(fsm_state_t, description);
 	F(fsm_state_t, transitions); F(fsm_state_t, transitions_count);
 	F(fsm_state_t, entry_action); F(fsm_state_t, exit_action); E();
-	//only the fields the inline helpers of the guards read
-	S(fsm_t); F(fsm_t, execution_trace); F(fsm_t, user_data); E();
+	//only the fields the inline helpers of the guards read, not the size
+	printf( "fsm_t" ); F(fsm_t, execution_trace); F(fsm_t, user_data); E();
 	S(mmt_memory_t); F(mmt_memory_t, ref_count); F(mmt_memory_t, size); F(mmt_memory_t, data); E();
+	//the enum values the generated code compiles in
+	printf( "enums FSM_EVENT_TYPE_TIMEOUT=%d FSM_ACTION_DO_NOTHING=%d FSM_ACTION_CREATE_INSTANCE=%d FSM_ACTION_RESET_TIMER=%d"
+			" MMT_SEC_MSG_DATA_TYPE_NUMERIC=%d MMT_SEC_MSG_DATA_TYPE_STRING=%d MMT_SEC_MSG_DATA_TYPE_BINARY=%d"
+			" RULE_TYPE_ATTACK=%d RULE_TYPE_SECURITY=%d RULE_TYPE_EVASION=%d RULE_TYPE_TEST=%d\n",
+			FSM_EVENT_TYPE_TIMEOUT, FSM_ACTION_DO_NOTHING, FSM_ACTION_CREATE_INSTANCE, FSM_ACTION_RESET_TIMER,
+			MMT_SEC_MSG_DATA_TYPE_NUMERIC, MMT_SEC_MSG_DATA_TYPE_STRING, MMT_SEC_MSG_DATA_TYPE_BINARY,
+			RULE_TYPE_ATTACK, RULE_TYPE_SECURITY, RULE_TYPE_EVASION, RULE_TYPE_TEST );
 	//what the generated guards read of rule_engine_t
 #if defined HAS_MSG_VALUES_ACCESSOR
 	printf( "rule_engine_t opaque mmt_sec_rule_engine_get_msg_values\n" );
