@@ -151,19 +151,33 @@ echo "  control (this tree's rules): $n alert(s)"
 
 # the .so of this tree reach rule_engine_t through the accessor only
 leg=0
-for x in $RULES; do
-	nm -D --undefined-only "$C/rules/$x.so" 2>/dev/null | grep -qw mmt_sec_rule_engine_get_msg_values \
-		|| fail "control: rules/$x.so does not call mmt_sec_rule_engine_get_msg_values"
-done
-# rule_verif_engine.h, the header of the generated guards, keeps
-# rule_engine_t opaque: a guard reading its layout does not compile
-printf '#include "rule_verif_engine.h"\nconst void *f( const rule_engine_t *e ){ return e; }\n' > "$TMP/opaque-ok.c"
-printf '#include "rule_verif_engine.h"\nsize_t f( const rule_engine_t *e ){ return sizeof( *e ); }\n' > "$TMP/opaque-ko.c"
-if ! "$CC" -fsyntax-only -I src/lib -I src/dpi "$TMP/opaque-ok.c" > "$TMP/opaque-ok.log" 2>&1; then
-	tail -3 "$TMP/opaque-ok.log" | sed 's/^/    | /'
-	fail "opaque: rule_verif_engine.h does not compile on its own"
-elif "$CC" -fsyntax-only -I src/lib -I src/dpi "$TMP/opaque-ko.c" > /dev/null 2>&1; then
-	fail "opaque: rule_verif_engine.h defines rule_engine_t: the guards can read its layout"
+if ! command -v nm > /dev/null; then
+	fail "control: nm (binutils) not found"
+else
+	for x in $RULES; do
+		nm -D --undefined-only "$C/rules/$x.so" | grep -qw mmt_sec_rule_engine_get_msg_values \
+			|| fail "control: rules/$x.so does not call mmt_sec_rule_engine_get_msg_values"
+	done
+fi
+# the headers of the generated guards (the include lines that gen_code.c
+# writes) keep rule_engine_t opaque: a guard reading its layout does not
+# compile, for the reason "incomplete type"
+inc=$(sed -n 's/.*fprintf( *fd, *"\(#include <string.h>.*\)");$/\1/p' src/lib/gen_code.c | sed 's/\\n/\n/g; s/\\"/"/g')
+if [ -z "$inc" ]; then
+	fail "opaque: the include lines of the generated code not found in src/lib/gen_code.c"
+else
+	printf '%s\nconst void *f( const rule_engine_t *e ){ return e; }\n' "$inc" > "$TMP/opaque-ok.c"
+	printf '%s\nsize_t f( const rule_engine_t *e ){ return sizeof( *e ); }\n' "$inc" > "$TMP/opaque-ko.c"
+	# $CC unquoted: it may be "ccache gcc"
+	if ! $CC -fsyntax-only -I src/lib -I src/dpi -I "${MMT_DPI_DIR:-/opt/mmt/dpi}/include" "$TMP/opaque-ok.c" > "$TMP/opaque-ok.log" 2>&1; then
+		tail -3 "$TMP/opaque-ok.log" | sed 's/^/    | /'
+		fail "opaque: the includes of the generated code do not compile ($CC)"
+	elif $CC -fsyntax-only -I src/lib -I src/dpi -I "${MMT_DPI_DIR:-/opt/mmt/dpi}/include" "$TMP/opaque-ko.c" > "$TMP/opaque-ko.log" 2>&1; then
+		fail "opaque: the generated code sees the definition of rule_engine_t: the guards can read its layout"
+	elif ! grep -q "incomplete type" "$TMP/opaque-ko.log"; then
+		tail -3 "$TMP/opaque-ko.log" | sed 's/^/    | /'
+		fail "opaque: sizeof( rule_engine_t ) fails for another reason than an incomplete type"
+	fi
 fi
 [ $leg -eq 0 ] && echo "  this tree's rules call the accessor; rule_engine_t is opaque to them"
 
@@ -203,7 +217,7 @@ static const rule_info_t rules[] = {{ .id = 9301, .description = "no version sta
 size_t mmt_sec_get_plugin_info( const rule_info_t **r ){ *r = rules; return 1; }
 CEOF
 # with rule 9101 of this tree, which must still load (see check_refused)
-if ! "$CC" -fPIC -shared -I src/lib -I src/dpi -o "$V/rules/9301.so" "$V/noversion.c" > "$V/cc.log" 2>&1; then
+if ! $CC -fPIC -shared -I src/lib -I src/dpi -o "$V/rules/9301.so" "$V/noversion.c" > "$V/cc.log" 2>&1; then
 	tail -3 "$V/cc.log" | sed 's/^/    | /'
 	fail "no version: the plugin does not compile"
 elif ! "$COMPILE_RULE" "$V/rules/9101.so" check/timeout/9101.xml > "$V/9101.log" 2>&1; then
