@@ -312,9 +312,11 @@ These are not baked into rule `.so` files, but they assume ids:
 A rule `.so` shares these with the engine: `rule_info_t`, `proto_attribute_t` and
 `rule_version_info_t` (`src/lib/plugin_header.h`). Through the inline helpers it
 also shares `message_t` and `message_element_t` (`src/lib/message_t.h`, read by
-`get_element_data_message_t`), `mmt_array_t`, and the FSM structs of
-`src/lib/mmt_fsm.h`. `tools/dpi-id-stability/abi-layout.sh` compiles a
-`sizeof`/`offsetof` probe against `src/lib` of every v1.2.* tag:
+`get_element_data_message_t`), `mmt_array_t`, the FSM structs of
+`src/lib/mmt_fsm.h`, and the header of the `mmt_mem_alloc` buffers
+(`mmt_memory_t`, read by `mmt_mem_size` and `mmt_mem_cmp`). Since 1.2.22 it no
+longer shares `rule_engine_t` (below). `tools/dpi-id-stability/abi-layout.sh`
+compiles a `sizeof`/`offsetof` probe against `src/lib` of every v1.2.* tag:
 
 | tags | rule_info_t, proto_attribute_t, rule_version_info_t | message_t | REQUIRE_PLUGIN |
 |---|---|---|---|
@@ -322,6 +324,7 @@ also shares `message_t` and `message_element_t` (`src/lib/message_t.h`, read by
 | v1.2.6 - v1.2.12 | unchanged | 128 bytes, `flow_id` and `user_data` added, `elements@24` | 1.2.7 |
 | v1.2.13 - v1.2.20 | unchanged | `hash` becomes `mmt_bit_t` (32 bytes, at 34) | 1.2.7 |
 | 1.2.21 (unreleased, fork #51) | `rule_info_t` 104 bytes: `instance_keys@96` appended; `rule_engine_t` changed too (below) | unchanged | 1.2.21 |
+| 1.2.22 (unreleased, fork #56) | unchanged; the guards no longer read `rule_engine_t`, they call `mmt_sec_rule_engine_get_msg_values` (below) | unchanged | 1.2.22 |
 
 - `rule_info_t` (96 bytes on LP64), `proto_attribute_t` (32) and
   `rule_version_info_t` (40) did not change from v1.2.0 to v1.2.20.
@@ -334,17 +337,18 @@ also shares `message_t` and `message_element_t` (`src/lib/message_t.h`, read by
   did not move), so v1.2.6+ `.so` files stay compatible. A struct hash would
   still have flagged it. Only the bump discipline protects the ABI today.
 
-### `rule_engine_t` is part of the plugin ABI (1.2.21)
+### `rule_engine_t` was part of the plugin ABI (1.2.21)
 
 The layout probe above covers the structs of `plugin_header.h`,
-`message_t.h`, `mmt_array_t.h` and `mmt_fsm.h`. It misses one: the guards
-that `compile_rule` generates `#include "rule_verif_engine.h"`
+`message_t.h`, `mmt_array_t.h` and `mmt_fsm.h`. Up to 1.2.21 it missed one:
+the guards that `compile_rule` generates `#include "rule_verif_engine.h"`
 (`src/lib/gen_code.c`, the includes of the generated code) and read the
 per-message attribute values as `_engine->msg_values`, where `_engine` is
 the `rule_engine_t` of the fsm (`fsm_get_user_data`). The offset of
-`msg_values` is therefore compiled into every rule `.so`. So
-`rule_engine_t`, an engine-private struct, is in effect part of the plugin
-ABI since `msg_values` was added (fork #51, PR #53).
+`msg_values` is therefore compiled into every 1.2.21 rule `.so`. So
+`rule_engine_t`, an engine-private struct, was in effect part of the plugin
+ABI from the addition of `msg_values` (fork #51, PR #53) to 1.2.21. 1.2.22
+removes it (next section).
 
 The fork #51 instance index (PR #55) changed both structs:
 
@@ -377,24 +381,134 @@ layout would pass a `>= 1.2.20` check. The fix:
   `compile_rule` of 97441d79 and rules stamped one patch version above the
   engine, and expects both refused, with a warning and exit 0.
 
-Two limits remain:
+Two limits remained in 1.2.21:
 
 - **Engines already deployed cannot be protected.** An engine of
   `REQUIRE_PLUGIN` 1.2.7 (v1.2.7 to v1.2.20, and the fork before this
   change) has no upper bound: it accepts a 1.2.21 rule, whose guards then
-  read its `rule_engine_t` at the wrong offset. Nothing in a new rule `.so`
-  can make an old engine refuse it.
+  read its `rule_engine_t` at the wrong offset. Nothing in a 1.2.21 rule
+  `.so` can make an old engine refuse it. The #55 re-review saw such a run
+  produce plausible alerts instead of crashing: the failure can be silent.
+  1.2.22 rules fail loudly on these engines instead (next section).
 - **The upper bound is strict.** A 1.2.21 engine also refuses a rule built
   by a later `compile_rule` whose layout did not change.
 
 **Rule: rebuild the rules with the engine.** Install a rule `.so` only with
 the mmt-security it was compiled by (same `VERSION`), and recompile every
 third-party rule when mmt-security is upgraded. `rule_info --build-info`
-prints the stamp of a rule `.so` (`mmt_security.version`).
+prints the stamp of a rule `.so` (`mmt_security.version`). This still holds
+in 1.2.22: the bounds of the loader did not change.
 
-The long-term fix (not done): generated guards reach the message values
-through an accessor exported by the engine, not through the struct offset,
-so that `rule_engine_t` leaves the plugin ABI.
+### `rule_engine_t` leaves the plugin ABI (1.2.22)
+
+Fork #56 removes `rule_engine_t` from what a rule `.so` shares with the
+engine:
+
+- the generated guards read the message values through a function the
+  engine exports, `mmt_sec_rule_engine_get_msg_values( const rule_engine_t * )`
+  (`src/lib/rule_verif_engine.h`), with the engine of `fsm_get_user_data( fsm )`:
+
+  ```c
+  const void * const *_mv = mmt_sec_rule_engine_get_msg_values( (const rule_engine_t *) fsm_get_user_data( fsm ));
+  if( unlikely( _mv == NULL )) return 0;
+  ```
+
+  It is a real exported function, defined in `rule_verif_engine.c` and never
+  `static inline`: an inline accessor would compile the offset of
+  `msg_values` back into every rule;
+- `rule_verif_engine.h`, the engine header that the generated code includes,
+  declares `rule_engine_t` as an incomplete type
+  (`typedef struct rule_engine_struct rule_engine_t;`). The struct is defined
+  in `rule_verif_engine_internal.h`, which only the engine's own files
+  (`rule_verif_engine.c`, `mmt_single_security.c`) include (`make install`
+  installs it with the other headers of `src/lib`, but no header that the
+  generated code includes reaches it). A guard that read a field of
+  `rule_engine_t`, or its `sizeof`, would no longer compile;
+- no other field of `rule_engine_t` is read by generated code. The generated
+  C of every rule of `rules/`, `rules/properties_all/` and `check/timeout/`
+  (223 files; the two OCPP rules of `properties_all` do not compile for an
+  unrelated reason, their protocol is not in mmt-dpi) contains no `_engine->`
+  and no other use of `rule_engine_t` than the cast above. 222 of their 223
+  `.so` list `mmt_sec_rule_engine_get_msg_values` as an undefined symbol; the
+  other one, `properties_all/26.ip_scan`, has no guard that reads the current
+  message, so it does not call the accessor.
+
+`rule_engine_t` can therefore change without a `REQUIRE_PLUGIN` bump, as
+long as the accessor keeps its meaning (element i of the returned array is
+the data of `rule_info_t.proto_atts[i]` in the message being verified, or
+NULL; the array is NULL when the rule has no `proto_atts`).
+
+`VERSION` and `REQUIRE_PLUGIN` are 1.2.22: a 1.2.21 rule still reads
+`rule_engine_t.msg_values` at offset 120, so the engine must refuse it
+before the struct changes again. Both directions are now clean:
+
+| rule | engine | result |
+|---|---|---|
+| 1.2.21 (3904b83c, guards read `msg_values@120`) | 1.2.22 | refused: "Ignored rule N as it is not up to date (built by version 1.2.21, this engine needs 1.2.22 or later)", exit 0 |
+| 1.2.22 | 1.2.21 or older, including the engines of `REQUIRE_PLUGIN` 1.2.7 that have no upper bound | `dlopen` fails before the version check: "Cannot open library: rules/6.SYNFUL.so. rules/6.SYNFUL.so: undefined symbol: mmt_sec_rule_engine_get_msg_values", and the engine halts (exit 1). Loud, not a wrong-memory read; `rule_info` halts the same way |
+| rule without a version stamp (`rule_info_t.version` NULL, a hand-made `.so`) | 1.2.22 | refused: "Ignored rule N as it has no version stamp (not built by compile_rule)" |
+
+The second row was measured with the engine and `rule_info` of 3904b83c.
+Their loader `dlopen`s with `RTLD_NOW`, as every engine since v1.2.0 does
+(`plugins_engine.c`), and the symbol exists in no engine before 1.2.22, so
+an older engine halts the same way. That closes the first limit of 1.2.21
+for most rules built from now on: an old engine cannot run them silently.
+Only for a `.so` that imports the accessor, though: a rule none of whose
+guards reads the current message (only constants or history `.N` values;
+`properties_all/26.ip_scan` is one) imports nothing new, so an engine of
+`REQUIRE_PLUGIN` 1.2.7 still loads it, with the risks of the first limit
+(its 104-byte `rule_info_t` array is indexed with a 96-byte stride). And an
+old engine halts rather than skipping the rule. So the "rebuild the rules
+with the engine" rule stays.
+`check/check-plugin-abi.sh` (`make check`) builds the rules of the first row
+with the `compile_rule` of 3904b83c (`MMT_SEC_ABI_BASE_1221`), and checks the
+third row and that the headers of the generated code (the include lines
+`gen_code.c` writes) keep the struct opaque.
+
+**Cost.** The accessor is a call, through the PLT, per guard evaluation that
+reads the current message, where 1.2.21 read a field. On
+`perf51.pcap` (100k packets, every rule of `rules/`, 0 alerts on both),
+taskset-pinned, median of 5, the 1.2.22 engine is 1.5 to 3.1 % slower
+than 3904b83c, depending on the core (the numbers and the options are in the
+fork PR that closes fork issue #56).
+
+`rule_abi.hash` (`mmt_sec_get_rule_abi_layout`, `src/lib/rule_build_info.c`)
+and the layout probe (`tools/dpi-id-stability/abi_layout.c`) now cover this
+whole surface: besides the structs of the table above, the instance-key
+tables (`fsm_instance_key_t`, `fsm_instance_key_component_t`), the fsm
+structs the generated code initialises (`fsm_delay_t`, `fsm_transition_t`,
+`fsm_state_t`), the `fsm_t` fields that its inline helpers read
+(`execution_trace`, `user_data`; not the size of `fsm_t`, which a rule never
+allocates), `mmt_memory_t`, the enum values the generated code compiles in
+(`FSM_EVENT_TYPE_TIMEOUT`, `FSM_ACTION_*`, `MMT_SEC_MSG_DATA_TYPE_*`,
+`RULE_TYPE_*`), and a `rule_engine_t:opaque{mmt_sec_rule_engine_get_msg_values}`
+entry for the accessor. `rule_info --abi` of 1.2.22 on aarch64:
+
+```
+sha256:4710cdd268f8c58c76f31723507d8e4768994557a1bc2a2f3bf6f7f920a332f0
+proto_attribute_t:32{proto@0:8,att@8:8,proto_id@16:4,att_id@20:4,data_type@24:4,dpi_type@28:4}
+rule_version_info_t:40{created_date@0:8,hash@8:8,number@16:8,index@24:4,dpi@32:8}
+rule_info_t:104{id@0:4,type_id@4:4,type_string@8:8,description@16:8,if_satisfied@24:8,if_not_satisfied@32:8,proto_atts_count@40:1,events_count@41:1,proto_atts@48:8,proto_atts_events@56:8,excluded_filter@64:8,create_instance@72:8,hash_message@80:8,version@88:8,instance_keys@96:8}
+message_element_t:24{proto_id@0:4,att_id@4:4,data_type@8:4,data@16:8}
+message_t:128{counter@0:8,timestamp@8:8,flow_id@16:8,elements@24:8,elements_count@32:2,hash@34:32,user_data@88:8}
+mmt_array_t:16{elements_count@0:8,data@8:8}
+fsm_instance_key_component_t:12{msg_att_index@0:2,his_event_id@2:2,his_att_index@4:2,data_type@8:4}
+fsm_instance_key_t:16{components_count@0:1,components@8:8}
+fsm_delay_t:48{time_min@0:8,time_max@8:8,time_min_sign@16:4,time_max_sign@20:4,counter_min@24:8,counter_max@32:8,counter_min_sign@40:4,counter_max_sign@44:4}
+fsm_transition_t:32{event_type@0:2,guard@8:8,action@16:4,target_state@24:8}
+fsm_state_t:88{delay@0:48,is_temporary@48:1,description@56:8,transitions@64:8,transitions_count@72:8,entry_action@80:4,exit_action@84:4}
+fsm_t{execution_trace@64:8,user_data@72:8}
+mmt_memory_t:16{ref_count@0:4,size@4:4,data@8:8}
+enums{FSM_EVENT_TYPE_TIMEOUT=0,FSM_ACTION_DO_NOTHING=0,FSM_ACTION_CREATE_INSTANCE=1,FSM_ACTION_RESET_TIMER=2,MMT_SEC_MSG_DATA_TYPE_NUMERIC=0,MMT_SEC_MSG_DATA_TYPE_STRING=1,MMT_SEC_MSG_DATA_TYPE_BINARY=2,RULE_TYPE_ATTACK=0,RULE_TYPE_SECURITY=1,RULE_TYPE_EVASION=2,RULE_TYPE_TEST=3}
+rule_engine_t:opaque{mmt_sec_rule_engine_get_msg_values}
+require_plugin:1.2.22
+```
+
+(One line per entry here; the real output has them on one line, separated by
+`;`.) The functions a rule calls (`fsm_init`, `mmt_mem_alloc`, `mmt_sec_log`,
+...) are part of the ABI too; their signatures are not hashed, and the
+`dlopen` with `RTLD_NOW` refuses a rule that needs a function the engine
+does not export.
 
 ## Recommendations
 
@@ -698,39 +812,61 @@ Counts of `to`. Protocols and attributes are counted separately; an attribute of
 
 ### `abi-layout.sh`
 
+Run as `tools/dpi-id-stability/abi-layout.sh $(git tag -l 'v1.2.*' | sort -V) 97441d79 3904b83c 4e21362d`
+(the tags, then three fork commits), on aarch64:
+
 ```
-v1.2.0   258c7ee2bc05 REQUIRE_PLUGIN=1.2.0
-v1.2.1   258c7ee2bc05 REQUIRE_PLUGIN=1.2.0
-v1.2.2   258c7ee2bc05 REQUIRE_PLUGIN=1.2.0
-v1.2.4   258c7ee2bc05 REQUIRE_PLUGIN=1.2.0
-v1.2.5   258c7ee2bc05 REQUIRE_PLUGIN=1.2.0
-v1.2.6   33532676bdd5 REQUIRE_PLUGIN=1.2.7
+v1.2.0   16d8b2bd7388 REQUIRE_PLUGIN=1.2.0
+v1.2.1   16d8b2bd7388 REQUIRE_PLUGIN=1.2.0
+v1.2.2   16d8b2bd7388 REQUIRE_PLUGIN=1.2.0
+v1.2.4   4e03282b759a REQUIRE_PLUGIN=1.2.0
+    < enums FSM_EVENT_TYPE_TIMEOUT=0 FSM_ACTION_DO_NOTHING=0 FSM_ACTION_CREATE_INSTANCE=1 FSM_ACTION_RESET_TIMER=2 NUMERIC=0 STRING=1 VOID=2 RULE_TYPE_ATTACK=0 RULE_TYPE_SECURITY=1 RULE_TYPE_EVASION=2 RULE_TYPE_TEST=3
+    > enums FSM_EVENT_TYPE_TIMEOUT=0 FSM_ACTION_DO_NOTHING=0 FSM_ACTION_CREATE_INSTANCE=1 FSM_ACTION_RESET_TIMER=2 MMT_SEC_MSG_DATA_TYPE_NUMERIC=0 MMT_SEC_MSG_DATA_TYPE_STRING=1 MMT_SEC_MSG_DATA_TYPE_BINARY=2 RULE_TYPE_ATTACK=0 RULE_TYPE_SECURITY=1 RULE_TYPE_EVASION=2 RULE_TYPE_TEST=3
+v1.2.5   4e03282b759a REQUIRE_PLUGIN=1.2.0
+v1.2.6   6a95e6b901cb REQUIRE_PLUGIN=1.2.7
     < message_t 64 counter@0:8 timestamp@8:8 elements@16:8 elements_count@24:2 hash@32:8
     > message_t 128 counter@0:8 timestamp@8:8 elements@24:8 elements_count@32:2 hash@40:8
-v1.2.7   33532676bdd5 REQUIRE_PLUGIN=1.2.7
-v1.2.8   33532676bdd5 REQUIRE_PLUGIN=1.2.7
-v1.2.9   33532676bdd5 REQUIRE_PLUGIN=1.2.7
-v1.2.10  33532676bdd5 REQUIRE_PLUGIN=1.2.7
-v1.2.11  33532676bdd5 REQUIRE_PLUGIN=1.2.7
-v1.2.12  33532676bdd5 REQUIRE_PLUGIN=1.2.7
-v1.2.13  4e1647eaf219 REQUIRE_PLUGIN=1.2.7
+v1.2.7   6a95e6b901cb REQUIRE_PLUGIN=1.2.7
+v1.2.8   6a95e6b901cb REQUIRE_PLUGIN=1.2.7
+v1.2.9   6a95e6b901cb REQUIRE_PLUGIN=1.2.7
+v1.2.10  6a95e6b901cb REQUIRE_PLUGIN=1.2.7
+v1.2.11  6a95e6b901cb REQUIRE_PLUGIN=1.2.7
+v1.2.12  6a95e6b901cb REQUIRE_PLUGIN=1.2.7
+v1.2.13  a9728e9cf6fa REQUIRE_PLUGIN=1.2.7
     < message_t 128 counter@0:8 timestamp@8:8 elements@24:8 elements_count@32:2 hash@40:8
     > message_t 128 counter@0:8 timestamp@8:8 elements@24:8 elements_count@32:2 hash@34:32
-v1.2.14  4e1647eaf219 REQUIRE_PLUGIN=1.2.7
-v1.2.15  4e1647eaf219 REQUIRE_PLUGIN=1.2.7
-v1.2.16  4e1647eaf219 REQUIRE_PLUGIN=1.2.7
-v1.2.17  4e1647eaf219 REQUIRE_PLUGIN=1.2.7
-v1.2.18  4e1647eaf219 REQUIRE_PLUGIN=1.2.7
-v1.2.19  4e1647eaf219 REQUIRE_PLUGIN=1.2.7
-v1.2.20  4e1647eaf219 REQUIRE_PLUGIN=1.2.7
-1.2.21   d349efdf8661 REQUIRE_PLUGIN=1.2.21
+v1.2.14  a9728e9cf6fa REQUIRE_PLUGIN=1.2.7
+v1.2.15  a9728e9cf6fa REQUIRE_PLUGIN=1.2.7
+v1.2.16  a9728e9cf6fa REQUIRE_PLUGIN=1.2.7
+v1.2.17  a9728e9cf6fa REQUIRE_PLUGIN=1.2.7
+v1.2.18  a9728e9cf6fa REQUIRE_PLUGIN=1.2.7
+v1.2.19  a9728e9cf6fa REQUIRE_PLUGIN=1.2.7
+v1.2.20  a9728e9cf6fa REQUIRE_PLUGIN=1.2.7
+97441d79 d0f0681b5ed9 REQUIRE_PLUGIN=1.2.7
+    < rule_engine_t not read
+    > rule_engine_t 112 msg_values@96:8
+3904b83c 1b7612cea617 REQUIRE_PLUGIN=1.2.21
     < rule_info_t 96 id@0:4 type_id@4:4 type_string@8:8 description@16:8 if_satisfied@24:8 if_not_satisfied@32:8 proto_atts_count@40:1 events_count@41:1 proto_atts@48:8 proto_atts_events@56:8 excluded_filter@64:8 create_instance@72:8 hash_message@80:8 version@88:8
-    > rule_info_t 104 id@0:4 type_id@4:4 type_string@8:8 description@16:8 if_satisfied@24:8 if_not_satisfied@32:8 proto_atts_count@40:1 events_count@41:1 proto_atts@48:8 proto_atts_events@56:8 excluded_filter@64:8 create_instance@72:8 hash_message@80:8 version@88:8
+    > rule_info_t 104 id@0:4 type_id@4:4 type_string@8:8 description@16:8 if_satisfied@24:8 if_not_satisfied@32:8 proto_atts_count@40:1 events_count@41:1 proto_atts@48:8 proto_atts_events@56:8 excluded_filter@64:8 create_instance@72:8 hash_message@80:8 version@88:8 instance_keys@96:8
+    > fsm_instance_key_component_t 12 msg_att_index@0:2 his_event_id@2:2 his_att_index@4:2 data_type@8:4
+    > fsm_instance_key_t 16 components_count@0:1 components@8:8
+    < rule_engine_t 112 msg_values@96:8
+    > rule_engine_t 136 msg_values@120:8
+4e21362d 66f8656a8e4b REQUIRE_PLUGIN=1.2.22
+    < rule_engine_t 136 msg_values@120:8
+    > rule_engine_t opaque mmt_sec_rule_engine_get_msg_values
 ```
 
-1.2.21 is not a tag: it is the fork tree after the #51 instance index
-(PR #55), probed the same way. The probe measures `sizeof( rule_info_t )`
-but not the `instance_keys` field, and does not cover `rule_engine_t`, whose
-`msg_values` the generated guards also read (section "`rule_engine_t` is
-part of the plugin ABI" above). Before this change the tree stamped 1.2.20
-with the v1.2.20 layout (4e1647eaf219).
+97441d79, 3904b83c and 4e21362d are not tags: 97441d79 is the fork before
+the #51 instance index (stamped 1.2.20, with `REQUIRE_PLUGIN` 1.2.7, and the
+first tree whose guards read `rule_engine_t.msg_values`); 3904b83c is the
+fork after it (PR #55, stamped 1.2.21); 4e21362d is the fork after #56
+(stamped 1.2.22), where the guards call `mmt_sec_rule_engine_get_msg_values`.
+Since #56 the probe also prints `rule_info_t.instance_keys`, the fields of
+`mmt_array_t`, the instance-key structs (from 3904b83c on), the fsm structs
+(`fsm_t` by field only), `mmt_memory_t`, the enum values the generated code
+compiles in, and what the guards read of `rule_engine_t`, so its hashes
+differ from those of the A0 run (the v1.2.20 layout was `4e1647eaf219`).
+The fsm structs, `mmt_memory_t` and the enum values did not change at any
+tag; at v1.2.4 the data types were only renamed (`NUMERIC, STRING, VOID` to
+`MMT_SEC_MSG_DATA_TYPE_NUMERIC, _STRING, _BINARY`, same values).

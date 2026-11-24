@@ -35,7 +35,7 @@ This document provides comprehensive instructions for an AI agent to perform a c
 
 ### Version Information
 
-- **Current Version**: 1.2.21 (`VERSION` in the Makefile; rules must be rebuilt with the engine, see doc/rule-abi-stability.md)
+- **Current Version**: 1.2.22 (`VERSION` in the Makefile; rules must be rebuilt with the engine, see doc/rule-abi-stability.md)
 - **Build System**: GNU Make
 - **Primary Platform**: Linux (Debian/Ubuntu), partial macOS support
 - **Default Installation Path**: `/opt/mmt/security`
@@ -1203,5 +1203,5 @@ sudo make uninstall               # Remove installation
 
 - **Version**: 1.0
 - **Last Updated**: January 2026
-- **Target Project Version**: MMT-Security 1.2.21
+- **Target Project Version**: MMT-Security 1.2.22
 - **MMT-DPI Version**: 1.10.3 or later (`MIN_DPI_VERSION` in the Makefile)

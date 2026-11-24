@@ -1,25 +1,36 @@
 #!/usr/bin/env bash
-# Plugin ABI gate of the rule loader (fork #51, PR #55 review finding 1),
-# run by `make check` as target check-plugin-abi.
+# Plugin ABI gate of the rule loader (fork #51, PR #55 review finding 1;
+# fork #56), run by `make check` as target check-plugin-abi.
 #
-# A rule .so shares rule_info_t (plugin_header.h) and, through the guards
-# that include rule_verif_engine.h, rule_engine_t with the engine. A rule
-# built for another layout must be refused by the loader with a warning,
-# never loaded (loading one is undefined behaviour: SIGSEGV in
+# A rule .so shares rule_info_t (plugin_header.h), the structs of
+# message_t.h and mmt_fsm.h, and the functions it calls with the engine.
+# Since 1.2.22 rule_engine_t is not among them: the generated guards read
+# the message values through mmt_sec_rule_engine_get_msg_values(), and
+# rule_verif_engine.h, which they include, keeps the struct opaque. A 1.2.21
+# rule still reads rule_engine_t.msg_values at its compiled-in offset.
+# A rule built for another layout must be refused by the loader with a
+# warning, never loaded (loading one is undefined behaviour: SIGSEGV in
 # rule_engine_init or inside the generated guards). The loader keeps a rule
 # whose stamp (rule_version_info_t.index, the version of the compile_rule
 # that built it) is in [REQUIRE_PLUGIN, version of the engine]:
 #  - older: rules built by compile_rule of $MMT_SEC_ABI_BASE (default
 #    97441d79, the last commit before instance_keys, which stamped 1.2.20
-#    with the old layout). That needs the commit in the clone (not in a
-#    shallow CI checkout); without it, the leg builds the rules with this
-#    tree's compile_rule stamped 1.2.20 instead, which checks the lower
-#    bound but not the old layout;
+#    with the old layout);
+#  - 1.2.21: rules built by compile_rule of $MMT_SEC_ABI_BASE_1221
+#    (default 3904b83c, the last commit whose guards read
+#    rule_engine_t.msg_values, stamped 1.2.21).
+#    Both need the commit in the clone (not in a shallow CI checkout);
+#    without it, the leg builds the rules with this tree's compile_rule
+#    stamped 1.2.20 or 1.2.21 instead, which checks the lower bound but
+#    not the old layout;
 #  - newer: rules built by this tree's compile_rule stamped one patch
 #    version above the engine (a scratch copy built with VERSION=x.y.z+1).
-# In both legs the engine must load no rule, name each refused rule, and
+# In these legs the engine must load no rule, name each refused rule, and
 # exit 0 on a capture; rule_info must refuse them too. A control leg with
-# this tree's rules must alert, so the capture does exercise the rules.
+# this tree's rules must alert, so the capture does exercise the rules,
+# and its .so must call the accessor. A hand-made plugin whose rule has no
+# version stamp (a NULL rule_info_t.version) is refused too, and a guard
+# that dereferenced rule_engine_t would not compile.
 # 6.SYNFUL.so holds two rules: the loader must not index an array of
 # another layout beyond its first rule. Each refused leg also holds 9101
 # (check/timeout) built by this tree: a rule of the right version in the
@@ -34,6 +45,8 @@ COMPILE_RULE=$(realpath "${1:-./compile_rule}")
 STANDALONE=$(realpath "${2:-./mmt_sec_standalone}")
 RULE_INFO=$(realpath "${3:-./rule_info}")
 BASE=${MMT_SEC_ABI_BASE:-97441d79}
+BASE_1221=${MMT_SEC_ABI_BASE_1221:-3904b83c}
+CC=${CC:-gcc}
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 status=0
@@ -136,24 +149,99 @@ for id in $IDS; do
 done
 echo "  control (this tree's rules): $n alert(s)"
 
-# older: rules of the layout before instance_keys
+# the .so of this tree reach rule_engine_t through the accessor only
 leg=0
-O=$TMP/older
-if git -C "$ROOT" cat-file -e "$BASE^{commit}" 2>/dev/null; then
-	mkdir -p "$O/tree"
-	git -C "$ROOT" archive "$BASE" Makefile src | tar -C "$O/tree" -xf - \
-		|| fail "older: git archive $BASE failed"
-	what="older ($BASE, stamped $(git -C "$ROOT" show "$BASE:Makefile" | sed -n 's/^VERSION *:= *//p'), old layout)"
-	build_compile_rule "$O/tree" || fail "older: compile_rule of $BASE does not build"
+if ! command -v nm > /dev/null; then
+	fail "control: nm (binutils) not found"
 else
-	echo "  older: commit $BASE not in this clone: stamping 1.2.20 with this tree's layout"
-	copy_tree "$O/tree" || fail "older: copy failed"
-	what="older (stamped 1.2.20, this layout)"
-	build_compile_rule "$O/tree" VERSION=1.2.20 || fail "older: compile_rule VERSION=1.2.20 does not build"
+	for x in $RULES; do
+		nm -D --undefined-only "$C/rules/$x.so" | grep -qw mmt_sec_rule_engine_get_msg_values \
+			|| fail "control: rules/$x.so does not call mmt_sec_rule_engine_get_msg_values"
+	done
 fi
-if [ $leg -eq 0 ]; then
-	compile_rules "$O/tree" "$O/rules" || fail "$what: compile_rule failed"
-	[ $leg -eq 0 ] && check_refused "$O" "it is not up to date" "$what"
+# the headers of the generated guards (the include lines that gen_code.c
+# writes) keep rule_engine_t opaque: a guard reading its layout does not
+# compile, for the reason "incomplete type"
+inc=$(sed -n 's/.*fprintf( *fd, *"\(#include <string.h>.*\)");$/\1/p' src/lib/gen_code.c | sed 's/\\n/\n/g; s/\\"/"/g')
+if [ -z "$inc" ]; then
+	fail "opaque: the include lines of the generated code not found in src/lib/gen_code.c"
+else
+	printf '%s\nconst void *f( const rule_engine_t *e ){ return e; }\n' "$inc" > "$TMP/opaque-ok.c"
+	printf '%s\nsize_t f( const rule_engine_t *e ){ return sizeof( *e ); }\n' "$inc" > "$TMP/opaque-ko.c"
+	# $CC unquoted: it may be "ccache gcc"
+	if ! $CC -fsyntax-only -I src/lib -I src/dpi -I "${MMT_DPI_DIR:-/opt/mmt/dpi}/include" "$TMP/opaque-ok.c" > "$TMP/opaque-ok.log" 2>&1; then
+		tail -3 "$TMP/opaque-ok.log" | sed 's/^/    | /'
+		fail "opaque: the includes of the generated code do not compile ($CC)"
+	elif $CC -fsyntax-only -I src/lib -I src/dpi -I "${MMT_DPI_DIR:-/opt/mmt/dpi}/include" "$TMP/opaque-ko.c" > "$TMP/opaque-ko.log" 2>&1; then
+		fail "opaque: the generated code sees the definition of rule_engine_t: the guards can read its layout"
+	elif ! grep -q "incomplete type" "$TMP/opaque-ko.log"; then
+		tail -3 "$TMP/opaque-ko.log" | sed 's/^/    | /'
+		fail "opaque: sizeof( rule_engine_t ) fails for another reason than an incomplete type"
+	fi
+fi
+[ $leg -eq 0 ] && echo "  this tree's rules call the accessor; rule_engine_t is opaque to them"
+
+# rules built by compile_rule of commit $2, or by this tree's stamped $3
+older_leg(){ # name commit stamp layout
+	local name=$1 base=$2 stamp=$3 layout=$4 d=$TMP/$1
+	leg=0
+	if git -C "$ROOT" cat-file -e "$base^{commit}" 2>/dev/null; then
+		mkdir -p "$d/tree"
+		git -C "$ROOT" archive "$base" Makefile src | tar -C "$d/tree" -xf - \
+			|| fail "$name: git archive $base failed"
+		what="$name ($base, stamped $(git -C "$ROOT" show "$base:Makefile" | sed -n 's/^VERSION *:= *//p'), $layout)"
+		build_compile_rule "$d/tree" || fail "$name: compile_rule of $base does not build"
+	else
+		echo "  $name: commit $base not in this clone: stamping $stamp with this tree's layout"
+		copy_tree "$d/tree" || fail "$name: copy failed"
+		what="$name (stamped $stamp, this layout)"
+		build_compile_rule "$d/tree" VERSION="$stamp" || fail "$name: compile_rule VERSION=$stamp does not build"
+	fi
+	if [ $leg -eq 0 ]; then
+		compile_rules "$d/tree" "$d/rules" || fail "$what: compile_rule failed"
+		[ $leg -eq 0 ] && check_refused "$d" "it is not up to date" "$what"
+	fi
+}
+# older: rules of the layout before instance_keys
+older_leg older "$BASE" 1.2.20 "old layout"
+# 1.2.21: guards that read rule_engine_t.msg_values at its 1.2.21 offset
+older_leg 1.2.21 "$BASE_1221" 1.2.21 "guards read rule_engine_t"
+
+# no version stamp: a hand-made plugin whose rule_info_t.version is NULL
+leg=0
+V=$TMP/noversion
+mkdir -p "$V/rules" "$V/out"
+cat > "$V/noversion.c" <<'CEOF'
+#include "plugin_header.h"
+static const rule_info_t rules[] = {{ .id = 9301, .description = "no version stamp" }};
+size_t mmt_sec_get_plugin_info( const rule_info_t **r ){ *r = rules; return 1; }
+CEOF
+# with rule 9101 of this tree, which must still load (see check_refused)
+if ! $CC -fPIC -shared -I src/lib -I src/dpi -o "$V/rules/9301.so" "$V/noversion.c" > "$V/cc.log" 2>&1; then
+	tail -3 "$V/cc.log" | sed 's/^/    | /'
+	fail "no version: the plugin does not compile"
+elif ! "$COMPILE_RULE" "$V/rules/9101.so" check/timeout/9101.xml > "$V/9101.log" 2>&1; then
+	fail "no version: rule 9101 of this tree does not compile"
+else
+	rc=0
+	( cd "$V" && timeout -s KILL 120 "$STANDALONE" -t "$ROOT/check/pcap/6.SYNFUL.pcap" -f "$V/out/" ) > "$V/run.log" 2>&1 || rc=$?
+	if [ $rc -ne 0 ]; then
+		tail -5 "$V/run.log" | sed 's/^/    | /'
+		fail "no version: mmt_sec_standalone exited $rc"
+	fi
+	grep -q "Ignored rule 9301 as it has no version stamp" "$V/run.log" \
+		|| fail "no version: no \"Ignored rule 9301 as it has no version stamp\" warning"
+	! grep -q "Ignored rule 9101\|no security rules" "$V/run.log" \
+		|| fail "no version: rule 9101 of this tree was not loaded"
+	rc=0
+	( cd "$V" && timeout -s KILL 60 "$RULE_INFO" rules/9301.so ) > "$V/info.log" 2>&1 || rc=$?
+	if [ $rc -ne 0 ]; then
+		tail -3 "$V/info.log" | sed 's/^/    | /'
+		fail "no version: rule_info rules/9301.so exited $rc"
+	elif ! grep -q "^Found 0 rule" "$V/info.log"; then
+		fail "no version: rule_info lists the rule of rules/9301.so"
+	fi
+	[ $leg -eq 0 ] && echo "  no version stamp: refused, exit 0"
 fi
 
 # newer: rules stamped one patch version above this engine

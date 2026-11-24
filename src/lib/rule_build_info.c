@@ -21,6 +21,8 @@
 
 #include "rule_build_info.h"
 #include "plugin_header.h"
+#include "mmt_fsm.h"
+#include "mmt_alloc.h"
 #include "version.h"
 
 /* ---------------------------------------------------------------------------
@@ -270,6 +272,52 @@ const char *mmt_sec_get_rule_abi_layout( void ){
 	_S(mmt_array_t);
 	_F(mmt_array_t, elements_count); _F(mmt_array_t, data);
 	_E();
+	//the instance-key tables the generated code initialises
+	_S(fsm_instance_key_component_t);
+	_F(fsm_instance_key_component_t, msg_att_index); _F(fsm_instance_key_component_t, his_event_id);
+	_F(fsm_instance_key_component_t, his_att_index); _F(fsm_instance_key_component_t, data_type);
+	_E();
+	_S(fsm_instance_key_t);
+	_F(fsm_instance_key_t, components_count); _F(fsm_instance_key_t, components);
+	_E();
+	//the fsm states and transitions the generated code initialises
+	_S(fsm_delay_t);
+	_F(fsm_delay_t, time_min); _F(fsm_delay_t, time_max);
+	_F(fsm_delay_t, time_min_sign); _F(fsm_delay_t, time_max_sign);
+	_F(fsm_delay_t, counter_min); _F(fsm_delay_t, counter_max);
+	_F(fsm_delay_t, counter_min_sign); _F(fsm_delay_t, counter_max_sign);
+	_E();
+	_S(fsm_transition_t);
+	_F(fsm_transition_t, event_type); _F(fsm_transition_t, guard);
+	_F(fsm_transition_t, action); _F(fsm_transition_t, target_state);
+	_E();
+	_S(fsm_state_t);
+	_F(fsm_state_t, delay); _F(fsm_state_t, is_temporary); _F(fsm_state_t, description);
+	_F(fsm_state_t, transitions); _F(fsm_state_t, transitions_count);
+	_F(fsm_state_t, entry_action); _F(fsm_state_t, exit_action);
+	_E();
+	//the fields of fsm_t that the inline helpers of the guards read
+	//(fsm_get_history, fsm_get_user_data). Not its size: a rule never
+	//allocates an fsm_t (fsm_init does), so engine-private fields may be
+	//appended without an ABI change
+	first = 0;
+	_buf_add( &b, ";fsm_t{" );
+	_F(fsm_t, execution_trace); _F(fsm_t, user_data);
+	_E();
+	//the header of the mmt_mem_alloc buffers (mmt_mem_size, mmt_mem_cmp)
+	_S(mmt_memory_t);
+	_F(mmt_memory_t, ref_count); _F(mmt_memory_t, size); _F(mmt_memory_t, data);
+	_E();
+	//the enum values that the generated code compiles in
+	_buf_printf( &b, ";enums{FSM_EVENT_TYPE_TIMEOUT=%d,FSM_ACTION_DO_NOTHING=%d,FSM_ACTION_CREATE_INSTANCE=%d,FSM_ACTION_RESET_TIMER=%d"
+			",MMT_SEC_MSG_DATA_TYPE_NUMERIC=%d,MMT_SEC_MSG_DATA_TYPE_STRING=%d,MMT_SEC_MSG_DATA_TYPE_BINARY=%d"
+			",RULE_TYPE_ATTACK=%d,RULE_TYPE_SECURITY=%d,RULE_TYPE_EVASION=%d,RULE_TYPE_TEST=%d}",
+			FSM_EVENT_TYPE_TIMEOUT, FSM_ACTION_DO_NOTHING, FSM_ACTION_CREATE_INSTANCE, FSM_ACTION_RESET_TIMER,
+			MMT_SEC_MSG_DATA_TYPE_NUMERIC, MMT_SEC_MSG_DATA_TYPE_STRING, MMT_SEC_MSG_DATA_TYPE_BINARY,
+			RULE_TYPE_ATTACK, RULE_TYPE_SECURITY, RULE_TYPE_EVASION, RULE_TYPE_TEST );
+	//rule_engine_t is opaque to the rules (since 1.2.22): the guards read
+	//the message values through this exported function, not a field offset
+	_buf_add( &b, ";rule_engine_t:opaque{mmt_sec_rule_engine_get_msg_values}" );
 	_buf_printf( &b, ";require_plugin:%s", mmt_sec_get_required_plugin_version() );
 
 	layout = b.s;
