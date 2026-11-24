@@ -157,10 +157,12 @@ static void _iterate_event_to_gen_guards( void *key, void *data, void *user_data
 		mmt_map_iterate( map, _count_current_message_variable, _u_data );
 		if( _u_data->uint16_val > 0 ){
 			//#msg_values was resolved once per message in rule_engine_process;
-			//the guard reaches the engine through fsm->user_data
-			fprintf(fd, "\n\t const rule_engine_t *_engine = (const rule_engine_t *) fsm_get_user_data( fsm );");
-			fprintf(fd, "\n\t if( unlikely( _engine == NULL || _engine->msg_values == NULL )) return 0;");
-			fprintf(fd, "\n\t const void * const *_mv = _engine->msg_values;");
+			//the guard reaches the engine through fsm->user_data. rule_engine_t
+			//is opaque to the generated code (rule_verif_engine.h): the guard
+			//reads #msg_values through the exported accessor, never through a
+			//field offset, so the struct stays out of the plugin ABI
+			fprintf(fd, "\n\t const void * const *_mv = mmt_sec_rule_engine_get_msg_values( (const rule_engine_t *) fsm_get_user_data( fsm ));");
+			fprintf(fd, "\n\t if( unlikely( _mv == NULL )) return 0;");
 		}
 
 		//fetch once each distinct history message the variables refer to,

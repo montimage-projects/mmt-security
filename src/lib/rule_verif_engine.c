@@ -4,7 +4,7 @@
  *  Created on: Oct 14, 2016
  *  Created by: Huu Nghia NGUYEN <huunghia.nguyen@montimage.com>
  */
-#include "rule_verif_engine.h"
+#include "rule_verif_engine_internal.h"
 #include "prefetch.h"
 #include "mmt_fsm.h"
 #include "mmt_security.h"
@@ -422,6 +422,14 @@ const mmt_array_t* rule_engine_get_valide_trace( const rule_engine_t *engine ){
 
 	rule_engine_t *_engine = ( rule_engine_t *)engine;
 	return _engine->valid_execution_trace;
+}
+
+//exported, never inline: the generated guards call it instead of reading
+//the field, so that rule_engine_t is not part of the plugin ABI
+const void * const *mmt_sec_rule_engine_get_msg_values( const rule_engine_t *engine ){
+	if( unlikely( engine == NULL ))
+		return NULL;
+	return engine->msg_values;
 }
 
 

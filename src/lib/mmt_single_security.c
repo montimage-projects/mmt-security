@@ -24,6 +24,8 @@
 
 #include "../dpi/mmt_dpi.h"
 #include "mmt_single_security.h"
+//events_count and events_hash of rule_engine_t
+#include "rule_verif_engine_internal.h"
 #include "mmt_security.h"
 
 
