@@ -30,7 +30,7 @@ GIT_VERSION := $(shell git log --format="%h" -n 1 2>/dev/null)
 ifeq ($(GIT_VERSION),)
   GIT_VERSION := nogit
 endif
-VERSION     := 1.2.21
+VERSION     := 1.2.22
 # minimum MMT-DPI version required by the deb and rpm packages (readme.md):
 # the latest release, the one CI tests (DPI_VERSION in .github/workflows/c-cpp.yml)
 MIN_DPI_VERSION := 1.10.3

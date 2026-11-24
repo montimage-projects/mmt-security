@@ -13,14 +13,19 @@
 #endif
 
 //update this number when structure of plugin has been changed: the rule
-//.so share rule_info_t (plugin_header.h) and, through the generated guards
-//that include rule_verif_engine.h, rule_engine_t with the engine.
+//.so share rule_info_t (plugin_header.h), the structs of message_t.h,
+//mmt_array_t.h and mmt_fsm.h, and the functions they call, with the
+//engine (doc/rule-abi-stability.md).
 //It must be greater than every version stamp a compile_rule of the old
-//layout could have written: 1.2.20 was stamped both before and after the
-//instance_keys change, so the bump is to 1.2.21 (VERSION in the Makefile).
+//layout could have written. 1.2.21: rule_info_t.instance_keys (1.2.20 was
+//stamped both before and after it). 1.2.22: the generated guards read
+//the message values through mmt_sec_rule_engine_get_msg_values() and no
+//longer through the rule_engine_t offset that the guards of a 1.2.21 rule
+//have compiled in, so rule_engine_t left the plugin ABI and 1.2.21 rules
+//are refused. VERSION in the Makefile.
 //The loader also refuses rules stamped newer than this engine
 //(plugins_engine.c), so a rule must be rebuilt with its engine.
-#define REQUIRE_PLUGIN "1.2.21"
+#define REQUIRE_PLUGIN "1.2.22"
 
 
 #define __NOW__   __DATE__ " " __TIME__
