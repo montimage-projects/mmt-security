@@ -267,8 +267,9 @@ ifdef STATIC_LINK
 #here we got a list of rule files
 RULE_OBJS := $(patsubst %.xml,%.o, $(RULE_XML))
 
-#Generate code C of a rule
-rules/%.c: compile_rule
+#Generate code C of a rule; the .xml is a prerequisite for the same
+# reason as in rules/%.so below (fork #70)
+rules/%.c: rules/%.xml compile_rule
 	$(QUIET) echo [COMPILE] rules/$*.xml
 	$(QUIET) ./$(MAIN_GEN_PLUGIN) $@ rules/$*.xml -c > /dev/null 2>&1
 
@@ -338,7 +339,10 @@ endif
 # '-fsanitize=address -fsanitize=undefined' - still reach it as one shell
 # word, and left absent entirely when empty (an "" would add a stray
 # argument and a trailing space in the recorded cflags).
-rules/%.so: compile_rule $(FLAVOR_DEP)
+# The .xml is a normal prerequisite: without it a `make` after a rule
+# edit kept the stale .so and `make check` tested the old rule (fork #70).
+# compile_rule is the generator input; a rebuilt one regenerates every rule.
+rules/%.so: rules/%.xml compile_rule $(FLAVOR_DEP)
 	$(QUIET) ./$(MAIN_GEN_PLUGIN) rules/$*.so rules/$*.xml $(if $(RULE_GCC_ARGS),"$(RULE_GCC_ARGS)")
 	
 sample_rules: $(SAMPLE_RULES)
@@ -677,6 +681,13 @@ check-tsan:
 check: check-flavor
 check-flavor:
 	@./check/check-flavor.sh
+
+# a touched rules/%.xml must rebuild its rules/%.so (and only it), a second
+# make must be a no-op, and a newer compile_rule rebuilds every rule; the
+# STATIC_LINK rules/%.c tracks its .xml the same way (fork #70)
+check: check-rule-deps
+check-rule-deps: _prepare
+	@./check/check-rule-deps.sh
 
 _csv.%: _prepare
 	$(QUIET) $(RM) /tmp/mmt-security*.csv
