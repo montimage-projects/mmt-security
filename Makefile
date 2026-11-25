@@ -200,11 +200,42 @@ $(MMT_DPI_DIR):
 	@echo "ERROR: Not found MMT-DPI at folder $(MMT_DPI_DIR).\n"
 	@exit 1
 	
-#Generate a DPI header, so mmt-security does not depend on mmt-dpi after having the header
-gen_dpi $(MMT_DPI_HEADER): $(MMT_DPI_DIR)
+# always-out-of-date prerequisite: it lets the header recipe below run on
+# every make, so the header tracks the installed DPI instead of file mtimes
+# (fork #70)
+.PHONY: FORCE
+FORCE:
+
+#The generator is a real target: its source is a prerequisite, so editing
+# main_gen_dpi.c relinks the binary (fork #70)
+$(MAIN_DPI): $(SRCDIR)/main_gen_dpi.c | $(MMT_DPI_DIR)
 	$(QUIET) $(CC) -I$(MMT_DPI_DIR)/include -L$(MMT_DPI_DIR)/lib -o $(MAIN_DPI) $(SRCDIR)/main_gen_dpi.c -l:libmmt_core.so -ldl
-	$(QUIET) echo ">>> Generate list of protocols and their attributes to $(MMT_DPI_HEADER)"
-	$(QUIET) ./$(MAIN_DPI) $(MMT_DPI_HEADER)
+
+#Generate a DPI header, so mmt-security does not depend on mmt-dpi after having the header.
+# The header is tracked so it is readable without mmt-dpi, but when
+# $(MMT_DPI_DIR) exists the installed DPI is authoritative (fork #70):
+# regenerate into a temp file on every make and replace the tracked copy
+# only when the content differs - the first two lines (a timestamp and the
+# generator's own path) are volatile and skipped by the compare, so a
+# settled tree is a no-op and nothing rebuilds needlessly. A prerequisite
+# on $(MMT_DPI_DIR) alone could not do this: on a fresh clone the tracked
+# header is always newer than the install dir, so the stale copy always won.
+gen_dpi $(MMT_DPI_HEADER): $(MAIN_DPI) $(MMT_DPI_DIR) FORCE
+	$(QUIET) set -e; T="$(MMT_DPI_HEADER).new"; \
+		./$(MAIN_DPI) "$$T"; \
+		sed '1,2d' "$$T" > "$$T.n"; \
+		if [ -f "$(MMT_DPI_HEADER)" ]; then \
+			sed '1,2d' "$(MMT_DPI_HEADER)" > "$$T.o"; \
+		else \
+			: > "$$T.o"; \
+		fi; \
+		if cmp -s "$$T.n" "$$T.o"; then \
+			rm -f "$$T" "$$T.n" "$$T.o"; \
+		else \
+			echo ">>> Generate list of protocols and their attributes to $(MMT_DPI_HEADER)"; \
+			mv "$$T" "$(MMT_DPI_HEADER)"; \
+			rm -f "$$T.n" "$$T.o"; \
+		fi
 
 %.o: %.c $(FLAVOR_DEP) | $(MMT_DPI_HEADER)
 	@echo "[COMPILE] $(notdir $@)"
@@ -351,7 +382,10 @@ sample_rules: $(SAMPLE_RULES)
 # create a temporal folder
 TMP_DIR := build_mmt_security
 
-copy_files:
+# copy_files stages the built rules, binaries and libs: as a sibling
+# prerequisite of install/deb/rpm a parallel make could run it before
+# sample_rules finished and `cp rules/*.so` would fail (fork #70)
+copy_files: all sample_rules
 	$(QUIET) $(RM)    $(TMP_DIR) 2> /dev/null
 	$(QUIET) $(MKDIR) $(TMP_DIR)/rules
 	
@@ -507,7 +541,7 @@ clean: clean-rules
 			$(RULE_OBJS) $(TMP_DIR) $(FLAVOR_STAMP)
 
 clean-all: clean
-	$(QUIET) $(RM) $(MMT_DPI_HEADER)
+	$(QUIET) $(RM) $(MMT_DPI_HEADER) $(MMT_DPI_HEADER).new*
 	
 ################################################################################
 # Auto test 

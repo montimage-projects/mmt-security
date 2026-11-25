@@ -8,7 +8,13 @@
 #     that rule;
 #   - a second `make` is a no-op;
 #   - a newer compile_rule rebuilds every rule (the generator input);
-#   - rules/%.c, the STATIC_LINK intermediate, likewise tracks its .xml.
+#   - rules/%.c, the STATIC_LINK intermediate, likewise tracks its .xml;
+#   - the generated, tracked src/dpi/mmt_dpi.h matches what the installed
+#     MMT-DPI generates - on a fresh clone its checkout mtime is always
+#     newer than $(MMT_DPI_DIR), so a Makefile that regenerates only when
+#     the directory is newer keeps the stale copy forever and every rule
+#     embeds the attribute ids of a DPI other than the installed one
+#     (fork #70, review M1).
 # On a Makefile whose rules/%.so does not list its .xml, the touched rule
 # keeps its stale .so - the bug #70 reports - and this script fails.
 #
@@ -88,6 +94,32 @@ case "$out" in
 *"rules/dep_probe.c rules/dep_probe.xml"*) ;;
 *) fail "STATIC_LINK: touched rules/dep_probe.xml does not regen its .c (got: '$out')" ;;
 esac
+
+# leg 6: src/dpi/mmt_dpi.h matches what the installed MMT-DPI generates
+# (fork #70, review M1). Simulate a fresh clone - the tracked header newer
+# than $(MMT_DPI_DIR) - then ask make for the header by its real target
+# name ($(MMT_DPI_HEADER) is an absolute path). The reference is generated
+# by a generator compiled straight from source: the Makefile under test is
+# not trusted to produce it - on the base Makefile nothing regenerates
+# here, so the stale tracked copy is compared and fails.
+touch src/dpi/mmt_dpi.h
+make -j1 "$PWD/src/dpi/mmt_dpi.h" > "$TMP/hdr.log" 2>&1 || {
+	cat "$TMP/hdr.log"; fail "make src/dpi/mmt_dpi.h"; }
+# where the DPI is installed: the lib dir make exported, else the default
+DPI_LIB=${LD_LIBRARY_PATH:-/opt/mmt/dpi/lib}
+DPI_DIR=${DPI_LIB%%:*}
+DPI_DIR=${DPI_DIR%/lib}
+gcc -I"$DPI_DIR/include" -L"$DPI_DIR/lib" -o "$TMP/gen_dpi" src/main_gen_dpi.c \
+	-l:libmmt_core.so -ldl > "$TMP/gcc.log" 2>&1 || {
+	cat "$TMP/gcc.log"; fail "compiling src/main_gen_dpi.c"; }
+LD_LIBRARY_PATH="$DPI_DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+	"$TMP/gen_dpi" "$TMP/mmt_dpi.now.h" || fail "the DPI header generator failed"
+if [ -f "$TMP/mmt_dpi.now.h" ]; then
+	# the first two lines (timestamp, generator path) are volatile, as in the
+	# Makefile's own compare
+	cmp -s <(sed '1,2d' src/dpi/mmt_dpi.h) <(sed '1,2d' "$TMP/mmt_dpi.now.h") || \
+		fail "src/dpi/mmt_dpi.h is stale: it differs from what the installed MMT-DPI generates"
+fi
 
 if [ "$status" -eq 0 ]; then
 	echo "  => OK: a newer xml or compile_rule rebuilds exactly the rules it should"
