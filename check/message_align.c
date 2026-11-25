@@ -59,6 +59,14 @@ int main( void ){
 	 * 7 so the following header stays 8-aligned (issue #64 is about the
 	 * message block itself, not the element headers' natural alignment) */
 	atts_count = mmt_sec_get_unique_protocol_attributes( &atts );
+	/* a run without rules must not pass: mmt_sec_init then registers
+	 * nothing and every block below would be skipped, so the assertions of
+	 * issue #66 would hold vacuously - "no rules loaded" is a failure */
+	if( atts_count <= 3 ){
+		fprintf( stderr, "FAIL: only %zu proto.atts after mmt_sec_init: no rules loaded\n",
+				atts_count );
+		fails ++;
+	}
 	if( atts_count > 0 ){
 		const char payload[7] = "0123456";
 		if( set_element_data_message_t( msgs[0], atts[0]->proto_id,

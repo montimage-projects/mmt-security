@@ -182,17 +182,23 @@ static inline int dpi_message_set_void_data( const ipacket_t *pkt, const void *d
 
 	case FTP_LAST_COMMAND:
 		if ( proto_id == PROTO_FTP ){
+			//#data is a ftp_command_t; copy it first, it has no guaranteed
+			//alignment (fork #66)
+			ftp_command_t cmd;
+			memcpy( &cmd, data, sizeof( cmd ));
 			new_data_type = MMT_SEC_MSG_DATA_TYPE_STRING;
-			new_data      = ((ftp_command_t *)data)->str_cmd;
-			new_data_len  = strlen( ((ftp_command_t *)data)->str_cmd );
+			new_data      = cmd.str_cmd;
+			new_data_len  = strlen( cmd.str_cmd );
 		}
 		break;
 
 	case FTP_LAST_RESPONSE_CODE:
 		if ( proto_id == PROTO_FTP ){
+			ftp_response_t resp;
+			memcpy( &resp, data, sizeof( resp ));
 			new_data_type = MMT_SEC_MSG_DATA_TYPE_STRING;
-			new_data      = ((ftp_response_t *)data)->str_code;
-			new_data_len  = strlen( ((ftp_response_t *)data)->str_code );
+			new_data      = resp.str_code;
+			new_data_len  = strlen( resp.str_code );
 		}
 		break;
 
@@ -232,6 +238,17 @@ static inline int dpi_message_set_dpi_data( const void *data, int dpi_data_type,
 	const void *new_data= NULL;
 	size_t new_data_len = 0;
 	int new_data_type   = MMT_SEC_MSG_DATA_TYPE_BINARY;
+	/* #data can point inside the packed report mmt_sec_server receives on
+	 * the wire, i.e. at any alignment: the scalar values and the struct
+	 * fields below are read with memcpy into typed locals (fork #66) */
+	char     c8;
+	uint8_t  v8;
+	uint16_t v16;
+	uint32_t v32;
+	uint64_t v64;
+	float    f32;
+	uint32_t var_len;
+	mmt_header_line_t hline;
 
 	//does not exist data for this proto_id and att_id
 	if( unlikely( data == NULL ))
@@ -241,14 +258,16 @@ static inline int dpi_message_set_dpi_data( const void *data, int dpi_data_type,
 	case MMT_UNDEFINED_TYPE: /**< no type constant value */
 		break;
 	case MMT_DATA_CHAR: /**< 1 character constant value */
-		number = *(char *) data;
+		memcpy( &c8, data, sizeof( c8 ));
+		number = c8;
 		new_data_type = MMT_SEC_MSG_DATA_TYPE_NUMERIC;
 		new_data      = &number;
 		new_data_len  = sizeof( double );
 		break;
 
 	case MMT_U8_DATA: /**< unsigned 1-byte constant value */
-		number    = *(uint8_t *) data;
+		memcpy( &v8, data, sizeof( v8 ));
+		number = v8;
 		new_data_type = MMT_SEC_MSG_DATA_TYPE_NUMERIC;
 		new_data      = &number;
 		new_data_len  = sizeof( double );
@@ -256,28 +275,32 @@ static inline int dpi_message_set_dpi_data( const void *data, int dpi_data_type,
 
 	case MMT_DATA_PORT: /**< tcp/udp port constant value */
 	case MMT_U16_DATA: /**< unsigned 2-bytes constant value */
-		number    = *(uint16_t *) data;
+		memcpy( &v16, data, sizeof( v16 ));
+		number    = v16;
 		new_data_type = MMT_SEC_MSG_DATA_TYPE_NUMERIC;
 		new_data      = &number;
 		new_data_len  = sizeof( double );
 		break;
 
 	case MMT_U32_DATA: /**< unsigned 4-bytes constant value */
-		number    = *(uint32_t *) data;
+		memcpy( &v32, data, sizeof( v32 ));
+		number    = v32;
 		new_data_type = MMT_SEC_MSG_DATA_TYPE_NUMERIC;
 		new_data      = &number;
 		new_data_len  = sizeof( double );
 		break;
 
 	case MMT_U64_DATA: /**< unsigned 8-bytes constant value */
-		number    = *(uint64_t *) data;
+		memcpy( &v64, data, sizeof( v64 ));
+		number    = v64;
 		new_data_type = MMT_SEC_MSG_DATA_TYPE_NUMERIC;
 		new_data      = &number;
 		new_data_len  = sizeof( double );
 		break;
 
 	case MMT_DATA_FLOAT: /**< float constant value */
-		number   =  *(float *) data;
+		memcpy( &f32, data, sizeof( f32 ));
+		number   =  f32;
 		new_data_type = MMT_SEC_MSG_DATA_TYPE_NUMERIC;
 		new_data      = &number;
 		new_data_len  = sizeof( double );
@@ -338,16 +361,19 @@ static inline int dpi_message_set_dpi_data( const void *data, int dpi_data_type,
 
 	case MMT_STRING_DATA: /**< text string data constant value. Len plus data. Data is expected to be '\0' terminated and maximum BINARY_64DATA_LEN long */
 	case MMT_STRING_LONG_DATA: /**< text string data constant value. Len plus data. Data is expected to be '\0' terminated and maximum STRING_DATA_LEN long */
+		//a mmt_binary_var_data_t: len (uint32_t) then the bytes
+		memcpy( &var_len, data, sizeof( var_len ));
 		new_data_type = MMT_SEC_MSG_DATA_TYPE_STRING;
-		new_data      = ((mmt_binary_var_data_t *)data)->data;
-		new_data_len  = ((mmt_binary_var_data_t *)data)->len;
+		new_data      = (const uint8_t *) data + sizeof( var_len );
+		new_data_len  = var_len;
 		break;
 
 
 	case MMT_HEADER_LINE: /**< string pointer value with a variable size. The string is not necessary null terminating */
+		memcpy( &hline, data, sizeof( hline ));
 		new_data_type = MMT_SEC_MSG_DATA_TYPE_STRING;
-		new_data      = ((mmt_header_line_t *)data)->ptr;
-		new_data_len  = ((mmt_header_line_t *)data)->len;
+		new_data      = hline.ptr;
+		new_data_len  = hline.len;
 		break;
 
 	case MMT_GENERIC_HEADER_LINE: /**< structure representing an RFC2822 header line with null terminating field and value elements. */

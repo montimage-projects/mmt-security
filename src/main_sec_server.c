@@ -200,6 +200,7 @@ static inline size_t receiving_reports( int sock ) {
 	int dpi_data_type;
 	size_t counter;
 	size_t elements_count;
+	struct timeval timestamp;
 
 	reports_count = 0;
 	while( ! is_interrupted ){
@@ -232,7 +233,10 @@ static inline size_t receiving_reports( int sock ) {
 
 		msg = create_message_t();
 
-		msg->timestamp = mmt_sec_encode_timeval( ( struct timeval * ) &( buffer[index] ) );
+		//the timestamp sits at index=1 in the packed report: read it with
+		//memcpy instead of casting, the buffer has no alignment (fork #66)
+		memcpy( &timestamp, &buffer[index], sizeof( timestamp ));
+		msg->timestamp = mmt_sec_encode_timeval( &timestamp );
 		index += sizeof (struct timeval);//16
 
 		msg->counter = reports_count; //TODO

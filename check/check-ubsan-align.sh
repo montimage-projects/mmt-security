@@ -22,6 +22,13 @@
 # its own logs; the jobs are bounded by UBSAN_JOBS (default: half the
 # cores).
 #
+# A last leg exercises the other packed-storage reader: mmt_sec_server
+# parses each wire report in place (the timestamp at index 1, each element
+# data at an arbitrary offset). check/ubsan_server_feed.c streams reports
+# that put a scalar of every size of dpi_message_set_dpi_data at an odd
+# offset and carry the attributes of rule 13, so the run must produce no
+# UBSan report and at least one alert.
+#
 # Usage: check/check-ubsan-align.sh
 set -u
 cd "$(dirname "$0")/.."
@@ -57,8 +64,8 @@ find "$B" -name "*.o" -delete
 rm -f "$B"/mmt_sec_standalone "$B"/mmt_sec_server "$B"/compile_rule \
 	"$B"/rule_info "$B"/rules/*.so
 
-( cd "$B" && make -j1 UBSAN=1 _prepare ) > "$TMP/make.log" 2>&1 || {
-	cat "$TMP/make.log"; fail "UBSan build failed (make UBSAN=1 _prepare)"; exit 1
+( cd "$B" && make -j1 UBSAN=1 _prepare sec_server ) > "$TMP/make.log" 2>&1 || {
+	cat "$TMP/make.log"; fail "UBSan build failed (make UBSAN=1 _prepare sec_server)"; exit 1
 }
 
 #do not stop at the first report of a run: every access of a pcap counts
@@ -123,6 +130,82 @@ for pcap in check/pcap/*.pcap; do
 		esac
 	done < "$LOGS/$name.fail"
 done
+
+# mmt_sec_server's wire path: the same packed-buffer parse, fed by
+# check/ubsan_server_feed.c over a unix socket (no port to clash). The
+# reports put a scalar of every size at an odd offset and carry rule 13's
+# attributes, so a run must produce no UBSan report and at least one alert.
+echo
+echo "Testing mmt_sec_server's wire report parsing under UBSan"
+runs=$((runs + 1))
+if ! gcc -O2 -o "$TMP/feed" check/ubsan_server_feed.c 2> "$TMP/feed-build.log"; then
+	cat "$TMP/feed-build.log"
+	fail "cannot build check/ubsan_server_feed.c"
+else
+	mkdir -p "$LOGS/server-out"
+	# exec keeps $! the pid of mmt_sec_server itself (for the TERM below)
+	( cd "$B" && exec ./mmt_sec_server -p "$TMP/sec.sock" \
+		-f "$LOGS/server-out/" ) > "$LOGS/server.log" 2>&1 &
+	spid=$!
+	# reports then disconnect: the forked child exits when its recv ends
+	"$TMP/feed" "$TMP/sec.sock" 50 > "$LOGS/feed.log" 2>&1
+	feed_rc=$?
+	# the feed can finish before the server accepts: first wait for the
+	# forked child to appear (ppid == $spid in /proc/*/stat), then for it
+	# to drain and exit; both bounded
+	_cpid(){
+		cpid=
+		for f in /proc/[0-9]*/stat; do
+			rest=$(sed 's/^.*) //' "$f" 2>/dev/null)
+			set -- $rest
+			[ "${2:-}" = "$spid" ] && { cpid=${f#/proc/}; cpid=${cpid%/stat}; break; }
+		done
+	}
+	cpid=
+	for i in $(seq 50); do
+		_cpid
+		[ -n "$cpid" ] && break
+		ls "$LOGS"/server-out/*.csv > /dev/null 2>&1 && break
+		sleep 0.1
+	done
+	for i in $(seq 150); do
+		_cpid
+		[ -z "$cpid" ] && break
+		sleep 0.1
+	done
+	# a child that outlives the bound is stopped rather than left behind
+	if [ -n "$cpid" ]; then
+		kill -TERM $cpid 2>/dev/null; sleep 1; kill -KILL $cpid 2>/dev/null
+	fi
+	kill -TERM $spid 2>/dev/null
+	for i in $(seq 150); do
+		kill -0 $spid 2>/dev/null || break
+		sleep 0.1
+	done
+	kill -KILL $spid 2>/dev/null
+	wait $spid 2>/dev/null
+	src=$?
+
+	n=$(grep -c "misaligned\|byte alignment\|insufficient alignment" "$LOGS/server.log")
+	if [ "$n" -gt 0 ]; then
+		fail "UBSan misaligned reports ($n) on mmt_sec_server's wire path"
+		grep -m 10 "misaligned\|byte alignment\|insufficient alignment" "$LOGS/server.log"
+	elif [ $feed_rc -ne 0 ]; then
+		fail "ubsan_server_feed exits $feed_rc"
+		cat "$LOGS/feed.log"
+	elif [ $src -ne 0 ]; then
+		fail "mmt_sec_server exits $src under UBSan"
+		tail -20 "$LOGS/server.log"
+	else
+		alerts=$(cat "$LOGS"/server-out/*.csv 2>/dev/null | wc -l)
+		if [ "$alerts" -eq 0 ]; then
+			fail "mmt_sec_server produced no alert: the feed did not drive the wire path to a verdict"
+			tail -20 "$LOGS/server.log"
+		else
+			echo "  server leg: 0 reports, $alerts alert(s) written to the verdict CSV"
+		fi
+	fi
+fi
 
 if [ "$status" -eq 0 ]; then
 	echo "  => OK: 0 UBSan misaligned report(s) in $runs run(s)"
