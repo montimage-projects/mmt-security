@@ -62,13 +62,37 @@ typedef struct message_struct{
 #define MSG_OVERFLOW 1
 #define MSG_DROP     2
 
+/* The elements of a message_t are embedded in its _data segment: each one is
+ * an mmt_memory_t header followed by the data bytes and their '\0'
+ * terminator. The slot of an element is padded so the next element's header
+ * keeps _Alignof(mmt_memory_t): packing at a stride of
+ * (data_length + SIZE_OF_MMT_MEMORY_T + 1) put headers - and so data - at
+ * arbitrary alignment, and every typed read of them (mmt_mem_cmp,
+ * mmt_mem_size, the _key_fold_value of rule_verif_engine.c, the generated
+ * guards' double loads, embedded functions' proto_hierarchy_t) was a
+ * misaligned access (issue #66).
+ * mmt_memory_t's own alignment (8 on LP64) covers every payload the
+ * attributes carry: double, uint64_t and struct timeval need 8,
+ * proto_hierarchy_t and the u16/u32/u64 arrays need <= 8. */
+#define MMT_SEC_MSG_ELEMENT_ALIGN _Alignof( mmt_memory_t )
+
+/* bytes an element of #data_length occupies in msg->_data, padding included */
+#define MMT_SEC_MSG_ELEMENT_SLOT( data_length ) \
+	( SIZE_OF_MMT_MEMORY_T \
+		+ ( ( (size_t)(data_length) + 1 + MMT_SEC_MSG_ELEMENT_ALIGN - 1 ) \
+			& ~(size_t)( MMT_SEC_MSG_ELEMENT_ALIGN - 1 ) ) )
+
+/* worst-case per-element overhead on top of the data bytes: the header, the
+ * '\0' terminator and up to ALIGN-1 pad bytes */
+#define MMT_SEC_MSG_ELEMENT_OVERHEAD ( SIZE_OF_MMT_MEMORY_T + MMT_SEC_MSG_ELEMENT_ALIGN )
+
 /**
  * Return true if #data_length bytes of data still fit in the room left in #msg,
  * i.e., if #set_element_data_message_t can copy them without MSG_OVERFLOW.
  * The size of #msg is given by "input.max_message_size".
  */
 static inline bool has_room_in_message_t( const message_t *msg, size_t data_length ){
-	return (size_t)msg->_data_index + data_length + SIZE_OF_MMT_MEMORY_T + 1 < msg->_data_length;
+	return (size_t)msg->_data_index + MMT_SEC_MSG_ELEMENT_SLOT( data_length ) < msg->_data_length;
 }
 
 message_t *create_message_t();

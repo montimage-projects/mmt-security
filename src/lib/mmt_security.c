@@ -398,14 +398,23 @@ static inline size_t _copy_plein_text( char *dst, int len, const char* src ){
 
 #define MAX_STR_SIZE 10000
 
+/* read an u16/u32/u64 without assuming #data is aligned: the elements of a
+ * MMT_U64_ARRAY sit at offset 4*j+4 inside the element data, i.e. 4 mod 8,
+ * so a typed load here is a misaligned access (issue #66) */
 static size_t _get_u( const uint8_t *data, int data_len ){
+	uint16_t v16;
+	uint32_t v32;
+	uint64_t v64;
 	switch( data_len ){
 	case 2:
-		return *((uint16_t *) data);
+		memcpy( &v16, data, 2 );
+		return v16;
 	case 4:
-		return *((uint32_t *) data);
+		memcpy( &v32, data, 4 );
+		return v32;
 	case 8:
-		return *((uint64_t *) data);
+		memcpy( &v64, data, 8 );
+		return v64;
 	default:
 		return 0;
 	}

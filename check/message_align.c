@@ -68,6 +68,64 @@ int main( void ){
 		}
 	}
 
+	/* issue #66: the embedded element headers inside msg->_data must keep
+	 * _Alignof(mmt_memory_t): an odd-length payload used to pack the next
+	 * header at a stride of data_length+16+1, so every typed read through
+	 * it - mmt_mem_size/mmt_mem_cmp, rule_verif_engine's key fold, the
+	 * generated guards' double loads - was a misaligned access.
+	 * Write order fixes the packing: element n's header follows the slot of
+	 * element n-1. A first element of 5 bytes puts the second header at
+	 * offset 22 (6 mod 8) on the unfixed stride. This unit is sanitized, so
+	 * each typed access below is also a UBSan report on base. */
+	if( atts_count > 3 ){
+		message_t *m = msgs[1];
+		const char odd[5] = "01234";      /* 5 bytes: next header 6 mod 8 on base */
+		const char bin[3] = "xy\0";
+		double num = 1.5;
+		const message_element_t *el;
+		int i;
+
+		if( set_element_data_message_t( m, atts[0]->proto_id, atts[0]->att_id,
+				odd, MMT_SEC_MSG_DATA_TYPE_BINARY, sizeof( odd )) != MSG_CONTINUE
+		 || set_element_data_message_t( m, atts[1]->proto_id, atts[1]->att_id,
+				&num, MMT_SEC_MSG_DATA_TYPE_NUMERIC, sizeof( num )) != MSG_CONTINUE
+		 || set_element_data_message_t( m, atts[2]->proto_id, atts[2]->att_id,
+				bin, MMT_SEC_MSG_DATA_TYPE_BINARY, sizeof( bin )) != MSG_CONTINUE ){
+			fprintf( stderr, "FAIL: set_element_data_message_t rejected the test payloads\n" );
+			fails ++;
+		} else {
+			for( i=0; i<3; i++ ){
+				el = get_element_message_t( m, atts[i]->proto_id, atts[i]->att_id );
+				if( el == NULL || ((uintptr_t) el->data % _Alignof( mmt_memory_t )) != 0 ){
+					fprintf( stderr, "FAIL: data of element %d.%d (%p) is not %zu-byte aligned\n",
+							atts[i]->proto_id, atts[i]->att_id,
+							(const void *)( el ? el->data : NULL ),
+							(size_t) _Alignof( mmt_memory_t ));
+					fails ++;
+					continue;
+				}
+				/* reads of the embedded header itself (mmt_mem_size) and a
+				 * comparison of two element payloads (mmt_mem_cmp): both
+				 * type-pun the mmt_memory_t header */
+				if( mmt_mem_size( el->data ) == 0 ){
+					fprintf( stderr, "FAIL: mmt_mem_size of element %d.%d is 0\n",
+							atts[i]->proto_id, atts[i]->att_id );
+					fails ++;
+				}
+			}
+			el = get_element_message_t( m, atts[0]->proto_id, atts[0]->att_id );
+			(void) mmt_mem_cmp( el->data,
+					get_element_message_t( m, atts[2]->proto_id, atts[2]->att_id )->data );
+			/* the generated guards read numbers as *(const double *) data:
+			 * the NUMERIC element must accept the same load */
+			if( *(const double *) get_element_message_t( m, atts[1]->proto_id,
+					atts[1]->att_id )->data != 1.5 ){
+				fprintf( stderr, "FAIL: NUMERIC element does not read back 1.5\n" );
+				fails ++;
+			}
+		}
+	}
+
 	/* reference-counted free paths on the same block */
 	mmt_mem_retains( msgs[0], 3 );               /* ref_count 4 */
 	free_message_ts( msgs[0], 2 );               /* ref_count 2 */

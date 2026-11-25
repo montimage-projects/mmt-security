@@ -661,6 +661,14 @@ check: check-message-align
 check-message-align: _prepare
 	@./check/check-message-align.sh
 
+# UBSan on the embedded element headers of message_t (fork #66): a UBSan
+# build of the library and the rules in a scratch copy (the normal build is
+# untouched), then every check/pcap single-threaded and `-c 1-8`; no
+# misaligned-access report may remain
+check: check-ubsan-align
+check-ubsan-align:
+	@./check/check-ubsan-align.sh
+
 # ThreadSanitizer on the SMP message hand-off (fork #45): a TSan build in a
 # scratch copy (the normal build is untouched), then `-c 1-8` on every
 # check/pcap, all rules and rule 54 alone; no report may remain unexplained
