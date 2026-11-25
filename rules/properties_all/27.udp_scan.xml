@@ -3,6 +3,22 @@
      Each probe must come from the host that opened its session (ip.src == ip.client_addr; mmt-dpi takes the
      sender of a session's first packet as its client). A server answering several connections of one client
      sends the same pattern from its service port to the client's ports, but it never opened those sessions.
+
+  MODIFIED 2026-11-25 (review of a false-positive report). What changed: a datagram counts as a probe only
+    when its destination is a single host (not 255.255.255.255, not a multicast group 224.0.0.0/4) and its
+    payload does not start with the 6-byte Tailscale disco magic ("TS" followed by U+1F4AC, 54 53 F0 9F 92 AC).
+    The chain itself (4 distinct destination ports, one source, one target, each step within 10 ms) is unchanged.
+  Why: Tailscale's NAT traversal pings every candidate address and port of a peer at once from its one UDP
+    socket (disco ping messages). A peer site behind NAT exposes many ports on one public address, so one
+    path-discovery round sends 4 to 16 datagrams from one source port to as many ports of one address
+    within a millisecond: the shape of a UDP scan. LAN discovery protocols broadcast one datagram to
+    255.255.255.255 on several ports at once, and a broadcast is not one host's ports.
+  Limits: IPv4 only, as before. A scanner that starts every probe's payload with the disco magic, or that
+    sends its probes to the broadcast address, is not counted. The payload is read from udp.p_data (the UDP
+    header and data), which every UDP datagram carries; udp.p_payload is absent on an empty datagram without
+    Ethernet padding (an event that reads it is then never evaluated), and ip.p_payload would copy the IP
+    payload of every packet, TCP included, into each message, leaving no room for the reassembled TCP
+    streams other rules read.
 -->
 
 <property value="THEN" delay_units="ms" delay_min="0+" delay_max="10" property_id="27" type_property="ATTACK" 
@@ -11,18 +27,40 @@
     <operator value="THEN" delay_units="ms" delay_min="0+" delay_max="10">
       <event value="COMPUTE" event_id="1" 
              description="UDP packet header with a destination port field set (1)"
-             boolean_expression="((ip.proto_id == 17)&amp;&amp;(ip.src == ip.client_addr))"/>
+             boolean_expression="(((ip.proto_id == 17)&amp;&amp;(ip.src == ip.client_addr))&amp;&amp;(#em27_probe(udp.p_data, ip.dst) == 1))"/>
       <event value="COMPUTE" event_id="2" 
              description="UDP packet header with another destination port field set (2)"
-             boolean_expression="(((ip.proto_id == 17)&amp;&amp;(ip.src == ip.client_addr))&amp;&amp;((udp.dest_port != udp.dest_port.1)&amp;&amp;((ip.dst == ip.dst.1)&amp;&amp;(ip.src == ip.src.1))))"/>
+             boolean_expression="((((ip.proto_id == 17)&amp;&amp;(ip.src == ip.client_addr))&amp;&amp;(#em27_probe(udp.p_data, ip.dst) == 1))&amp;&amp;((udp.dest_port != udp.dest_port.1)&amp;&amp;((ip.dst == ip.dst.1)&amp;&amp;(ip.src == ip.src.1))))"/>
     </operator>
     <operator value="THEN" delay_units="ms" delay_min="0+" delay_max="10">
       <event value="COMPUTE" event_id="3" 
              description="UDP packet header with another destination port field set (3)"
-             boolean_expression="(((ip.proto_id == 17)&amp;&amp;(ip.src == ip.client_addr))&amp;&amp;((udp.dest_port != udp.dest_port.2)&amp;&amp;((udp.dest_port != udp.dest_port.1)&amp;&amp;((ip.dst == ip.dst.1)&amp;&amp;(ip.src == ip.src.1)))))"/>
+             boolean_expression="((((ip.proto_id == 17)&amp;&amp;(ip.src == ip.client_addr))&amp;&amp;(#em27_probe(udp.p_data, ip.dst) == 1))&amp;&amp;((udp.dest_port != udp.dest_port.2)&amp;&amp;((udp.dest_port != udp.dest_port.1)&amp;&amp;((ip.dst == ip.dst.1)&amp;&amp;(ip.src == ip.src.1)))))"/>
       <event value="COMPUTE" event_id="4"
              description="UDP packet header with another destination port field set (4)"
-             boolean_expression="(((ip.proto_id == 17)&amp;&amp;(ip.src == ip.client_addr))&amp;&amp;((udp.dest_port != udp.dest_port.3)&amp;&amp;((udp.dest_port != udp.dest_port.2)&amp;&amp;((udp.dest_port != udp.dest_port.1)&amp;&amp;((ip.dst == ip.dst.1)&amp;&amp;(ip.src == ip.src.1))))))"/>
+             boolean_expression="((((ip.proto_id == 17)&amp;&amp;(ip.src == ip.client_addr))&amp;&amp;(#em27_probe(udp.p_data, ip.dst) == 1))&amp;&amp;((udp.dest_port != udp.dest_port.3)&amp;&amp;((udp.dest_port != udp.dest_port.2)&amp;&amp;((udp.dest_port != udp.dest_port.1)&amp;&amp;((ip.dst == ip.dst.1)&amp;&amp;(ip.src == ip.src.1))))))"/>
     </operator>
 </property>
+<embedded_functions><![CDATA[
+#include <stdint.h>
+
+/* 1 when this UDP datagram can be a port-scan probe: sent to one host, and not a Tailscale disco
+ * message. udp_data is the UDP header and data as copied by mmt-security (copied length:
+ * mmt_mem_size(), shorter than the datagram when the capture truncated it), ip_dst the 4-byte IPv4
+ * destination address. */
+static inline int em27_probe( const void *udp_data, const void *ip_dst ){
+	static const uint8_t disco[ 6 ] = { 0x54, 0x53, 0xF0, 0x9F, 0x92, 0xAC };   /* "TS" U+1F4AC */
+	const uint8_t *p = (const uint8_t *) udp_data, *d = (const uint8_t *) ip_dst;
+
+	if( d != NULL ){
+		if( d[0] == 255 && d[1] == 255 && d[2] == 255 && d[3] == 255 )
+			return 0;                      /* limited broadcast */
+		if( d[0] >= 224 && d[0] <= 239 )
+			return 0;                      /* multicast */
+	}
+	if( p != NULL && mmt_mem_size( p ) >= 8 + sizeof( disco ) && memcmp( p + 8, disco, sizeof( disco ) ) == 0 )
+		return 0;                          /* Tailscale disco message (path discovery, NAT traversal) */
+	return 1;
+}
+]]></embedded_functions>
 </beginning>
