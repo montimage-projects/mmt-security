@@ -17,7 +17,13 @@
 #  5. rule 56 gives no false alert when more than 65536 handshakes are pending
 #     at once and all complete, and reports only on a packet to the victim
 #     server port (check/syn_flood_rule56.c);
-#  6. the servers of check/pcap/56.crafted_servers_attack.pcap, crafted for the
+#  6. rule 56 gives the same verdict whatever the thread schedule: its pending
+#     SYN-ACKs are queued per engine instance and expired by that instance's
+#     own packet time, so an instance ahead in packet time cannot report the
+#     handshakes of an instance behind as half-open (fork issue #68), while
+#     the per-port half-open count stays shared by the instances
+#     (check/syn_flood_rule56_skew.c);
+#  7. the servers of check/pcap/56.crafted_servers_attack.pcap, crafted for the
 #     unseeded hash, do fill the victim's slot run with seed 0, but their
 #     pending alerts expire 2 s after they are raised and their slots become
 #     evictable again: the victim is then reported even with a known seed
@@ -152,6 +158,14 @@ if gcc -O2 -pthread -DRULE_C="\"$TMP/rule56.c\"" -o "$TMP/rule56" check/syn_floo
 	"$TMP/rule56" || fail "rule 56 gave a false alert when its FIFO was full, missed the control flood, or reported on a packet from the server port"
 else
 	fail "cannot compile check/syn_flood_rule56.c"
+fi
+
+echo
+echo "Testing rule 56's verdict under cross-instance packet-time skew (issue #68)"
+if gcc -O2 -pthread -DRULE_C="\"$TMP/rule56.c\"" -o "$TMP/rule56skew" check/syn_flood_rule56_skew.c; then
+	"$TMP/rule56skew" || fail "rule 56's verdict changed with the instance schedule, or a flood was lost"
+else
+	fail "cannot compile check/syn_flood_rule56_skew.c"
 fi
 
 echo

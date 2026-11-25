@@ -9,7 +9,8 @@
 
      The counting is done in C, at a constant cost per packet, so that a fast flood does not slow the engine
      down (an FSM instance per SYN-ACK triple grows with the cube of the SYN-ACK rate):
-     - each SYN-ACK is kept in a FIFO of pending handshakes, for at most 1 s;
+     - each SYN-ACK is kept in the queue of pending handshakes of the engine instance that saw it, for at
+       most 1 s of that instance's own packet time;
      - the client's completing packet marks its handshake done;
      - a handshake still pending after 1 s is half-open: it is counted for its server IP address and port;
      - a client's RST or RST|ACK on a pending handshake makes it half-open at once: a reset handshake cannot
@@ -18,28 +19,30 @@
        is given on the next packet TO that server port (a SYN, the client's RST, any other packet), so the
        victim is always ip.dst:tcp.dest_port of the reported packet; its ip.src:tcp.src_port is one client
        of that port, not necessarily an attacker;
-     - at most one alert per server port per second (of packet time): the half-open handshakes counted
+     - at most one alert per server port per second (of the shared clock, the highest packet time any
+       instance has seen, so an instance behind in packet time cannot re-report an alert a faster
+       instance reported, nor let a pending alert expire early): the half-open handshakes counted
        since the previous alert of that port are reported together, on the first packet to that port at
-       least 1 s after the previous alert. An alert still pending 2 s after it is raised expires: the
-       server's slot is then evictable again, and the pending alert is dropped when a new server takes the
-       slot;
+       least 1 s of the shared clock after the previous alert. An alert still pending 2 s after it is
+       raised expires: the server's slot is then evictable again, and the pending alert is dropped when a
+       new server takes the slot;
      Notes:
-     - the 1 s are checked on later TCP packets (of any connection), and the alert waits for a packet to the
-       server port: a spoofed flood (the clients never answer) shorter than 1 s, after which that port
-       receives nothing, is not reported by this rule. Rule 57 reports it from its SYN rate only if it reaches
-       rule 57's threshold (100 SYN within 1 s by default): a smaller burst on a port that then receives
-       nothing is reported by neither rule. A packet to the port while the alert is still pending (a
-       legitimate client, the next pulse of a pulsing flood) reports it. A real-source flood (the clients
-       reset the handshakes) is counted at once;
-     - the FIFO holds 65536 SYN-ACKs (1 s at 65536 new connections per second). When it is full, a new
+     - the 1 s are checked on later TCP packets (of any connection) of the queue's instance, and the alert
+       waits for a packet to the server port: a spoofed flood (the clients never answer) shorter than 1 s,
+       after which that port receives nothing, is not reported by this rule. Rule 57 reports it from its SYN
+       rate only if it reaches rule 57's threshold (100 SYN within 1 s by default): a smaller burst on a port
+       that then receives nothing is reported by neither rule. A packet to the port while the alert is still
+       pending (a legitimate client, the next pulse of a pulsing flood) reports it. A real-source flood (the
+       clients reset the handshakes) is counted at once;
+     - the pool holds 65536 SYN-ACKs (1 s at 65536 new connections per second). When it is full, a new
        SYN-ACK is not tracked until the oldest ones leave after their 1 s: above about 65 k new connections
        per second, a part of the handshakes is not checked, and a flood is reported from the tracked ones,
        up to about 0.7 s later at 100 k/s. Taking the oldest SYN-ACK out early and counting it if it is still
        pending would instead give false alerts on a server above about 65 k new connections per second whose
        clients are slow (more than about 0.65 s from the SYN-ACK to their ACK). So an attacker who injects
-       about 65 k spoofed SYN-ACKs per second keeps the FIFO full and pauses this rule for all the servers
+       about 65 k spoofed SYN-ACKs per second keeps the pool full and pauses this rule for all the servers
        (such a rate is a loud flood in its own right, which rule 57 sees only if it includes SYNs);
-     - the FIFO and the server table are indexed by a hash that mixes every bit of the addresses and ports
+     - the pool and the server table are indexed by a hash that mixes every bit of the addresses and ports
        with a random seed drawn once per process (in on_load), so that an attacker cannot choose servers that
        share the slots of a victim and evict it. For tests only, MMT_SEC_SYN_FLOOD_HASH_SEED (a decimal
        integer from 0 to 4294967295, also read by rule 57) sets the seed: 0 gives the unseeded hash. A server
@@ -50,8 +53,18 @@
        that a real flood whose port goes quiet for more than 2 s loses its last pending alert if the slot is
        taken before a packet reaches the port — an acceptable trade-off, since an attacker who re-arms
        pending alerts within 2 s can still hold slots, and the seed remains the primary defence;
-     - the tables are shared by all the engine instances of a process (the threads of mmt-probe) and
-       protected by a mutex.
+     - the engine instances of a process (the security threads of mmt-probe, the -c workers of
+       mmt_sec_standalone) each keep their pending SYN-ACKs in a queue of their own, expired by the packet
+       time of that instance alone — a thread ahead in packet time can no longer expire the pending
+       handshakes queued by a worker that is behind, which made the verdict depend on thread scheduling
+       (issue #68). Only the entry pool, the handshake index, the per-server half-open counts and one
+       shared clock (the highest packet time any instance has seen) are shared by the instances, all
+       protected by a mutex; the per-server alert and report rate limits are measured on that shared
+       clock, so a lagging instance's packets cannot re-report an alert nor expire one early. An
+       instance is keyed by the thread that calls the rule: a thread driving several instances merges
+       them into one queue (its packets are one interleaved stream, hence one clock — the pre-#68
+       semantics for that stream); beyond EM_SYN56_LANES calling threads, the extra ones share an
+       overflow queue.
 -->
 <embedded_functions><![CDATA[
 #include <errno.h>
@@ -67,12 +80,13 @@
 #define EM_SYN56_TIMEOUT_US  1000000  //a handshake not completed within 1 s is half-open
 #define EM_SYN56_SPAN_US      200000  //3 half-open handshakes of one server port within 200 ms
 #define EM_SYN56_HALF_OPEN         3
-#define EM_SYN56_PENDING       65536  //FIFO of the SYN-ACKs of the last 1 s (power of 2)
-#define EM_SYN56_INDEX        131072  //hash index of the FIFO (power of 2)
+#define EM_SYN56_PENDING       65536  //pool of the pending SYN-ACKs (power of 2)
+#define EM_SYN56_INDEX        131072  //hash index of the pool (power of 2)
 #define EM_SYN56_SERVERS        4096  //server IP address and port (power of 2)
 #define EM_SYN56_PROBES            8
 #define EM_SYN56_REPORT_US   1000000  //at most one alert per server port per second
 #define EM_SYN56_EXPIRE_US   2000000  //a pending alert expires 2 s after it is raised
+#define EM_SYN56_LANES           256  //engine instances tracked (the threads that call the rule)
 
 enum { EM_SYN56_FREE = 0, EM_SYN56_WAITING, EM_SYN56_DONE };
 
@@ -80,7 +94,8 @@ typedef struct {
 	uint32_t srv_ip, cli_ip;  //network order
 	uint16_t srv_port, cli_port;
 	uint32_t index;           //slot of em_syn56_index pointing at this entry
-	uint64_t ts;              //time of the SYN-ACK, in us
+	uint32_t next;            //pool position + 1 of the next entry: the queue's, or the free list's
+	uint64_t ts;              //time of the SYN-ACK, in us, on the packet clock of its queue's instance
 	uint8_t  state;
 } em_syn56_hs_t;
 
@@ -97,13 +112,28 @@ typedef struct {
 	uint64_t alert_ts;        //packet time when the pending alert was raised
 } em_syn56_srv_t;
 
-static em_syn56_hs_t  em_syn56_fifo[ EM_SYN56_PENDING ];
-static uint32_t       em_syn56_head, em_syn56_size;
-static uint32_t       em_syn56_index[ EM_SYN56_INDEX ]; //FIFO position + 1, 0: empty
-static em_syn56_srv_t em_syn56_srv[ EM_SYN56_SERVERS ];
-static uint32_t       em_syn56_alerts;                  //servers whose alert flag is set
+//one engine instance: the queue of the SYN-ACKs it has seen and not yet
+//expired, ordered by its own packet time — only that instance's packets can
+//expire them, so the verdict does not depend on thread scheduling (#68)
+typedef struct {
+	pthread_t tid;            //the thread that drives this instance
+	uint32_t  head;           //pool position + 1 of the oldest pending entry, 0: none
+	uint32_t  tail;           //pool position + 1 of the newest
+	uint8_t   used;
+} em_syn56_lane_t;
+
+static em_syn56_hs_t   em_syn56_pool[ EM_SYN56_PENDING ];
+static uint32_t        em_syn56_free_head;                //pool position + 1 of a recycled entry, 0: none
+static uint32_t        em_syn56_top;                      //first never-used pool position
+static uint32_t        em_syn56_size;                     //entries in use, all the lanes together
+static uint32_t        em_syn56_index[ EM_SYN56_INDEX ];  //pool position + 1, 0: empty
+static em_syn56_srv_t  em_syn56_srv[ EM_SYN56_SERVERS ];
+static uint32_t        em_syn56_alerts;                   //servers whose alert flag is set
+static uint64_t        em_syn56_now;                      //highest packet time seen by any lane: the shared clock
+                                                         //of the server table's alert/report rate limits (#68)
+static em_syn56_lane_t em_syn56_lane[ EM_SYN56_LANES + 1 ];//the last one is the overflow lane
 static pthread_mutex_t em_syn56_lock = PTHREAD_MUTEX_INITIALIZER;
-static uint32_t       em_syn56_seed;                    //hash seed, drawn in on_load()
+static uint32_t        em_syn56_seed;                     //hash seed, drawn in on_load()
 
 // Parses str: a decimal integer from 0 to 4294967295, without sign, leading zero or trailing character.
 // Returns 1 and sets *seed when it is valid, else 0.
@@ -158,12 +188,39 @@ static inline uint32_t em_syn56_hash_hs( uint32_t srv_ip, uint16_t srv_port, uin
 	return em_syn56_mix( h ^ (((uint32_t) srv_port << 16) | cli_port) );
 }
 
-//the FIFO entry that the index slot i points at, if that entry is live and owns the slot
+//the lane of the calling thread, that is, of the engine instance it drives:
+//its own queue of pending SYN-ACKs, expired by its own packet time alone —
+//the fix of issue #68. A thread driving several engine instances merges them
+//into the one lane of its interleaved stream; when more than EM_SYN56_LANES
+//threads call, the extra ones share the overflow lane.
+static em_syn56_lane_t *em_syn56_lane_of( void ){
+	em_syn56_lane_t *lane;
+	pthread_t self = pthread_self();
+	uint64_t t = 0;
+	uint32_t h, p;
+
+	//pthread_t is opaque: fold it into 64 bits
+	memcpy( &t, &self, sizeof( self ) < sizeof( t )? sizeof( self ) : sizeof( t ));
+	h = em_syn56_mix( (uint32_t) t ^ (uint32_t)( t >> 32 ));
+	for( p = 0; p < EM_SYN56_PROBES; p++ ){
+		lane = &em_syn56_lane[ (h + p) & (EM_SYN56_LANES - 1) ];
+		if( lane->used && pthread_equal( lane->tid, self ))
+			return lane;
+		if( !lane->used ){
+			lane->used = 1;
+			lane->tid  = self;
+			return lane;
+		}
+	}
+	return &em_syn56_lane[ EM_SYN56_LANES ];
+}
+
+//the pool entry that the index slot i points at, if that entry is live and owns the slot
 static inline em_syn56_hs_t *em_syn56_owner( uint32_t i ){
 	em_syn56_hs_t *hs;
 	if( em_syn56_index[ i ] == 0 )
 		return NULL;
-	hs = &em_syn56_fifo[ em_syn56_index[ i ] - 1 ];
+	hs = &em_syn56_pool[ em_syn56_index[ i ] - 1 ];
 	return ( hs->state != EM_SYN56_FREE && hs->index == i )? hs : NULL;
 }
 
@@ -179,7 +236,7 @@ static em_syn56_hs_t *em_syn56_find( uint32_t srv_ip, uint16_t srv_port, uint32_
 	return NULL;
 }
 
-static em_syn56_srv_t *em_syn56_server( uint32_t ip, uint16_t port, int create, uint64_t now ){
+static em_syn56_srv_t *em_syn56_server( uint32_t ip, uint16_t port, int create ){
 	uint32_t h = em_syn56_mix( em_syn56_mix( ip ^ em_syn56_seed ) ^ port ), p;
 	em_syn56_srv_t *s, *free_slot = NULL, *old = NULL;
 	for( p = 0; p < EM_SYN56_PROBES; p++ ){
@@ -189,9 +246,10 @@ static em_syn56_srv_t *em_syn56_server( uint32_t ip, uint16_t port, int create, 
 		if( free_slot == NULL && !s->used )
 			free_slot = s;
 		//the evictable server whose last half-open handshake is the oldest: no alert pending, or an
-		//alert that expired (more than EM_SYN56_EXPIRE_US without a packet to the port reported it)
+		//alert that expired (more than EM_SYN56_EXPIRE_US of the shared clock without a packet to the
+		//port reporting it)
 		if( s->used && ( !s->alert
-				|| ( now > s->alert_ts && now - s->alert_ts > EM_SYN56_EXPIRE_US ))
+				|| ( em_syn56_now > s->alert_ts && em_syn56_now - s->alert_ts > EM_SYN56_EXPIRE_US ))
 				&& ( old == NULL || s->last < old->last ))
 			old = s;
 	}
@@ -218,8 +276,8 @@ static inline int em_syn56_within( uint64_t a, uint64_t b ){
 }
 
 //a handshake of server ip:port, whose SYN-ACK was sent at ts, is half-open
-static void em_syn56_half_open( uint32_t ip, uint16_t port, uint64_t ts, uint64_t now ){
-	em_syn56_srv_t *s = em_syn56_server( ip, port, 1, now );
+static void em_syn56_half_open( uint32_t ip, uint16_t port, uint64_t ts ){
+	em_syn56_srv_t *s = em_syn56_server( ip, port, 1 );
 	int i, n = 0;
 	//keep only the half-open handshakes within 200 ms of this one
 	for( i = 0; i < s->count; i++ )
@@ -231,30 +289,36 @@ static void em_syn56_half_open( uint32_t ip, uint16_t port, uint64_t ts, uint64_
 		s->count = 0;
 		if( !s->alert ){
 			s->alert    = 1;
-			s->alert_ts = now;
+			s->alert_ts = em_syn56_now;
 			em_syn56_alerts ++;
 		}
 	} else
 		s->ts[ s->count++ ] = ts;
 }
 
-//take the oldest SYN-ACK out of the FIFO (after its 1 s): still pending, it is half-open
-static void em_syn56_pop( uint64_t now ){
-	em_syn56_hs_t *hs = &em_syn56_fifo[ em_syn56_head ];
+//take the oldest SYN-ACK out of the lane's queue (after its 1 s on the lane's
+//own packet clock): still pending, it is half-open; then recycle its entry
+static void em_syn56_pop( em_syn56_lane_t *lane ){
+	uint32_t pos = lane->head - 1;
+	em_syn56_hs_t *hs = &em_syn56_pool[ pos ];
+	lane->head = hs->next;
+	if( lane->head == 0 )
+		lane->tail = 0;
 	if( hs->state == EM_SYN56_WAITING )
-		em_syn56_half_open( hs->srv_ip, hs->srv_port, hs->ts, now );
+		em_syn56_half_open( hs->srv_ip, hs->srv_port, hs->ts );
 	hs->state = EM_SYN56_FREE;
-	em_syn56_head = (em_syn56_head + 1) & (EM_SYN56_PENDING - 1);
+	hs->next  = em_syn56_free_head;
+	em_syn56_free_head = pos + 1;
 	em_syn56_size --;
 }
 
-static void em_syn56_add( uint32_t srv_ip, uint16_t srv_port, uint32_t cli_ip, uint16_t cli_port, uint64_t now ){
+static void em_syn56_add( em_syn56_lane_t *lane, uint32_t srv_ip, uint16_t srv_port, uint32_t cli_ip, uint16_t cli_port, uint64_t now ){
 	uint32_t h, p, i, pos;
 	em_syn56_hs_t *hs;
 	//a retransmitted SYN-ACK keeps the time of the first one
 	if( em_syn56_find( srv_ip, srv_port, cli_ip, cli_port ) != NULL )
 		return;
-	//FIFO full (65536 SYN-ACKs within 1 s): do not track this handshake. Taking out a pending one
+	//pool full (65536 SYN-ACKs pending): do not track this handshake. Taking out a pending one
 	//before its 1 s would count a handshake that can still complete (a false alert)
 	if( em_syn56_size == EM_SYN56_PENDING )
 		return;
@@ -267,16 +331,28 @@ static void em_syn56_add( uint32_t srv_ip, uint16_t srv_port, uint32_t cli_ip, u
 	//no free index slot (the index is at most half full, so this is rare): do not track this handshake
 	if( p == EM_SYN56_PROBES )
 		return;
-	pos = (em_syn56_head + em_syn56_size) & (EM_SYN56_PENDING - 1);
-	hs  = &em_syn56_fifo[ pos ];
+	//an entry of the shared pool: the recycled free list, else a never-used
+	//position (one remains, since em_syn56_size < EM_SYN56_PENDING)
+	if( em_syn56_free_head != 0 ){
+		pos = em_syn56_free_head - 1;
+		em_syn56_free_head = em_syn56_pool[ pos ].next;
+	}else
+		pos = em_syn56_top ++;
+	hs = &em_syn56_pool[ pos ];
 	hs->srv_ip   = srv_ip;
 	hs->cli_ip   = cli_ip;
 	hs->srv_port = srv_port;
 	hs->cli_port = cli_port;
 	hs->ts       = now;
 	hs->index    = i;
+	hs->next     = 0;
 	hs->state    = EM_SYN56_WAITING;
 	em_syn56_index[ i ] = pos + 1;
+	if( lane->tail != 0 )
+		em_syn56_pool[ lane->tail - 1 ].next = pos + 1;
+	else
+		lane->head = pos + 1;
+	lane->tail = pos + 1;
 	em_syn56_size ++;
 }
 
@@ -295,6 +371,7 @@ static int em_syn_flood_half_open( const void *ip_src, const void *ip_dst, doubl
 	uint64_t now;
 	em_syn56_hs_t *hs;
 	em_syn56_srv_t *s;
+	em_syn56_lane_t *lane;
 
 	if( ip_src == NULL || ip_dst == NULL || tv == NULL )
 		return 0;
@@ -303,14 +380,22 @@ static int em_syn_flood_half_open( const void *ip_src, const void *ip_dst, doubl
 	now = (uint64_t) tv->tv_sec * 1000000 + (uint64_t) tv->tv_usec;
 
 	pthread_mutex_lock( &em_syn56_lock );
-	//the handshakes waiting for more than 1 s (time going backwards stops this until it catches up)
-	while( em_syn56_size > 0 && now > em_syn56_fifo[ em_syn56_head ].ts
-			&& now - em_syn56_fifo[ em_syn56_head ].ts > EM_SYN56_TIMEOUT_US )
-		em_syn56_pop( now );
+	lane = em_syn56_lane_of();
+	//the shared clock is the highest packet time any lane has seen: the alert
+	//and report rate limits of the server table are measured on it, so a lane
+	//behind in packet time cannot re-report an alert a faster lane reported,
+	//nor let a pending alert expire early (#68)
+	if( now > em_syn56_now )
+		em_syn56_now = now;
+	//the handshakes of this instance waiting for more than 1 s of its own
+	//packet time (time going backwards stops this until it catches up)
+	while( lane->head != 0 && now > em_syn56_pool[ lane->head - 1 ].ts
+			&& now - em_syn56_pool[ lane->head - 1 ].ts > EM_SYN56_TIMEOUT_US )
+		em_syn56_pop( lane );
 
 	if( f == 0x12 ){
 		if( src != dst )
-			em_syn56_add( src, sp, dst, dp, now );
+			em_syn56_add( lane, src, sp, dst, dp, now );
 	} else if( em_completes_handshake( f )){
 		hs = em_syn56_find( dst, dp, src, sp );
 		if( hs != NULL )
@@ -320,18 +405,18 @@ static int em_syn_flood_half_open( const void *ip_src, const void *ip_dst, doubl
 		hs = em_syn56_find( dst, dp, src, sp );
 		if( hs != NULL && hs->state == EM_SYN56_WAITING ){
 			hs->state = EM_SYN56_DONE;
-			em_syn56_half_open( hs->srv_ip, hs->srv_port, hs->ts, now );
+			em_syn56_half_open( hs->srv_ip, hs->srv_port, hs->ts );
 		}
 	}
 
-	//report on a packet to the server port, at most once per second (time going backwards reports)
+	//report on a packet to the server port, at most once per second of the shared clock
 	if( em_syn56_alerts > 0 && src != dst ){
-		s = em_syn56_server( dst, dp, 0, now );
-		if( s != NULL && s->alert && ( !s->reported || now < s->reported_ts
-				|| now - s->reported_ts >= EM_SYN56_REPORT_US )){
+		s = em_syn56_server( dst, dp, 0 );
+		if( s != NULL && s->alert &&
+				( !s->reported || em_syn56_now - s->reported_ts >= EM_SYN56_REPORT_US )){
 			s->alert       = 0;
 			s->reported    = 1;
-			s->reported_ts = now;
+			s->reported_ts = em_syn56_now;
 			em_syn56_alerts --;
 			ret = 1;
 		}
