@@ -17,7 +17,11 @@
 #     (fork #70, review M1);
 #   - the installed DPI's file content invalidates the objects: an upgrade
 #     in place at the same $(MMT_DPI_DIR) rewrites .build-flavor, rebuilds
-#     every object and regenerates every rule (fork #70, review M2).
+#     every object and regenerates every rule (fork #70, review M2);
+#   - the Makefile's own content hash sees a change: a cp -a copy of the
+#     prefix, settled then changed in one file, moves the stamp and
+#     compiles objects - also when $(MMT_DPI_DIR) points at the copy
+#     through a symlink (fork #70, review L5/M3).
 # On a Makefile whose rules/%.so does not list its .xml, the touched rule
 # keeps its stale .so - the bug #70 reports - and this script fails.
 #
@@ -144,15 +148,47 @@ n=$(find rules -maxdepth 1 -name '*.so' -newer "$TMP/m2.marker" | wc -l)
 total=$(find rules -maxdepth 1 -name '*.xml' | wc -l)
 [ "$n" -eq "$total" ] || fail "changed DPI content regenerates $n rules, expected all $total"
 # ...and the signature itself must observe content: hashing a copy of the
-# installed dir before and after a planted change must differ
-sig_of(){ find "$1" -type f -print0 2>/dev/null | sort -z | xargs -0 -r md5sum 2>/dev/null | md5sum; }
+# installed dir before and after a planted change must differ. The
+# pipeline mirrors the Makefile's, `find -L` included (review M3)
+sig_of(){ find -L "$1" -type f -print0 2>/dev/null | sort -z | xargs -0 -r md5sum 2>/dev/null | md5sum | cut -d' ' -f1; }
 cp -a "$DPI_DIR" "$TMP/dpi-copy"
 before=$(sig_of "$TMP/dpi-copy")
-f=$(find "$TMP/dpi-copy" -type f | head -1)
+f=$(find -L "$TMP/dpi-copy" -type f | head -1)
 echo x >> "$f"
 after=$(sig_of "$TMP/dpi-copy")
 [ "$before" != "$after" ] || \
 	fail "the DPI content signature does not observe the installed files' content"
+
+# leg 8: the Makefile's own DPI_SIG pipeline must observe file content,
+# not only file names (fork #70, review L5). Leg 7 feeds make the
+# signature a swap produces, so a pipeline that stopped hashing content -
+# or a find that cannot descend a symlinked $(MMT_DPI_DIR) (review M3) -
+# would keep this suite green while a real upgrade rebuilt nothing.
+# cp -a the prefix, settle a build against it, change one file's content:
+# the stamp's hash field must move and objects must compile. Probe the
+# plain copy first, then the same copy through a symlink - a `find`
+# without -L hashes empty input for the symlinked prefix and fails.
+cp -a "$DPI_DIR" "$TMP/dpi-real"
+ln -s "$TMP/dpi-real" "$TMP/dpi-link"
+probe_dpi_dir(){
+	make -j1 MMT_DPI_DIR="$1" compile_rule > "$TMP/probe.settle.log" 2>&1 || {
+		cat "$TMP/probe.settle.log"; fail "real-pipeline probe ($1): settle build failed"; return; }
+	s1=$(cut -d' ' -f1 .build-flavor)
+	# append where no compile or link can trip on it: a doc file is
+	# hashed like everything else under the prefix
+	f=$(find -L "$1" -type f -path '*/share/*' | sort | head -1)
+	[ -n "$f" ] || f=$(find -L "$1" -type f | sort | head -1)
+	echo x >> "$f"
+	make -j1 MMT_DPI_DIR="$1" compile_rule > "$TMP/probe.log" 2>&1 || {
+		cat "$TMP/probe.log"; fail "real-pipeline probe ($1): rebuild failed"; return; }
+	s2=$(cut -d' ' -f1 .build-flavor)
+	[ "$s1" != "$s2" ] || {
+		fail "real-pipeline probe ($1): a content change left the DPI hash '$s2'"; return; }
+	n=$(grep -c '^\[COMPILE\] .*\.o$' "$TMP/probe.log")
+	[ "$n" -gt 0 ] || fail "real-pipeline probe ($1): a content change rebuilt 0 objects"
+}
+probe_dpi_dir "$TMP/dpi-real"
+probe_dpi_dir "$TMP/dpi-link"
 
 if [ "$status" -eq 0 ]; then
 	echo "  => OK: a newer xml or compile_rule rebuilds exactly the rules it should"

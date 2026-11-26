@@ -141,15 +141,27 @@ FLAVOR_STAMP := .build-flavor
 # remade, planning the whole tree every time. The order-only prerequisite
 # of %.o/%.gen.o is kept instead: it guarantees the regen check runs
 # before any compile.
-DPI_SIG := $(shell find '$(MMT_DPI_DIR)' -type f -print0 2>/dev/null | sort -z | xargs -0 -r md5sum 2>/dev/null | md5sum)
+# The stamp matters only to goals that compile objects (an empty
+# MAKECMDGOALS is the default goal `all`); the clean and uninstall goals
+# get no stray write - `clean` deletes the stamp right away anyway. The
+# same filter gates the DPI hash: those goals compile nothing, so hashing
+# the installed tree there is wasted work on every parse (fork #70,
+# review L7).
+FLAVOR_GOALS := $(if $(MAKECMDGOALS),$(filter-out clean clean-all clean-rules dist-clean uninstall,$(MAKECMDGOALS)),all)
+# `find -L` keeps a symlinked $(MMT_DPI_DIR) - a versioned prefix managed
+# as `dpi -> dpi-x.y.z` - inside the signature: without it find lists the
+# link itself, the hash is the md5 of empty input and no in-place swap is
+# ever seen (fork #70, review M3). The cut drops md5sum's ` -` stdin tag
+# (review L7).
+DPI_SIG := $(if $(FLAVOR_GOALS),$(shell find -L '$(MMT_DPI_DIR)' -type f -print0 2>/dev/null | sort -z | xargs -0 -r md5sum 2>/dev/null | md5sum | cut -d' ' -f1))
 FLAVOR_SIG := $(strip $(DPI_SIG)|$(CC)|$(AR)|STATIC_LINK=$(STATIC_LINK)|$(filter-out -DGIT_VERSION=%,$(CFLAGS))|$(CLDFLAGS)|$(RULE_GCC_ARGS)|$(LIBS))
 # -n/-t/-q come bundled as letters in the first MAKEFLAGS word
 FLAVOR_FLAGS := $(filter-out --%,$(firstword $(MAKEFLAGS)))
-# The stamp matters only to goals that compile objects (an empty
-# MAKECMDGOALS is the default goal `all`); the clean and uninstall goals
-# get no stray write - `clean` deletes the stamp right away anyway.
-ifneq ($(if $(MAKECMDGOALS),$(filter-out clean clean-all clean-rules dist-clean uninstall,$(MAKECMDGOALS)),all),)
+ifneq ($(FLAVOR_GOALS),)
 ifneq ($(strip $(file <$(FLAVOR_STAMP))),$(FLAVOR_SIG))
+  # nothing is written under -n/-t/-q, so a dry run right after a DPI
+  # swap shows none of the rebuild the real run then does (fork #70,
+  # review L6)
   ifeq ($(findstring n,$(FLAVOR_FLAGS))$(findstring t,$(FLAVOR_FLAGS))$(findstring q,$(FLAVOR_FLAGS)),)
     $(file >$(FLAVOR_STAMP),$(FLAVOR_SIG))
   endif
