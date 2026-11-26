@@ -738,6 +738,15 @@ check: check-ubsan-align
 check-ubsan-align:
 	@./check/check-ubsan-align.sh
 
+# mmt_sec_server must validate the announced lengths of each report it
+# receives: an ASan build in a scratch copy is fed by
+# check/malformed_server_feed.c with reports whose lengths do not match
+# their data, each followed by a valid report; the run must produce one
+# alert per valid report and no sanitizer report
+check: check-server-malformed
+check-server-malformed:
+	@./check/check-server-malformed.sh
+
 # ThreadSanitizer on the SMP message hand-off (fork #45): a TSan build in a
 # scratch copy (the normal build is untouched), then `-c 1-8` on every
 # check/pcap, all rules and rule 54 alone; no report may remain unexplained

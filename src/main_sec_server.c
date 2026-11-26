@@ -183,6 +183,60 @@ static inline int _get_dpi_data_type( uint32_t proto_id, uint32_t att_id ){
 	return -1;
 }
 
+/* On the wire an element's data occupies data_length bytes. For the types
+ * whose conversion reads fixed-size fields, data_length must cover their
+ * size. For the variable-length types, the first 4 bytes are a number of
+ * items and the items that follow must fit in data_length. Returns 0 when
+ * data_length cannot encode a valid value of dpi_data_type. */
+static inline int _element_data_fits( int dpi_data_type, const uint8_t *data, uint16_t data_length ){
+	uint32_t items_count, item_size;
+	switch( dpi_data_type ){
+	case MMT_DATA_CHAR:
+	case MMT_U8_DATA:
+		return data_length >= 1;
+	case MMT_DATA_PORT:
+	case MMT_U16_DATA:
+		return data_length >= 2;
+	case MMT_U32_DATA:
+	case MMT_DATA_FLOAT:
+	case MMT_DATA_IP_NET:
+	case MMT_DATA_IP_ADDR:
+		return data_length >= 4;
+	case MMT_DATA_MAC_ADDR:
+		return data_length >= 6;
+	case MMT_U64_DATA:
+		return data_length >= 8;
+	case MMT_DATA_IP6_ADDR:
+	case MMT_DATA_TIMEVAL:
+		return data_length >= sizeof( struct timeval );
+	//the variable-length types start with a uint32 number of items:
+	// a byte count for strings and binary data, an entry count otherwise
+	case MMT_STRING_DATA:
+	case MMT_STRING_LONG_DATA:
+	case MMT_BINARY_DATA:
+	case MMT_BINARY_VAR_DATA:
+		item_size = 1;
+		break;
+	case MMT_U16_ARRAY:
+		item_size = 2;
+		break;
+	case MMT_U32_ARRAY:
+	case MMT_DATA_PATH:
+		item_size = 4;
+		break;
+	case MMT_U64_ARRAY:
+		item_size = 8;
+		break;
+	//the other types read nothing from the element
+	default:
+		return 1;
+	}
+	if( data_length < sizeof( items_count ))
+		return 0;
+	memcpy( &items_count, data, sizeof( items_count ));
+	return items_count <= ( data_length - sizeof( items_count )) / item_size;
+}
+
 /**
  * Received reports from mmt-probe.
  * For each incoming report, the function will converts them to a #message_t type,
@@ -208,20 +262,38 @@ static inline size_t receiving_reports( int sock ) {
 		//Read 4 bytes first to know the length of the report
 		n = recv( sock, &length_of_report, 4, MSG_WAITALL );
 
-		//end of socket flow, or the socket was shut down by the signal handler
-		if ( unlikely( n <= 0 ))	break;
+		//end of socket flow, the socket was shut down by the signal
+		//handler, or the peer stopped inside the length itself
+		if ( unlikely( n != 4 ))	break;
 
-		if( unlikely( length_of_report > REPORT_SIZE )){
-			mmt_warn("Overflow: length_of_report = %d", length_of_report );
-			length_of_report = REPORT_SIZE;
+		//the length includes its own 4 bytes: a shorter value has no body
+		//and nothing to skip, so the rest of the stream still parses
+		if( unlikely( length_of_report < 4 )){
+			mmt_warn( "Invalid length_of_report = %"PRIu32, length_of_report );
+			continue;
+		}
+
+		//a report cannot be bigger than buffer: there is no way to
+		//resynchronize the stream after it, so the connection is dropped
+		if( unlikely( length_of_report > REPORT_SIZE + 4 )){
+			mmt_warn( "Invalid length_of_report = %"PRIu32, length_of_report );
+			break;
 		}
 
 		n = recv( sock, buffer, length_of_report-4, MSG_WAITALL );
 
-		if( unlikely( n <= 0 )){
+		//a report must be received in full: a short read leaves the stream
+		// without a resynchronization point, so the connection is dropped
+		if( unlikely( n != (ssize_t)( length_of_report - 4 ))){
 			if( ! is_interrupted )
-				mmt_halt( "Error: Cannot read data of report having size = %d", length_of_report );
+				mmt_warn( "Incomplete report: expected %"PRIu32" bytes, received %zd", length_of_report - 4, n );
 			break;
+		}
+
+		//a report needs at least the elements count and the timestamp
+		if( unlikely( n < (ssize_t)( 1 + sizeof( timestamp )))){
+			mmt_warn( "Malformed report of %zd bytes", n );
+			continue;
 		}
 
 		index = 0;
@@ -242,6 +314,12 @@ static inline size_t receiving_reports( int sock ) {
 		msg->counter = reports_count; //TODO
 
 		for(counter = 0; counter < elements_count; counter ++){
+			//an element is proto_id(4) att_id(4) data_length(2) then data
+			if( unlikely( index + 10 > (size_t) n )){
+				mmt_warn( "Malformed report of %zd bytes: truncated element header at %zu", n, index );
+				goto drop_report;
+			}
+
 			//protocol ID
 			//proto_id = *(uint32_t *) &buffer[index];
 			memcpy( &proto_id, &buffer[index], 4 );
@@ -257,9 +335,25 @@ static inline size_t receiving_reports( int sock ) {
 			memcpy( &data_length, &buffer[index], 2 );
 			index += 2;
 
-			//data
-			dpi_data_type = _get_dpi_data_type( proto_id, att_id );
+			//the element's data must be inside the received report
+			if( unlikely( index + data_length > (size_t) n )){
+				mmt_warn( "Malformed report of %zd bytes: data of element %zu is out of range", n, counter );
+				goto drop_report;
+			}
 
+			dpi_data_type = _get_dpi_data_type( proto_id, att_id );
+			//an attribute that no loaded rule uses is not registered: it
+			//is skipped, like dpi_message_set_dpi_data did before
+			if( unlikely( dpi_data_type < 0 )){
+				index += data_length;
+				continue;
+			}
+			if( unlikely( ! _element_data_fits( dpi_data_type, &buffer[index], data_length ))){
+				mmt_warn( "Malformed data of attribute %"PRIu32".%"PRIu32" in report", proto_id, att_id );
+				goto drop_report;
+			}
+
+			//data
 			//special processing for these data types
 			switch( dpi_data_type ){
 			case MMT_STRING_DATA_POINTER:
@@ -270,25 +364,33 @@ static inline size_t receiving_reports( int sock ) {
 			case MMT_DATA_POINTER:
 				set_element_data_message_t( msg, proto_id, att_id,  &buffer[index], MMT_SEC_MSG_DATA_TYPE_BINARY, data_length );
 				break;
+			//the variable-length types are encoded as a number of items
+			//then the items: store the element as received rather than the
+			//fixed-size struct dpi_message_set_dpi_data reads for in-memory
+			//data
+			case MMT_BINARY_DATA:
+			case MMT_BINARY_VAR_DATA:
+			case MMT_U16_ARRAY:
+			case MMT_U32_ARRAY:
+			case MMT_U64_ARRAY:
+			case MMT_DATA_PATH:
+				set_element_data_message_t( msg, proto_id, att_id,  &buffer[index], MMT_SEC_MSG_DATA_TYPE_BINARY, data_length );
+				break;
 			default:
 				dpi_message_set_dpi_data( &buffer[index], dpi_data_type, msg, proto_id, att_id );
 			}
 			index += data_length;
-
-			//http.method
-//			if( el_ptr->proto_id == 153 && el_ptr->att_id == 1 ){
-//				printf("http %zu: len:%"PRIu32", data:[%s] \n", reports_count, el_data_length, (char *)el_ptr->data );
-//			}
-
-			if( unlikely( index >= length_of_report )){
-				mmt_halt( "Data format received from mmt-probe is not correct. Expected %zu but has only %"PRIu32" bytes", index, length_of_report );
-				break;
-			}
 		}
 
 		reports_count ++;
 		//call mmt_security
 		mmt_sec_process( sec_handler, msg );
+		continue;
+
+	//a malformed report is not processed: it was received in full, so the
+	//stream stays synchronized and the next report still parses
+	drop_report:
+		free_message_t( msg );
 	}
 
 	return reports_count;
