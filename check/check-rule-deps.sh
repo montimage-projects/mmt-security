@@ -27,11 +27,30 @@
 #
 # Usage: check/check-rule-deps.sh
 set -u
+ORIG_PWD=$PWD
 cd "$(dirname "$0")/.." || exit 1
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 status=0
 fail(){ echo "  => FAILED: $*"; status=1; }
+
+# a relative $(MMT_DPI_DIR) - on make's command line (it rides MAKEFLAGS)
+# or in the environment - resolves only from the caller's directory; the
+# makes run inside the scratch copy inherit it, so hand them the resolved
+# absolute path (review M4)
+case ${MAKEFLAGS-} in
+*MMT_DPI_DIR=*)
+	d=${MAKEFLAGS##*MMT_DPI_DIR=} d=${d%% *}
+	case $d in
+	''|/*) ;;
+	*) MAKEFLAGS=$(printf '%s' "$MAKEFLAGS" | sed "s|MMT_DPI_DIR=[^ ]*|MMT_DPI_DIR=$(readlink -f "$ORIG_PWD/$d")|g")
+		export MAKEFLAGS ;;
+	esac ;;
+esac
+case ${MMT_DPI_DIR-} in
+''|/*) ;;
+*) MMT_DPI_DIR=$(readlink -f "$ORIG_PWD/$MMT_DPI_DIR"); export MMT_DPI_DIR ;;
+esac
 
 echo
 echo "Testing that a rule .so rebuilds when its .xml is newer"
@@ -116,6 +135,16 @@ make -j1 "$PWD/src/dpi/mmt_dpi.h" > "$TMP/hdr.log" 2>&1 || {
 DPI_LIB=${LD_LIBRARY_PATH:-/opt/mmt/dpi/lib}
 DPI_DIR=${DPI_LIB%%:*}
 DPI_DIR=${DPI_DIR%/lib}
+# a symlinked prefix is a supported configuration (review M3): resolve the
+# top-level link once, so the cp -a copies below get the real tree and no
+# append lands in the installed prefix (review M4). The exported
+# LD_LIBRARY_PATH may hold a relative $(MMT_DPI_DIR); it is meant from
+# where this script was invoked, so anchor a relative path there first
+case $DPI_DIR in
+/*) ;;
+*) DPI_DIR=$ORIG_PWD/$DPI_DIR ;;
+esac
+DPI_DIR=$(readlink -f "$DPI_DIR")
 ${CC:-gcc} -I"$DPI_DIR/include" -L"$DPI_DIR/lib" -o "$TMP/gen_dpi" src/main_gen_dpi.c \
 	-l:libmmt_core.so -ldl > "$TMP/gcc.log" 2>&1 || {
 	cat "$TMP/gcc.log"; fail "compiling src/main_gen_dpi.c"; }
@@ -151,13 +180,31 @@ total=$(find rules -maxdepth 1 -name '*.xml' | wc -l)
 # installed dir before and after a planted change must differ. The
 # pipeline mirrors the Makefile's, `find -L` included (review M3)
 sig_of(){ find -L "$1" -type f -print0 2>/dev/null | sort -z | xargs -0 -r md5sum 2>/dev/null | md5sum | cut -d' ' -f1; }
+# the file a probe appends to: a share/ or pkgconfig file of the copied
+# prefix - an appended byte there cannot corrupt a header a later compile
+# needs; a prefix with neither gets a new file under the copy
+pick_append_file(){
+	f=$(find -L "$1" -type f \( -path '*/share/*' -o -path '*/pkgconfig/*' \) | sort | head -1)
+	[ -n "$f" ] || f=$1/dpi-probe-note.txt
+	printf '%s\n' "$f"
+}
+# an append must land under $TMP: `find -L` can pick an inner link that
+# resolves into the real install (review M4)
+append_x(){
+	case $(readlink -f "$1") in
+	"$TMP"/*) ;;
+	*) fail "refusing to append outside the scratch dir: $1"; return 1 ;;
+	esac
+	echo x >> "$1" || { fail "cannot append to $1"; return 1; }
+}
 cp -a "$DPI_DIR" "$TMP/dpi-copy"
 before=$(sig_of "$TMP/dpi-copy")
-f=$(find -L "$TMP/dpi-copy" -type f | head -1)
-echo x >> "$f"
-after=$(sig_of "$TMP/dpi-copy")
-[ "$before" != "$after" ] || \
-	fail "the DPI content signature does not observe the installed files' content"
+f=$(pick_append_file "$TMP/dpi-copy")
+if append_x "$f"; then
+	after=$(sig_of "$TMP/dpi-copy")
+	[ "$before" != "$after" ] || \
+		fail "the DPI content signature does not observe the installed files' content"
+fi
 
 # leg 8: the Makefile's own DPI_SIG pipeline must observe file content,
 # not only file names (fork #70, review L5). Leg 7 feeds make the
@@ -173,15 +220,14 @@ ln -s "$TMP/dpi-real" "$TMP/dpi-link"
 probe_dpi_dir(){
 	make -j1 MMT_DPI_DIR="$1" compile_rule > "$TMP/probe.settle.log" 2>&1 || {
 		cat "$TMP/probe.settle.log"; fail "real-pipeline probe ($1): settle build failed"; return; }
-	s1=$(cut -d' ' -f1 .build-flavor)
-	# append where no compile or link can trip on it: a doc file is
-	# hashed like everything else under the prefix
-	f=$(find -L "$1" -type f -path '*/share/*' | sort | head -1)
-	[ -n "$f" ] || f=$(find -L "$1" -type f | sort | head -1)
-	echo x >> "$f"
+	s1=$(cut -d'|' -f1 .build-flavor)
+	# append where the extra byte cannot corrupt a header the rebuild
+	# compiles against: a share/ or pkgconfig file, else a new file
+	f=$(pick_append_file "$1")
+	append_x "$f" || return
 	make -j1 MMT_DPI_DIR="$1" compile_rule > "$TMP/probe.log" 2>&1 || {
 		cat "$TMP/probe.log"; fail "real-pipeline probe ($1): rebuild failed"; return; }
-	s2=$(cut -d' ' -f1 .build-flavor)
+	s2=$(cut -d'|' -f1 .build-flavor)
 	[ "$s1" != "$s2" ] || {
 		fail "real-pipeline probe ($1): a content change left the DPI hash '$s2'"; return; }
 	n=$(grep -c '^\[COMPILE\] .*\.o$' "$TMP/probe.log")
