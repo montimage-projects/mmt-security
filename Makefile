@@ -128,14 +128,40 @@ FLAVOR_STAMP := .build-flavor
 # STATIC_RULES_SUFFIX_LIST accumulated while the rule objects compile) are
 # not part of the signature: no CFLAGS-* variable is defined today and the
 # suffix list is derived from the same rules/*.xml set.
-FLAVOR_SIG := $(strip $(CC)|$(AR)|STATIC_LINK=$(STATIC_LINK)|$(filter-out -DGIT_VERSION=%,$(CFLAGS))|$(CLDFLAGS)|$(RULE_GCC_ARGS)|$(LIBS))
-# -n/-t/-q come bundled as letters in the first MAKEFLAGS word
-FLAVOR_FLAGS := $(filter-out --%,$(firstword $(MAKEFLAGS)))
+# The DPI installed under $(MMT_DPI_DIR) is a build input of every object:
+# its include/ is on the compile line and the generated src/dpi/mmt_dpi.h
+# supplies the attribute ids the rules embed. An upgrade in place - a
+# package swapped at the same prefix - leaves the flag set and the
+# directory mtime unchanged, so nothing below saw it: the objects stayed
+# and every rules/*.so kept the previous DPI's ids (fork #70, review M2).
+# Hashing the installed files into the signature makes a swap rewrite the
+# stamp while the makefile is read, so the objects rebuild in the same
+# make - the header file itself cannot be the normal prerequisite here:
+# its recipe below runs on every make and a dry run would count that as
+# remade, planning the whole tree every time. The order-only prerequisite
+# of %.o/%.gen.o is kept instead: it guarantees the regen check runs
+# before any compile.
 # The stamp matters only to goals that compile objects (an empty
 # MAKECMDGOALS is the default goal `all`); the clean and uninstall goals
-# get no stray write - `clean` deletes the stamp right away anyway.
-ifneq ($(if $(MAKECMDGOALS),$(filter-out clean clean-all clean-rules dist-clean uninstall,$(MAKECMDGOALS)),all),)
+# get no stray write - `clean` deletes the stamp right away anyway. The
+# same filter gates the DPI hash: those goals compile nothing, so hashing
+# the installed tree there is wasted work on every parse (fork #70,
+# review L7).
+FLAVOR_GOALS := $(if $(MAKECMDGOALS),$(filter-out clean clean-all clean-rules dist-clean uninstall,$(MAKECMDGOALS)),all)
+# `find -L` keeps a symlinked $(MMT_DPI_DIR) - a versioned prefix managed
+# as `dpi -> dpi-x.y.z` - inside the signature: without it find lists the
+# link itself, the hash is the md5 of empty input and no in-place swap is
+# ever seen (fork #70, review M3). The cut drops md5sum's ` -` stdin tag
+# (review L7).
+DPI_SIG := $(if $(FLAVOR_GOALS),$(shell find -L '$(MMT_DPI_DIR)' -type f -print0 2>/dev/null | sort -z | xargs -0 -r md5sum 2>/dev/null | md5sum | cut -d' ' -f1))
+FLAVOR_SIG := $(strip $(DPI_SIG)|$(CC)|$(AR)|STATIC_LINK=$(STATIC_LINK)|$(filter-out -DGIT_VERSION=%,$(CFLAGS))|$(CLDFLAGS)|$(RULE_GCC_ARGS)|$(LIBS))
+# -n/-t/-q come bundled as letters in the first MAKEFLAGS word
+FLAVOR_FLAGS := $(filter-out --%,$(firstword $(MAKEFLAGS)))
+ifneq ($(FLAVOR_GOALS),)
 ifneq ($(strip $(file <$(FLAVOR_STAMP))),$(FLAVOR_SIG))
+  # nothing is written under -n/-t/-q, so a dry run right after a DPI
+  # swap shows none of the rebuild the real run then does (fork #70,
+  # review L6)
   ifeq ($(findstring n,$(FLAVOR_FLAGS))$(findstring t,$(FLAVOR_FLAGS))$(findstring q,$(FLAVOR_FLAGS)),)
     $(file >$(FLAVOR_STAMP),$(FLAVOR_SIG))
   endif
@@ -200,12 +226,46 @@ $(MMT_DPI_DIR):
 	@echo "ERROR: Not found MMT-DPI at folder $(MMT_DPI_DIR).\n"
 	@exit 1
 	
-#Generate a DPI header, so mmt-security does not depend on mmt-dpi after having the header
-gen_dpi $(MMT_DPI_HEADER): $(MMT_DPI_DIR)
-	$(QUIET) $(CC) -I$(MMT_DPI_DIR)/include -L$(MMT_DPI_DIR)/lib -o $(MAIN_DPI) $(SRCDIR)/main_gen_dpi.c -l:libmmt_core.so -ldl
-	$(QUIET) echo ">>> Generate list of protocols and their attributes to $(MMT_DPI_HEADER)"
-	$(QUIET) ./$(MAIN_DPI) $(MMT_DPI_HEADER)
+# always-out-of-date prerequisite: it lets the header recipe below run on
+# every make, so the header tracks the installed DPI instead of file mtimes
+# (fork #70)
+.PHONY: FORCE
+FORCE:
 
+#The generator is a real target: its source is a prerequisite, so editing
+# main_gen_dpi.c relinks the binary (fork #70)
+$(MAIN_DPI): $(SRCDIR)/main_gen_dpi.c | $(MMT_DPI_DIR)
+	$(QUIET) $(CC) -I$(MMT_DPI_DIR)/include -L$(MMT_DPI_DIR)/lib -o $(MAIN_DPI) $(SRCDIR)/main_gen_dpi.c -l:libmmt_core.so -ldl
+
+#Generate a DPI header, so mmt-security does not depend on mmt-dpi after having the header.
+# The header is tracked so it is readable without mmt-dpi, but when
+# $(MMT_DPI_DIR) exists the installed DPI is authoritative (fork #70):
+# regenerate into a temp file on every make and replace the tracked copy
+# only when the content differs - the first two lines (a timestamp and the
+# generator's own path) are volatile and skipped by the compare, so a
+# settled tree is a no-op and nothing rebuilds needlessly. A prerequisite
+# on $(MMT_DPI_DIR) alone could not do this: on a fresh clone the tracked
+# header is always newer than the install dir, so the stale copy always won.
+gen_dpi $(MMT_DPI_HEADER): $(MAIN_DPI) $(MMT_DPI_DIR) FORCE
+	$(QUIET) set -e; T="$(MMT_DPI_HEADER).new"; \
+		./$(MAIN_DPI) "$$T"; \
+		sed '1,2d' "$$T" > "$$T.n"; \
+		if [ -f "$(MMT_DPI_HEADER)" ]; then \
+			sed '1,2d' "$(MMT_DPI_HEADER)" > "$$T.o"; \
+		else \
+			: > "$$T.o"; \
+		fi; \
+		if cmp -s "$$T.n" "$$T.o"; then \
+			rm -f "$$T" "$$T.n" "$$T.o"; \
+		else \
+			echo ">>> Generate list of protocols and their attributes to $(MMT_DPI_HEADER)"; \
+			mv "$$T" "$(MMT_DPI_HEADER)"; \
+			rm -f "$$T.n" "$$T.o"; \
+		fi
+
+# The header is order-only: it orders the regen check before this compile.
+# A *changed* header invalidates objects through $(FLAVOR_DEP) - the DPI
+# content is hashed into FLAVOR_SIG (fork #70, review M2)
 %.o: %.c $(FLAVOR_DEP) | $(MMT_DPI_HEADER)
 	@echo "[COMPILE] $(notdir $@)"
 	$(QUIET) $(CC) $(CFLAGS) $(CLDFLAGS) -c -o $@ $<
@@ -238,6 +298,8 @@ else
   GEN_OBJS     := $(LIB_OBJS) $(SRCDIR)/main_gen_plugin.o
 endif
 
+# same as %.o above: the header orders the regen check, the stamp carries
+# the invalidation (fork #70, review M2)
 %.gen.o: %.c $(FLAVOR_DEP) | $(MMT_DPI_HEADER)
 	@echo "[COMPILE] $(notdir $@)"
 	$(QUIET) $(CC) $(GEN_CFLAGS) $(GEN_CLDFLAGS) -c -o $@ $<
@@ -267,8 +329,9 @@ ifdef STATIC_LINK
 #here we got a list of rule files
 RULE_OBJS := $(patsubst %.xml,%.o, $(RULE_XML))
 
-#Generate code C of a rule
-rules/%.c: compile_rule
+#Generate code C of a rule; the .xml is a prerequisite for the same
+# reason as in rules/%.so below (fork #70)
+rules/%.c: rules/%.xml compile_rule
 	$(QUIET) echo [COMPILE] rules/$*.xml
 	$(QUIET) ./$(MAIN_GEN_PLUGIN) $@ rules/$*.xml -c > /dev/null 2>&1
 
@@ -338,7 +401,10 @@ endif
 # '-fsanitize=address -fsanitize=undefined' - still reach it as one shell
 # word, and left absent entirely when empty (an "" would add a stray
 # argument and a trailing space in the recorded cflags).
-rules/%.so: compile_rule $(FLAVOR_DEP)
+# The .xml is a normal prerequisite: without it a `make` after a rule
+# edit kept the stale .so and `make check` tested the old rule (fork #70).
+# compile_rule is the generator input; a rebuilt one regenerates every rule.
+rules/%.so: rules/%.xml compile_rule $(FLAVOR_DEP)
 	$(QUIET) ./$(MAIN_GEN_PLUGIN) rules/$*.so rules/$*.xml $(if $(RULE_GCC_ARGS),"$(RULE_GCC_ARGS)")
 	
 sample_rules: $(SAMPLE_RULES)
@@ -347,7 +413,10 @@ sample_rules: $(SAMPLE_RULES)
 # create a temporal folder
 TMP_DIR := build_mmt_security
 
-copy_files:
+# copy_files stages the built rules, binaries and libs: as a sibling
+# prerequisite of install/deb/rpm a parallel make could run it before
+# sample_rules finished and `cp rules/*.so` would fail (fork #70)
+copy_files: all sample_rules
 	$(QUIET) $(RM)    $(TMP_DIR) 2> /dev/null
 	$(QUIET) $(MKDIR) $(TMP_DIR)/rules
 	
@@ -503,7 +572,7 @@ clean: clean-rules
 			$(RULE_OBJS) $(TMP_DIR) $(FLAVOR_STAMP)
 
 clean-all: clean
-	$(QUIET) $(RM) $(MMT_DPI_HEADER)
+	$(QUIET) $(RM) $(MMT_DPI_HEADER) $(MMT_DPI_HEADER).new*
 	
 ################################################################################
 # Auto test 
@@ -677,6 +746,13 @@ check-tsan:
 check: check-flavor
 check-flavor:
 	@./check/check-flavor.sh
+
+# a touched rules/%.xml must rebuild its rules/%.so (and only it), a second
+# make must be a no-op, and a newer compile_rule rebuilds every rule; the
+# STATIC_LINK rules/%.c tracks its .xml the same way (fork #70)
+check: check-rule-deps
+check-rule-deps: _prepare
+	@CC='$(CC)' ./check/check-rule-deps.sh
 
 _csv.%: _prepare
 	$(QUIET) $(RM) /tmp/mmt-security*.csv

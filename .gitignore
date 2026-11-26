@@ -9,6 +9,7 @@ mmt_sec_standalone
 mmt_sec_server
 gen_dpi_header
 .build-flavor
+src/dpi/mmt_dpi.h.new*
 .settings
 .project
 .cproject
