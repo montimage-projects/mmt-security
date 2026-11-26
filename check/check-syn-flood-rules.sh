@@ -23,7 +23,13 @@
 #     handshakes of an instance behind as half-open (fork issue #68), while
 #     the per-port half-open count stays shared by the instances
 #     (check/syn_flood_rule56_skew.c);
-#  7. the servers of check/pcap/56.crafted_servers_attack.pcap, crafted for the
+#  7. rule 56 does not lose a flood whose SYN-ACKs were queued on an engine
+#     instance that then stops receiving packets inside the 1 s window (the
+#     review of PR #73): a SYN-ACK held for more than 1 s + EM_SYN56_STALL_US
+#     of the shared clock is provisionally counted by whichever lane calls,
+#     and the late expiries of a burst whose alert was already given do not
+#     raise it a second time (check/syn_flood_rule56_stall.c);
+#  8. the servers of check/pcap/56.crafted_servers_attack.pcap, crafted for the
 #     unseeded hash, do fill the victim's slot run with seed 0, but their
 #     pending alerts expire 2 s after they are raised and their slots become
 #     evictable again: the victim is then reported even with a known seed
@@ -166,6 +172,14 @@ if gcc -O2 -pthread -DRULE_C="\"$TMP/rule56.c\"" -o "$TMP/rule56skew" check/syn_
 	"$TMP/rule56skew" || fail "rule 56's verdict changed with the instance schedule, or a flood was lost"
 else
 	fail "cannot compile check/syn_flood_rule56_skew.c"
+fi
+
+echo
+echo "Testing rule 56's verdict when a lane stops receiving packets inside the 1 s window (PR #73 review)"
+if gcc -O2 -pthread -DRULE_C="\"$TMP/rule56.c\"" -o "$TMP/rule56stall" check/syn_flood_rule56_stall.c; then
+	"$TMP/rule56stall" || fail "rule 56 lost a flood queued on a stalled lane, or reported a burst a second time"
+else
+	fail "cannot compile check/syn_flood_rule56_stall.c"
 fi
 
 echo

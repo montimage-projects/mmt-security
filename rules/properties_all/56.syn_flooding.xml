@@ -27,8 +27,11 @@
        raised expires: the server's slot is then evictable again, and the pending alert is dropped when a
        new server takes the slot;
      Notes:
-     - the 1 s are checked on later TCP packets (of any connection) of the queue's instance, and the alert
-       waits for a packet to the server port: a spoofed flood (the clients never answer) shorter than 1 s,
+     - the 1 s are checked on later TCP packets (of any connection) of the queue's instance — and, for the
+       SYN-ACKs another lane has held for more than 1 s + EM_SYN56_STALL_US of the shared clock, they are
+       provisionally counted on whichever lane calls until the owning lane itself completes the handshake
+       — and the alert waits for a packet to the server port: a spoofed flood
+       (the clients never answer) shorter than 1 s,
        after which that port receives nothing, is not reported by this rule. Rule 57 reports it from its SYN
        rate only if it reaches rule 57's threshold (100 SYN within 1 s by default): a smaller burst on a port
        that then receives nothing is reported by neither rule. A packet to the port while the alert is still
@@ -64,7 +67,32 @@
        instance is keyed by the thread that calls the rule: a thread driving several instances merges
        them into one queue (its packets are one interleaved stream, hence one clock — the pre-#68
        semantics for that stream); beyond EM_SYN56_LANES calling threads, the extra ones share an
-       overflow queue.
+       overflow queue. Lane identity follows the calling thread, not the engine instance: if an
+       engine ever migrated an instance to another thread, its queue would be silently re-keyed
+       (mmt-probe workers and dedicated security threads, and the -c workers of mmt_sec_standalone,
+       all drive one instance per thread).
+       A lane that stops calling cannot expire its own queue: whichever lane calls provisionally
+       counts the SYN-ACKs every other lane has held for more than 1 s + EM_SYN56_STALL_US (2 s)
+       of the shared clock — they are marked DRAINED but stay on their lane's queue. A lane whose
+       packet stream ended or paused loses no flood: the entries count even though the lane never
+       calls again, and the tombstones are recycled EM_SYN56_HOLD_US (8 s) later. A lane merely
+       behind in packet time keeps its own verdict: when it catches up, its packets still complete
+       the handshakes, and each completing ACK takes the provisional count back — a pending alert
+       the burst raised is cancelled. An alert raised by provisional counts also reports only
+       once every lane a count was taken from has passed the point where it would have
+       adjudicated the handshake itself — a completing ACK then already had its chance to
+       un-count it — or was observed frozen for EM_SYN56_DEFER_US (1 s) of the shared
+       clock: the completing ACK can only arrive on the SYN-ACK's lane, so those are the
+       only verdicts the report waits for; a stopped lane never passes the adjudication
+       point, so the freeze is what lets its flood report at all, while a lagging lane's
+       completing ACK almost always un-counts first. Only a lane more than 2 s behind can
+       hold a stale entry, so the #68 skew
+       sensitivity stays bounded to those, plus the narrow window where a lane's flood is
+       provisionally counted before its own packets disprove it. And a half-open
+       handshake within 200 ms of a burst whose alert was already given is not counted a second
+       time: a flood's SYN-ACKs leave their queues in per-lane batches paced by each lane's own
+       traffic, and without it the late batches would raise and report the same burst again one
+       second later;
 -->
 <embedded_functions><![CDATA[
 #include <errno.h>
@@ -87,8 +115,25 @@
 #define EM_SYN56_REPORT_US   1000000  //at most one alert per server port per second
 #define EM_SYN56_EXPIRE_US   2000000  //a pending alert expires 2 s after it is raised
 #define EM_SYN56_LANES           256  //engine instances tracked (the threads that call the rule)
+#define EM_SYN56_STALL_US    2000000  //a SYN-ACK pending for more than 1 s + 2 s of the shared
+                                     //clock is provisionally counted when another lane calls:
+                                     //only a lane that stopped receiving packets can hold one
+                                     //that long (a live lane's own 1 s expiry takes it first),
+                                     //so a lane whose stream ends or pauses loses no flood, and
+                                     //the skew sensitivity stays bounded to lanes more than 2 s
+                                     //behind the shared clock (#68)
+#define EM_SYN56_HOLD_US     8000000  //a provisionally counted entry is held for its lane to
+                                     //disprove (its ACK un-counts it); past 1 s + 2 s + 8 s of
+                                     //the shared clock the lane is presumed dead and the pool
+                                     //entry is recycled anyway (#68)
+#define EM_SYN56_DEFER_US    1000000  //a lane whose packet time did not move for this much of
+                                     //the shared clock is presumed stopped: an alert raised by
+                                     //provisionally counted handshakes waits for every lane that
+                                     //contributed one to pass the point where it would have
+                                     //adjudicated it itself — a completing ACK then already had
+                                     //its chance to un-count — or to be observed frozen (#68)
 
-enum { EM_SYN56_FREE = 0, EM_SYN56_WAITING, EM_SYN56_DONE };
+enum { EM_SYN56_FREE = 0, EM_SYN56_WAITING, EM_SYN56_DONE, EM_SYN56_DRAINED };
 
 typedef struct {
 	uint32_t srv_ip, cli_ip;  //network order
@@ -110,16 +155,34 @@ typedef struct {
 	uint64_t last;            //SYN-ACK time of the last half-open handshake
 	uint64_t reported_ts;     //packet time of the last alert of this server port
 	uint64_t alert_ts;        //packet time when the pending alert was raised
+	uint64_t burst_ts;        //SYN-ACK time of the newest handshake of the last counted burst
+	uint64_t prov_clear;      //packet time a lane must pass to have adjudicated the
+	                          //newest provisionally counted handshake of this burst
+	uint64_t prov_lanes[ (EM_SYN56_LANES + 64) / 64 ]; //lanes a provisional
+	                          //count of this server came from: only they can still
+	                          //disprove it — the completing ACK lands on the SYN-ACK's
+	                          //lane (EM_SYN56_LANES + 1 queue positions at most)
 } em_syn56_srv_t;
 
 //one engine instance: the queue of the SYN-ACKs it has seen and not yet
-//expired, ordered by its own packet time — only that instance's packets can
-//expire them, so the verdict does not depend on thread scheduling (#68)
+//expired, ordered by its own packet time — its own packets expire them after
+//1 s, or any instance's after 1 s + EM_SYN56_STALL_US of the shared clock when
+//this instance stopped calling (#68)
 typedef struct {
 	pthread_t tid;            //the thread that drives this instance
 	uint32_t  head;           //pool position + 1 of the oldest pending entry, 0: none
 	uint32_t  tail;           //pool position + 1 of the newest
 	uint8_t   used;
+	uint8_t   unordered;      //its queue is not ordered by SYN-ACK time: a rewound
+	                          //stream put older entries behind newer ones — a stale
+	                          //scan cannot stop at the first fresh entry
+	uint64_t  now;            //highest packet time this instance processed: past a
+	                          //handshake's SYN-ACK time + 1 s, its adjudication is
+	                          //over (a completing ACK had to reach it by then)
+	uint64_t  mark;           //the last packet time this instance was seen at (#68)
+	uint64_t  mark_now;       //the shared-clock time its packet time last moved: a
+	                          //lane that did not move for EM_SYN56_DEFER_US is
+	                          //presumed stopped, not owed an adjudication anymore
 } em_syn56_lane_t;
 
 static em_syn56_hs_t   em_syn56_pool[ EM_SYN56_PENDING ];
@@ -275,10 +338,37 @@ static inline int em_syn56_within( uint64_t a, uint64_t b ){
 	return ( a > b ? a - b : b - a ) <= EM_SYN56_SPAN_US;
 }
 
-//a handshake of server ip:port, whose SYN-ACK was sent at ts, is half-open
-static void em_syn56_half_open( uint32_t ip, uint16_t port, uint64_t ts ){
+//a handshake of server ip:port, whose SYN-ACK was sent at ts, is half-open.
+//provisional = the lane that owned the pending entry when the count comes
+//from another lane's stall drain, NULL when the count is the owning lane's
+//own expiry. Returns 0 when the count was suppressed as a repeat of an
+//already-given burst, 1 when it counted.
+static int em_syn56_half_open( uint32_t ip, uint16_t port, uint64_t ts,
+		em_syn56_lane_t *provisional ){
 	em_syn56_srv_t *s = em_syn56_server( ip, port, 1 );
-	int i, n = 0;
+	int i, n = 0, b;
+	//a burst whose alert was already given does not raise a second one: a
+	//flood's SYN-ACKs leave the lanes' queues in batches paced by each lane's
+	//own traffic, so late expiries of the same burst (their SYN-ACK times stay
+	//within 200 ms of the counted ones) would otherwise raise and report it
+	//again (#68)
+	if( s->reported && em_syn56_within( ts, s->burst_ts )){
+		//still a half-open handshake of this server: it counts toward the
+		//eviction age, only its burst count is suppressed
+		if( ts > s->last )
+			s->last = ts;
+		return 0;
+	}
+	//a provisional count records the lane it was taken from — only that lane
+	//can still disprove it — and the packet time past which the lane has
+	//certainly adjudicated the handshake itself: an alert raised by such
+	//counts waits for those lanes (EM_SYN56_DEFER_US)
+	if( provisional ){
+		b = provisional - em_syn56_lane;
+		s->prov_lanes[ b >> 6 ] |= (uint64_t) 1 << ( b & 63 );
+		if( s->prov_clear < ts + EM_SYN56_TIMEOUT_US )
+			s->prov_clear = ts + EM_SYN56_TIMEOUT_US;
+	}
 	//keep only the half-open handshakes within 200 ms of this one
 	for( i = 0; i < s->count; i++ )
 		if( em_syn56_within( ts, s->ts[i] ))
@@ -287,6 +377,7 @@ static void em_syn56_half_open( uint32_t ip, uint16_t port, uint64_t ts ){
 	s->last  = ts;
 	if( n == EM_SYN56_HALF_OPEN - 1 ){
 		s->count = 0;
+		s->burst_ts = ts;
 		if( !s->alert ){
 			s->alert    = 1;
 			s->alert_ts = em_syn56_now;
@@ -294,10 +385,35 @@ static void em_syn56_half_open( uint32_t ip, uint16_t port, uint64_t ts ){
 		}
 	} else
 		s->ts[ s->count++ ] = ts;
+	return 1;
+}
+
+//a handshake that another lane's drain provisionally counted completed on
+//its own lane after all: take the count back — the pending alert its burst
+//raised is cancelled (an alert already reported cannot be), or the SYN-ACK
+//time it left in the gathering count is dropped (#68)
+static void em_syn56_uncount( const em_syn56_hs_t *hs ){
+	em_syn56_srv_t *s = em_syn56_server( hs->srv_ip, hs->srv_port, 0 );
+	int i;
+	if( s == NULL )
+		return;
+	for( i = 0; i < s->count; i++ )
+		if( s->ts[i] == hs->ts ){
+			s->ts[i] = s->ts[ --s->count ];
+			return;
+		}
+	if( s->alert && !s->reported && em_syn56_within( hs->ts, s->burst_ts )){
+		s->alert = 0;
+		s->prov_clear = 0;
+		memset( s->prov_lanes, 0, sizeof( s->prov_lanes ));
+		em_syn56_alerts --;
+	}
 }
 
 //take the oldest SYN-ACK out of the lane's queue (after its 1 s on the lane's
-//own packet clock): still pending, it is half-open; then recycle its entry
+//own packet clock, or as a dead lane's tombstone — em_syn_flood_half_open):
+//still pending, it is half-open; a DRAINED one was provisionally counted by
+//another lane already; then recycle the entry
 static void em_syn56_pop( em_syn56_lane_t *lane ){
 	uint32_t pos = lane->head - 1;
 	em_syn56_hs_t *hs = &em_syn56_pool[ pos ];
@@ -305,7 +421,7 @@ static void em_syn56_pop( em_syn56_lane_t *lane ){
 	if( lane->head == 0 )
 		lane->tail = 0;
 	if( hs->state == EM_SYN56_WAITING )
-		em_syn56_half_open( hs->srv_ip, hs->srv_port, hs->ts );
+		em_syn56_half_open( hs->srv_ip, hs->srv_port, hs->ts, NULL );
 	hs->state = EM_SYN56_FREE;
 	hs->next  = em_syn56_free_head;
 	em_syn56_free_head = pos + 1;
@@ -348,12 +464,31 @@ static void em_syn56_add( em_syn56_lane_t *lane, uint32_t srv_ip, uint16_t srv_p
 	hs->next     = 0;
 	hs->state    = EM_SYN56_WAITING;
 	em_syn56_index[ i ] = pos + 1;
-	if( lane->tail != 0 )
+	if( lane->tail != 0 ){
 		em_syn56_pool[ lane->tail - 1 ].next = pos + 1;
-	else
+		//a rewound stream appends an older SYN-ACK behind a newer one: the
+		//queue's order is no longer the SYN-ACK times', stale entries can
+		//sit anywhere in it
+		if( em_syn56_pool[ lane->tail - 1 ].ts > now )
+			lane->unordered = 1;
+	}else
 		lane->head = pos + 1;
 	lane->tail = pos + 1;
 	em_syn56_size ++;
+}
+
+//a lane is presumed stopped once its packet time was not seen moving for
+//EM_SYN56_DEFER_US of the shared clock — refreshed on every lane scan, so the
+//freeze is measured from when the lane actually stopped progressing, not from
+//when a provisional count first needed it (#68)
+static int em_syn56_lane_frozen( em_syn56_lane_t *l ){
+	if( l->now != l->mark ){
+		l->mark     = l->now;
+		l->mark_now = em_syn56_now;
+		return 0;
+	}
+	return em_syn56_now > l->mark_now
+			&& em_syn56_now - l->mark_now > EM_SYN56_DEFER_US;
 }
 
 //ACK set, SYN and RST clear: the client's packet that completes (or follows) the TCP handshake
@@ -367,11 +502,12 @@ static int em_syn_flood_half_open( const void *ip_src, const void *ip_dst, doubl
 	const struct timeval *tv = (const struct timeval *) utime;
 	uint32_t src, dst;
 	uint16_t sp = (uint16_t) sport, dp = (uint16_t) dport;
-	int f = (int) flags, ret = 0;
+	int f = (int) flags, ret = 0, i;
 	uint64_t now;
+	uint32_t pos;
 	em_syn56_hs_t *hs;
 	em_syn56_srv_t *s;
-	em_syn56_lane_t *lane;
+	em_syn56_lane_t *lane, *l;
 
 	if( ip_src == NULL || ip_dst == NULL || tv == NULL )
 		return 0;
@@ -387,6 +523,10 @@ static int em_syn_flood_half_open( const void *ip_src, const void *ip_dst, doubl
 	//nor let a pending alert expire early (#68)
 	if( now > em_syn56_now )
 		em_syn56_now = now;
+	//how far this instance's own adjudication has run: past a handshake's
+	//SYN-ACK time + 1 s it cannot disprove a provisional count of it anymore
+	if( now > lane->now )
+		lane->now = now;
 	//the handshakes of this instance waiting for more than 1 s of its own
 	//packet time (time going backwards stops this until it catches up)
 	while( lane->head != 0 && now > em_syn56_pool[ lane->head - 1 ].ts
@@ -398,23 +538,102 @@ static int em_syn_flood_half_open( const void *ip_src, const void *ip_dst, doubl
 			em_syn56_add( lane, src, sp, dst, dp, now );
 	} else if( em_completes_handshake( f )){
 		hs = em_syn56_find( dst, dp, src, sp );
-		if( hs != NULL )
+		if( hs != NULL ){
+			//another lane's drain provisionally counted this handshake: the
+			//lane itself disproves the count now that the ACK reached it
+			if( hs->state == EM_SYN56_DRAINED )
+				em_syn56_uncount( hs );
 			hs->state = EM_SYN56_DONE;
+		}
 	} else if( f & 0x04 ){
 		//the client resets a pending handshake: it cannot complete, so it is half-open now
 		hs = em_syn56_find( dst, dp, src, sp );
 		if( hs != NULL && hs->state == EM_SYN56_WAITING ){
 			hs->state = EM_SYN56_DONE;
-			em_syn56_half_open( hs->srv_ip, hs->srv_port, hs->ts );
-		}
+			em_syn56_half_open( hs->srv_ip, hs->srv_port, hs->ts, NULL );
+		} else if( hs != NULL && hs->state == EM_SYN56_DRAINED )
+			hs->state = EM_SYN56_DONE;
 	}
+
+	//a lane that stopped calling cannot expire its queue on its own clock:
+	//the calling lane provisionally counts the SYN-ACKs every lane observed
+	//frozen for EM_SYN56_DEFER_US of the shared clock has held for more than
+	//EM_SYN56_TIMEOUT_US + EM_SYN56_STALL_US — they become DRAINED, still on
+	//their lane's queue, so a lane whose stream ends or pauses loses no flood
+	//while a lane that resumes can still disprove them (its completing ACK
+	//un-counts: a lagging lane keeps its own-clock verdict). A lane still
+	//moving adjudicates its queue itself: its entries are never taken, only
+	//stopped lanes are — the skew sensitivity of #68 stays bounded to those.
+	//The calling lane's own queue stays on its own clock alone. Entries a
+	//lane never adjudicates are recycled 8 s later still (#68)
+	if( em_syn56_size != 0 )
+		for( l = em_syn56_lane; l <= &em_syn56_lane[ EM_SYN56_LANES ]; l++ ){
+			//how far each lane's own adjudication has run: a lane that keeps
+			//moving owes the provisional alerts its verdict, one frozen for
+			//EM_SYN56_DEFER_US is presumed stopped (#68)
+			if( l->now != l->mark ){
+				l->mark     = l->now;
+				l->mark_now = em_syn56_now;
+			}
+			if( l != lane && l->head != 0 && em_syn56_lane_frozen( l )){
+				//a lane still moving adjudicates its queue itself; only a lane
+				//observed frozen for EM_SYN56_DEFER_US of the shared clock has
+				//its stale SYN-ACKs provisionally counted here. On an ordered
+				//queue the scan stops at the first fresh entry; a rewound one
+				//hides stale entries behind fresh ones and is walked in full (#68)
+				for( pos = l->head; pos != 0; pos = em_syn56_pool[ pos - 1 ].next ){
+					hs = &em_syn56_pool[ pos - 1 ];
+					if( em_syn56_now <= hs->ts
+							|| em_syn56_now - hs->ts <= EM_SYN56_TIMEOUT_US + EM_SYN56_STALL_US ){
+						if( l->unordered )
+							continue;
+						break;
+					}
+					if( hs->state == EM_SYN56_WAITING && em_syn56_half_open( hs->srv_ip,
+							hs->srv_port, hs->ts, l ))
+						hs->state = EM_SYN56_DRAINED;
+				}
+				//recycle at the head: tombstones the lane never adjudicated
+				//(dead lanes' DRAINED entries), adjudicated handshakes whose
+				//SYN-ACK aged out, and stale WAITING entries the count
+				//suppressed — all older than the stale bound
+				while( l->head != 0 ){
+					hs = &em_syn56_pool[ l->head - 1 ];
+					if( em_syn56_now <= hs->ts
+							|| em_syn56_now - hs->ts <= EM_SYN56_TIMEOUT_US + EM_SYN56_STALL_US )
+						break;
+					if( hs->state == EM_SYN56_DRAINED
+							&& em_syn56_now - hs->ts
+								<= EM_SYN56_TIMEOUT_US + EM_SYN56_STALL_US + EM_SYN56_HOLD_US )
+						break;
+					em_syn56_pop( l );
+				}
+			}
+		}
 
 	//report on a packet to the server port, at most once per second of the shared clock
 	if( em_syn56_alerts > 0 && src != dst ){
 		s = em_syn56_server( dst, dp, 0 );
+		if( s != NULL && s->alert && s->prov_clear ){
+			//a provisional alert waits until every lane a count was taken
+			//from has passed the point where it adjudicates the drained
+			//handshake itself — a completing ACK it processed since
+			//un-counted the alert already — or was observed frozen for
+			//EM_SYN56_DEFER_US of the shared clock: only those lanes can
+			//still disprove the count, the others' verdicts are in (#68)
+			for( i = 0; i <= EM_SYN56_LANES; i++ )
+				if( ( s->prov_lanes[ i >> 6 ] >> ( i & 63 ) & 1 )
+						&& em_syn56_lane[ i ].now <= s->prov_clear
+						&& !em_syn56_lane_frozen( &em_syn56_lane[ i ] )){
+					s = NULL;
+					break;
+				}
+		}
 		if( s != NULL && s->alert &&
 				( !s->reported || em_syn56_now - s->reported_ts >= EM_SYN56_REPORT_US )){
 			s->alert       = 0;
+			s->prov_clear  = 0;
+			memset( s->prov_lanes, 0, sizeof( s->prov_lanes ));
 			s->reported    = 1;
 			s->reported_ts = em_syn56_now;
 			em_syn56_alerts --;
