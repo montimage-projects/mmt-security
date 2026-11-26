@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# message_t alignment (issue #64), run by `make check` as target
+# message_t alignment (issues #64 and #66), run by `make check` as target
 # check-message-align. message_t is declared __aligned (a cache line) but
 # mmt_mem_alloc used to return data 16 bytes past the malloc base. The
 # allocator and the message code are rebuilt here with
