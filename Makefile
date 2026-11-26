@@ -128,7 +128,21 @@ FLAVOR_STAMP := .build-flavor
 # STATIC_RULES_SUFFIX_LIST accumulated while the rule objects compile) are
 # not part of the signature: no CFLAGS-* variable is defined today and the
 # suffix list is derived from the same rules/*.xml set.
-FLAVOR_SIG := $(strip $(CC)|$(AR)|STATIC_LINK=$(STATIC_LINK)|$(filter-out -DGIT_VERSION=%,$(CFLAGS))|$(CLDFLAGS)|$(RULE_GCC_ARGS)|$(LIBS))
+# The DPI installed under $(MMT_DPI_DIR) is a build input of every object:
+# its include/ is on the compile line and the generated src/dpi/mmt_dpi.h
+# supplies the attribute ids the rules embed. An upgrade in place - a
+# package swapped at the same prefix - leaves the flag set and the
+# directory mtime unchanged, so nothing below saw it: the objects stayed
+# and every rules/*.so kept the previous DPI's ids (fork #70, review M2).
+# Hashing the installed files into the signature makes a swap rewrite the
+# stamp while the makefile is read, so the objects rebuild in the same
+# make - the header file itself cannot be the normal prerequisite here:
+# its recipe below runs on every make and a dry run would count that as
+# remade, planning the whole tree every time. The order-only prerequisite
+# of %.o/%.gen.o is kept instead: it guarantees the regen check runs
+# before any compile.
+DPI_SIG := $(shell find '$(MMT_DPI_DIR)' -type f -print0 2>/dev/null | sort -z | xargs -0 -r md5sum 2>/dev/null | md5sum)
+FLAVOR_SIG := $(strip $(DPI_SIG)|$(CC)|$(AR)|STATIC_LINK=$(STATIC_LINK)|$(filter-out -DGIT_VERSION=%,$(CFLAGS))|$(CLDFLAGS)|$(RULE_GCC_ARGS)|$(LIBS))
 # -n/-t/-q come bundled as letters in the first MAKEFLAGS word
 FLAVOR_FLAGS := $(filter-out --%,$(firstword $(MAKEFLAGS)))
 # The stamp matters only to goals that compile objects (an empty
@@ -237,6 +251,9 @@ gen_dpi $(MMT_DPI_HEADER): $(MAIN_DPI) $(MMT_DPI_DIR) FORCE
 			rm -f "$$T.n" "$$T.o"; \
 		fi
 
+# The header is order-only: it orders the regen check before this compile.
+# A *changed* header invalidates objects through $(FLAVOR_DEP) - the DPI
+# content is hashed into FLAVOR_SIG (fork #70, review M2)
 %.o: %.c $(FLAVOR_DEP) | $(MMT_DPI_HEADER)
 	@echo "[COMPILE] $(notdir $@)"
 	$(QUIET) $(CC) $(CFLAGS) $(CLDFLAGS) -c -o $@ $<
@@ -269,6 +286,8 @@ else
   GEN_OBJS     := $(LIB_OBJS) $(SRCDIR)/main_gen_plugin.o
 endif
 
+# same as %.o above: the header orders the regen check, the stamp carries
+# the invalidation (fork #70, review M2)
 %.gen.o: %.c $(FLAVOR_DEP) | $(MMT_DPI_HEADER)
 	@echo "[COMPILE] $(notdir $@)"
 	$(QUIET) $(CC) $(GEN_CFLAGS) $(GEN_CLDFLAGS) -c -o $@ $<
@@ -721,7 +740,7 @@ check-flavor:
 # STATIC_LINK rules/%.c tracks its .xml the same way (fork #70)
 check: check-rule-deps
 check-rule-deps: _prepare
-	@./check/check-rule-deps.sh
+	@CC='$(CC)' ./check/check-rule-deps.sh
 
 _csv.%: _prepare
 	$(QUIET) $(RM) /tmp/mmt-security*.csv

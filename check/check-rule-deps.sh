@@ -14,7 +14,10 @@
 #     newer than $(MMT_DPI_DIR), so a Makefile that regenerates only when
 #     the directory is newer keeps the stale copy forever and every rule
 #     embeds the attribute ids of a DPI other than the installed one
-#     (fork #70, review M1).
+#     (fork #70, review M1);
+#   - the installed DPI's file content invalidates the objects: an upgrade
+#     in place at the same $(MMT_DPI_DIR) rewrites .build-flavor, rebuilds
+#     every object and regenerates every rule (fork #70, review M2).
 # On a Makefile whose rules/%.so does not list its .xml, the touched rule
 # keeps its stale .so - the bug #70 reports - and this script fails.
 #
@@ -109,7 +112,7 @@ make -j1 "$PWD/src/dpi/mmt_dpi.h" > "$TMP/hdr.log" 2>&1 || {
 DPI_LIB=${LD_LIBRARY_PATH:-/opt/mmt/dpi/lib}
 DPI_DIR=${DPI_LIB%%:*}
 DPI_DIR=${DPI_DIR%/lib}
-gcc -I"$DPI_DIR/include" -L"$DPI_DIR/lib" -o "$TMP/gen_dpi" src/main_gen_dpi.c \
+${CC:-gcc} -I"$DPI_DIR/include" -L"$DPI_DIR/lib" -o "$TMP/gen_dpi" src/main_gen_dpi.c \
 	-l:libmmt_core.so -ldl > "$TMP/gcc.log" 2>&1 || {
 	cat "$TMP/gcc.log"; fail "compiling src/main_gen_dpi.c"; }
 LD_LIBRARY_PATH="$DPI_DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
@@ -120,6 +123,36 @@ if [ -f "$TMP/mmt_dpi.now.h" ]; then
 	cmp -s <(sed '1,2d' src/dpi/mmt_dpi.h) <(sed '1,2d' "$TMP/mmt_dpi.now.h") || \
 		fail "src/dpi/mmt_dpi.h is stale: it differs from what the installed MMT-DPI generates"
 fi
+
+# leg 7: the installed DPI's file content is a build input of every object
+# (fork #70, review M2). An upgrade in place swaps files under
+# $(MMT_DPI_DIR) but keeps the flag set, the directory mtime and
+# .build-flavor's content, so a change that only the files' contents carry
+# rebuilt nothing and rules kept embedding the previous DPI's ids. The
+# Makefile folds a hash of the installed files (DPI_SIG) into the flavor
+# signature: a swap rewrites the stamp while the makefile is read and the
+# objects rebuild in the same make; a relinked compile_rule then
+# regenerates every rule. Feed make the signature change a swap produces;
+# on a Makefile that does not observe the DPI content nothing rebuilds.
+exp_objs=$(( $(find src/lib -name '*.c' | wc -l) + 1 ))  # LIB_OBJS + main_gen_plugin.o
+touch "$TMP/m2.marker"
+make -j1 DPI_SIG=dpi-content-changed compile_rule sample_rules > "$TMP/m2.log" 2>&1 || {
+	cat "$TMP/m2.log"; fail "rebuild after a DPI content change"; }
+n=$(grep -c '^\[COMPILE\] .*\.o$' "$TMP/m2.log")
+[ "$n" -eq "$exp_objs" ] || fail "changed DPI content rebuilds $n objects, expected $exp_objs"
+n=$(find rules -maxdepth 1 -name '*.so' -newer "$TMP/m2.marker" | wc -l)
+total=$(find rules -maxdepth 1 -name '*.xml' | wc -l)
+[ "$n" -eq "$total" ] || fail "changed DPI content regenerates $n rules, expected all $total"
+# ...and the signature itself must observe content: hashing a copy of the
+# installed dir before and after a planted change must differ
+sig_of(){ find "$1" -type f -print0 2>/dev/null | sort -z | xargs -0 -r md5sum 2>/dev/null | md5sum; }
+cp -a "$DPI_DIR" "$TMP/dpi-copy"
+before=$(sig_of "$TMP/dpi-copy")
+f=$(find "$TMP/dpi-copy" -type f | head -1)
+echo x >> "$f"
+after=$(sig_of "$TMP/dpi-copy")
+[ "$before" != "$after" ] || \
+	fail "the DPI content signature does not observe the installed files' content"
 
 if [ "$status" -eq 0 ]; then
 	echo "  => OK: a newer xml or compile_rule rebuilds exactly the rules it should"
